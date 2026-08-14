@@ -1,0 +1,30 @@
+{
+  "method": "turboquant_vllm",
+  "ctxs": {
+    "1024": {
+      "tpot_ms": 27.4702,
+      "ttft_ms": 156.29082193551585,
+      "peak_gb": null
+    },
+    "4096": {
+      "tpot_ms": 31.772,
+      "ttft_ms": 581.8272347226739,
+      "peak_gb": null
+    },
+    "16384": {
+      "tpot_ms": 49.0701,
+      "ttft_ms": 2718.8578239683993,
+      "peak_gb": null
+    },
+    "32768": {
+      "tpot_ms": 70.88,
+      "ttft_ms": 6795.7369399063755,
+      "peak_gb": null
+    },
+    "65536": {
+      "tpot_ms": 116.6215,
+      "ttft_ms": 19059.107354500098,
+      "peak_gb": null
+    }
+  }
+}

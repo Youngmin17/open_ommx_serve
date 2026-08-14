@@ -1,0 +1,45 @@
+{
+  "method": "kitty",
+  "model": "meta-llama/Llama-3.1-8B-Instruct",
+  "ctxs": {
+    "1024": {
+      "ttft_ms": 2938.4377,
+      "tpot_ms": 30.2441,
+      "p99_ms": 54.3948,
+      "peak_gb": 15.2675
+    },
+    "4096": {
+      "ttft_ms": 339.0218,
+      "tpot_ms": 30.9347,
+      "p99_ms": 38.9796,
+      "peak_gb": 16.0936
+    },
+    "16384": {
+      "ttft_ms": 1536.262,
+      "tpot_ms": 58.6594,
+      "p99_ms": 60.5014,
+      "peak_gb": 19.351
+    },
+    "32768": {
+      "ttft_ms": 4306.8462,
+      "tpot_ms": 97.8584,
+      "p99_ms": 100.5515,
+      "peak_gb": 23.7373
+    },
+    "65536": {
+      "ttft_ms": 11496.9346,
+      "tpot_ms": 179.33,
+      "p99_ms": 181.5573,
+      "peak_gb": 32.4179
+    }
+  },
+  "quality": {
+    "prompt": "Question: What is the capital of France, and why is it historically important?\nAnswer:",
+    "output": " The capital of France is Paris. Paris is historically important for several reasons:\n1. **Birthplace of the French Revolution**: Paris was the epicenter of the French Revolution in 1789, which overthrew the monarchy and established the First French Republic. The city's iconic landmarks, such as the Bastille, symbolize the revolution's spirit of liberty, equality, and fraternity.\n2. **Seat of the French Monarchy**: Paris was the capital of the Kingdom of"
+  },
+  "meta": {
+    "warmup": 8,
+    "measure": 40,
+    "dtype": "float16"
+  }
+}

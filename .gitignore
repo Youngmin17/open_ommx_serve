@@ -1,0 +1,23 @@
+# venvs (per-method)
+.venv*/
+venv/
+# python caches / build
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+build/
+dist/
+# measured data (figure/data_<gpu>/*.json) + normalized figure/data/*.json ARE committed
+# result figures (figure/*.png) + demo (assets/*.gif) ARE committed
+runs/
+figure/data/_e2e.*
+# model / hf caches
+.cache/
+*.safetensors
+*.bin
+*.pickle
+# editor / os
+.DS_Store
+*.swp

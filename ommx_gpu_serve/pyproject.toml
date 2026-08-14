@@ -1,0 +1,62 @@
+# Copyright (c) 2024-2026, OMMX Contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Standalone packaging for the OMMX GPU attention serving kernels.
+#
+# This package is the SELF-CONTAINED attention serving unit: the canonical Triton
+# paged-decode kernel + KV pack/codec + the framework adapters (vLLM / SGLang /
+# LMCache / PyTorch / JAX). It depends ONLY on torch (+ triton at GPU runtime) and
+# the chosen serving framework as an optional extra — NOT on the parent ``ommx``
+# repo. ``csrc/linear`` (the CUTLASS linear/fusion kernels, built by
+# ``build_serve.py``) is intentionally NOT part of this package: the attention
+# decode path is PURE Triton and needs no C++/CUTLASS compilation to import or run.
+#
+# Package layout note: the project directory is itself named ``ommx_gpu_serve`` and
+# the existing tests import ``ommx_gpu_serve.attention.*``. To keep that import path
+# working with the pyproject living *inside* the directory, ``package-dir`` anchors
+# the top-level package ``ommx_gpu_serve`` at ``.`` (this dir); subpackages
+# (``ommx_gpu_serve.attention`` -> ``./attention``) resolve via the longest-prefix
+# rule. Install from this directory:  ``pip install -e .``
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ommx-gpu-serve"
+version = "0.1.0"
+description = "OMMX standalone low-bit (i2f4/i2/itf4) attention serving kernels + framework adapters"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+# torch is the only hard dep; the decode kernels JIT-compile via triton lazily on
+# the first GPU call (see attention/paged_decode.py:_require_triton). triton is an
+# optional extra so the package imports (config/pack/codec are pure-python) on a
+# host with neither triton nor a GPU.
+dependencies = ["torch>=2.4.0"]
+
+[project.optional-dependencies]
+triton = ["triton>=3.0.0"]
+vllm = ["vllm>=0.11"]
+sglang = ["sglang>=0.5"]
+dev = ["pytest", "numpy"]
+
+# vLLM discovers OMMX through one re-entrant general plugin per worker: it registers
+# the OMMX canonical attention backend under AttentionBackendEnum.CUSTOM. The entry
+# point imports lazily and is idempotent; selecting it requires --attention-backend
+# CUSTOM (or the equivalent attention_config) at LLM construction.
+[project.entry-points."vllm.general_plugins"]
+ommx_gpu_serve = "ommx_gpu_serve.integration.vllm.plugin:register"
+
+[tool.setuptools]
+# Anchor the top-level package name to this directory (see layout note above).
+package-dir = { "ommx_gpu_serve" = "." }
+# Explicit package list (not find-based) so csrc/ and serve/ — the OFF-LIMITS
+# linear/fusion CUTLASS side — are never swept into the attention package. New
+# subpackages (integration.vllm, bench) are added here as they land.
+packages = [
+    "ommx_gpu_serve",
+    "ommx_gpu_serve.attention",
+    "ommx_gpu_serve.integration",
+    "ommx_gpu_serve.integration.common",
+    "ommx_gpu_serve.integration.vllm",
+    "ommx_gpu_serve.bench",
+]

@@ -1,0 +1,89 @@
+# open_ommx_serve — reproduction code for OMMX low-bit KV serving vs KIVI / Kitty.
+#
+# This root project ships NO importable package of its own; it exists to declare the
+# per-METHOD dependency bundles as optional-dependencies (extras). Because KIVI, Kitty and
+# vLLM pin mutually-incompatible transformers / engine versions, each method
+# is installed into its OWN venv (see README "Setup"), e.g.:
+#
+#   uv venv .venv-ommx  --python 3.10 && uv pip install -e '.[ommx]'  && uv pip install -e ommx_gpu_serve && uv pip install -e eval
+#   uv venv .venv-kivi  --python 3.10 && uv pip install -e '.[kivi]'  && uv pip install -e eval
+#   uv venv .venv-kitty --python 3.10 && uv pip install -e '.[kitty]' && uv pip install -e eval
+#
+# run.sh picks the matching venv per method. Versions below are starting pins; validate /
+# adjust on the target A100 (some are GPU-build sensitive, e.g. flash-attn).
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "open-ommx-serve"
+version = "0.1.0"
+description = "ICCAD 2026 artifact: OMMX low-bit MX outlier quantization, accuracy + serving repro"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+readme = "README.md"
+authors = [{ name = "Youngmin17", email = "galateia2331@gmail.com" }]
+# Bare install pulls nothing heavy; everything is opt-in per method.
+dependencies = []
+
+[project.optional-dependencies]
+# ── figure plotting only (CPU, no model) ──────────────────────────────────────
+fig = ["numpy", "matplotlib"]
+
+# ── OMMX: Triton paged-decode kernel + HF-eager + vLLM best-recipe ────────────
+#   also: `pip install -e ommx_gpu_serve` (the kernel package) and `-e eval` for RULER.
+#   flash-attn optional (faster long-ctx prefill); drivers fall back to sdpa if absent.
+ommx = [
+    "torch>=2.4.0",
+    "triton>=3.0.0",
+    "transformers>=4.52",
+    "accelerate>=0.30",
+    "vllm>=0.11",
+    "numpy",
+    "matplotlib",
+]
+
+# ── KIVI: real 2-bit KV kernel (Triton fallback; build kivi_gemv CUDA from upstream) ──
+#   KIVI targets an older transformers (cache_utils.Cache + _prepare_4d_causal_attention_mask).
+kivi = [
+    "torch>=2.4.0",
+    "transformers>=4.40,<4.50",
+    "accelerate>=0.30",
+    "triton>=2.3.0",
+    "numpy",
+]
+
+# ── Kitty: 2-bit + INT4-channel boost. Needs external `kitty` package (KITTY_PKG_PATH) ──
+#   Kitty modeling pins transformers 4.53.2 exactly (masking_utils + CacheConfig).
+kitty = [
+    "torch>=2.4.0",
+    "transformers==4.53.2",
+    "accelerate>=0.30",
+    "triton>=3.0.0",
+    "numpy",
+]
+
+
+# ── lm-eval deps (RULER, coqa). Prefer `pip install -e eval` (authoritative).
+#    lm-eval degrades gracefully without sacrebleu/pytablewriter/peft (lazy-guarded),
+#    but install them for full output formatting + the HFLM adapter.
+eval = [
+    "datasets>=2.16",
+    "evaluate",
+    "sacrebleu",
+    "rouge-score",
+    "nltk",
+    "jsonlines",
+    "sqlitedict",
+    "pytablewriter",
+    "peft",
+    "tqdm",
+    "numpy",
+]
+
+dev = ["pytest", "numpy", "matplotlib"]
+
+# No packages: this root is a dependency-bundle project only (real code lives in the
+# ommx_gpu_serve/, eval/ sub-packages installed separately, plus PYTHONPATH source dirs).
+[tool.setuptools]
+packages = []
