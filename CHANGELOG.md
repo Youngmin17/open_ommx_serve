@@ -62,3 +62,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   collecting it as this run's result.
 - README documents named recipes, the `ommx_w` offline-pack and serving flow, and what a
   quoted number does and does not cover.
+- README is an artifact README: what the artifact contains, setup, reproduce, recipes,
+  limitations, citation. Provenance and forensic detail moved to `docs/MEASUREMENT_NOTES.md`
+  rather than dropped, so no caveat a reader needs is lost.
+
+### Removed
+- README no longer says the `ommx_w` serving path is GPU-unverified; it has been served end to
+  end and its accuracy measured through the CUDA kernel.
