@@ -4,7 +4,7 @@
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
-#     http://www.apache.org/licenses/LICENSE-2.0
+#    http://www.apache.org/licenses/LICENSE-2.0
 #
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
@@ -242,28 +242,28 @@ def get_dataset(
     return write_jsons
 
 def safe_get_tokenizer(pretrained, tokenizer_revision=None):
-    """안전한 토크나이저 추출"""
+    """Safely extract the tokenizer name"""
     if isinstance(pretrained, dict):
-        # 딕셔너리에서 모델명 추출
+        # extract the model name from a dict
         model_name = pretrained.get('name_or_path') or pretrained.get('pretrained') or 'togethercomputer/Llama-2-7B-32K'
         return get_tokenizer(
             model_name, tokenizer_revision=tokenizer_revision,
             ruler_builder="ruler_vt",
         )
     elif hasattr(pretrained, 'name_or_path'):
-        # 모델 객체에서 이름 추출
+        # extract the name from a model object
         return get_tokenizer(
             pretrained.name_or_path, tokenizer_revision=tokenizer_revision,
             ruler_builder="ruler_vt",
         )
     elif pretrained:
-        # 문자열인 경우
+        # already a string
         return get_tokenizer(
             pretrained, tokenizer_revision=tokenizer_revision,
             ruler_builder="ruler_vt",
         )
     else:
-        # 기본값 사용
+        # fall back to the default
         return get_tokenizer(
             'togethercomputer/Llama-2-7B-32K',
             tokenizer_revision=tokenizer_revision,

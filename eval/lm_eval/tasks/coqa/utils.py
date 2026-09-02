@@ -7,7 +7,7 @@ from collections import Counter
 
 def doc_to_text(doc):
     """
-    공식 CoQA 프롬프트 생성 (표준 버전)
+    Build the official CoQA prompt (standard version).
     """
     # Given a passage p, the conversation history {q1, a1, . . . qi−1, ai−1}
     # and a question qi, the task is to predict the answer ai
@@ -25,7 +25,7 @@ def doc_to_text(doc):
 
 def doc_to_target(doc):
     """
-    공식 타겟 답변 추출 (표준 버전)
+    Extract the official target answer (standard version).
     """
     turn_id = len(doc["questions"]["input_text"])
     # Returns unique answers and valid alternatives (Some questions in CoQA have multiple valid answers).
@@ -45,7 +45,7 @@ def doc_to_target(doc):
 
 
 def normalize_answer_official(s):
-    """CoQA 공식 답변 정규화 (SQuAD 스타일 기반)"""
+    """Official CoQA answer normalization (SQuAD-style)."""
     def remove_articles(text):
         return re.sub(r'\b(a|an|the)\b', ' ', text)
     
@@ -63,19 +63,19 @@ def normalize_answer_official(s):
 
 
 def get_tokens_official(s):
-    """공식 토큰화 방법"""
+    """Official tokenization."""
     if not s:
         return []
     return normalize_answer_official(s).split()
 
 
 def compute_exact_match_official(a_gold, a_pred):
-    """공식 정확 매치 계산"""
+    """Official exact-match computation."""
     return int(normalize_answer_official(a_gold) == normalize_answer_official(a_pred))
 
 
 def compute_f1_official(a_gold, a_pred):
-    """공식 F1 점수 계산 (word-level)"""
+    """Official F1 score (word level)."""
     gold_toks = get_tokens_official(a_gold)
     pred_toks = get_tokens_official(a_pred)
     
@@ -83,7 +83,7 @@ def compute_f1_official(a_gold, a_pred):
     num_same = sum(common.values())
     
     if len(gold_toks) == 0 or len(pred_toks) == 0:
-        # 둘 다 비어있으면 1, 하나만 비어있으면 0
+        # both empty -> 1; exactly one empty -> 0
         return int(gold_toks == pred_toks)
     
     if num_same == 0:
@@ -98,37 +98,37 @@ def compute_f1_official(a_gold, a_pred):
 
 def clean_corrupted_text(text):
     """
-    깨진 텍스트를 정리하는 함수 (강화된 버전)
+    Clean up mangled text (hardened version).
     """
     if not text or not isinstance(text, str):
         return ""
     
-    # 기본 정리
+    # basic cleanup
     text = text.strip()
     
-    # 너무 긴 숫자 시퀀스 제거 (예: 2000000000000)
+    # drop over-long digit runs (e.g. 2000000000000)
     text = re.sub(r'\b\d{8,}\b', '', text)
     
-    # 16진수 같은 패턴 제거 (예: 2000e0e0)
+    # drop hex-looking patterns (e.g. 2000e0e0)
     text = re.sub(r'\b[a-f0-9]{8,}\b', '', text)
     
-    # JSON/딕셔너리 패턴 제거 (예: 'filter': 'none')
+    # drop JSON/dict patterns (e.g. 'filter': 'none')
     text = re.sub(r"['\"][^'\"]*['\"]:\s*['\"][^'\"]*['\"]", '', text)
     text = re.sub(r"\['[^']*'\]", '', text)
     
-    # 특수 구두점 패턴 제거 (예: |, 등)
+    # drop stray punctuation patterns (e.g. |)
     text = re.sub(r'[|{}[\]]+', ' ', text)
     
-    # 연속된 특수문자 제거 (3개 이상)
+    # drop runs of 3+ special characters
     text = re.sub(r'[^\w\s\.\,\!\?\-\'\"]{3,}', ' ', text)
     
-    # 비정상적인 문자 패턴 제거
-    text = re.sub(r'[^\x20-\x7E]+', ' ', text)  # ASCII 범위 외 문자 제거
+    # drop malformed character patterns
+    text = re.sub(r'[^\x20-\x7E]+', ' ', text)  # strip non-ASCII characters
     
-    # 연속된 공백 정리
+    # collapse repeated whitespace
     text = re.sub(r'\s+', ' ', text)
     
-    # 너무 많은 연속된 같은 문자 제거
+    # drop long runs of one repeated character
     text = re.sub(r'(.)\1{10,}', r'\1', text)
     
     return text.strip()
@@ -136,12 +136,12 @@ def clean_corrupted_text(text):
 
 def is_text_corrupted(text):
     """
-    텍스트가 깨졌는지 판단하는 함수 (강화된 버전)
+    Decide whether the text is mangled (hardened version).
     """
     if not text or len(text) < 2:
         return True
     
-    # 정상적인 단어의 비율 확인
+    # measure the share of well-formed words
     words = text.split()
     if not words:
         return True
@@ -149,15 +149,15 @@ def is_text_corrupted(text):
     normal_words = 0
     suspicious_patterns = 0
     
-    for word in words[:10]:  # 처음 10개 단어만 확인
-        # 정상적인 영어 단어인지 확인 (글자와 일반적인 구두점만 포함)
+    for word in words[:10]:  # inspect only the first 10 words
+        # well-formed English word? (letters and ordinary punctuation only)
         if re.match(r'^[a-zA-Z\'\-\.]+$', word) and len(word) <= 20:
             normal_words += 1
-        # 의심스러운 패턴 확인
+        # check for suspicious patterns
         elif re.match(r'^[0-9a-f]{6,}$', word) or len(word) > 25:
             suspicious_patterns += 1
     
-    # 정상 단어 비율이 30% 미만이거나 의심스러운 패턴이 많으면 깨진 것으로 판단
+    # call it mangled if <30% of words are well-formed, or suspicious patterns dominate
     normal_ratio = normal_words / min(len(words), 10)
     suspicious_ratio = suspicious_patterns / min(len(words), 10)
     
@@ -166,15 +166,15 @@ def is_text_corrupted(text):
 
 def extract_answer_standard(model_output):
     """
-    표준 답변 추출 함수 (공식 방법론 + 안전성 강화)
+    Standard answer extraction (official methodology, hardened).
     """
     if not model_output or not model_output.strip():
         return ""
     
-    # 기본 정리
+    # basic cleanup
     output = clean_corrupted_text(model_output.strip())
     
-    # Q: 패턴 이전까지만 추출 (더 강력한 패턴 매칭)
+    # keep only what precedes a 'Q:' marker (stronger matching)
     q_patterns = [r'\nQ:', r'\n\nQ:', r'Q:', r' Q:']
     for pattern in q_patterns:
         q_match = re.search(pattern, output)
@@ -182,24 +182,24 @@ def extract_answer_standard(model_output):
             output = output[:q_match.start()].strip()
             break
     
-    # 첫 번째 줄만 추출 (공식 방법론 준수)
+    # take the first line only (official methodology)
     first_line = output.split('\n')[0].strip()
     
-    # Q: 패턴이 남아있으면 제거
+    # drop any leftover 'Q:' marker
     first_line = re.sub(r'\s*Q:\s*.*$', '', first_line).strip()
     
-    # 텍스트가 깨졌는지 확인
+    # check whether the text is mangled
     if is_text_corrupted(first_line):
-        # 깨진 경우, 더 보수적으로 처리
+        # if mangled, fall back to something more conservative
         words = first_line.split()
         clean_words = []
         
-        for word in words[:20]:  # 최대 20개 단어까지만
-            # 정상적인 단어 패턴 확인
+        for word in words[:20]:  # at most 20 words
+            # check for well-formed word patterns
             if re.match(r'^[a-zA-Z0-9\'\-\.]+$', word) and len(word) <= 20:
                 clean_words.append(word)
             else:
-                break  # 비정상적인 단어가 나오면 중단
+                break  # stop at the first malformed word
         
         if clean_words:
             return ' '.join(clean_words)
@@ -211,51 +211,51 @@ def extract_answer_standard(model_output):
 
 def extract_answer_enhanced(model_output):
     """
-    향상된 답변 추출 함수 (표준 + 스마트 개선)
+    Improved answer extraction (standard plus heuristics).
     """
     if not model_output or not model_output.strip():
         return ""
     
-    # 기본 표준 추출
+    # start from the standard extraction
     standard_answer = extract_answer_standard(model_output)
     
-    # 표준 추출이 실패하면 빈 문자열 반환
+    # return an empty string if standard extraction fails
     if not standard_answer:
         return ""
     
-    # 추가적인 스마트 개선 시도
+    # try a further heuristic improvement
     output = model_output.strip()
     
-    # Q: 패턴 이전까지만 추출
+    # keep only what precedes a 'Q:' marker
     q_pattern_match = re.search(r'\nQ:', output)
     if q_pattern_match:
         output = output[:q_pattern_match.start()].strip()
     
-    # 여러 줄을 하나로 합치되, 의미있는 구분 유지
+    # join lines while keeping meaningful separation
     lines = output.split('\n')
     cleaned_lines = []
     
-    for line in lines[:3]:  # 최대 3줄까지만 처리
+    for line in lines[:3]:  # process at most 3 lines
         line = clean_corrupted_text(line)
         if line and not line.startswith('Q:') and not line.startswith('A:'):
-            # 라인이 너무 깨지지 않았는지 확인
+            # check the line is not too mangled
             if not is_text_corrupted(line):
                 cleaned_lines.append(line)
     
     if cleaned_lines:
-        # 줄바꿈을 공백으로 처리한 전체 답변
+        # whole answer with newlines flattened to spaces
         full_answer = ' '.join(cleaned_lines)
         
-        # 너무 길면 적절히 자르기
+        # truncate if over-long
         if len(full_answer.split()) > 30:
             words = full_answer.split()[:30]
             full_answer = ' '.join(words)
         
-        # 첫 번째 완전한 문장 추출
+        # take the first complete sentence
         sentences = re.split(r'[.!?]', full_answer)
         if len(sentences) > 1 and sentences[0].strip():
             first_sentence = sentences[0].strip()
-            # 첫 번째 문장이 너무 짧지 않고 정상적인 경우
+            # when the first sentence is neither too short nor malformed
             if len(first_sentence.split()) >= 2 and not is_text_corrupted(first_sentence):
                 enhanced_answer = first_sentence
             else:
@@ -263,10 +263,10 @@ def extract_answer_enhanced(model_output):
         else:
             enhanced_answer = full_answer
         
-        # 두 후보 중 더 나은 것 선택
+        # pick the better of the two candidates
         candidates = [standard_answer, enhanced_answer]
         
-        # 유효성 확인 후 선택
+        # validate, then pick
         valid_candidates = []
         for candidate in candidates:
             candidate = candidate.strip()
@@ -276,22 +276,22 @@ def extract_answer_enhanced(model_output):
         if not valid_candidates:
             return standard_answer
         
-        # 첫 번째 유효한 후보 (표준 답변) 우선
+        # prefer the first valid candidate (the standard answer)
         return valid_candidates[0]
     
-    # 모든 처리가 실패하면 표준 답변 반환
+    # fall back to the standard answer if everything fails
     return standard_answer
 
 
 def compute_scores_official(gold_list, pred):
     """
-    공식 점수 계산 (표준 CoQA 방법론)
+    Official scoring (standard CoQA methodology).
     """
     f1_sum = 0.0
     em_sum = 0.0
     
     if len(gold_list) > 1:
-        # 여러 정답이 있는 경우: 각 정답에 대해 계산하고 최고점 선택
+        # multiple gold answers: score against each and keep the best
         for i in range(len(gold_list)):
             gold_answers = gold_list[0:i] + gold_list[i + 1:]
             # predictions compared against (n) golds and take maximum
@@ -302,7 +302,7 @@ def compute_scores_official(gold_list, pred):
                 f1_sum = f1_score
                 em_sum = em_score
     else:
-        # 단일 정답
+        # single gold answer
         em_sum = compute_exact_match_official(gold_list[0], pred)
         f1_sum = compute_f1_official(gold_list[0], pred)
 
@@ -314,31 +314,31 @@ def compute_scores_official(gold_list, pred):
 
 def process_results(doc, results):
     """
-    표준 결과 처리 함수 (공식 기반 + 개선된 답변 추출)
+    Standard result processing (official base plus improved extraction).
     """
     gold_list = doc_to_target(doc)
     
-    # 공식 방식: 첫 번째 줄만 추출
+    # official behaviour: first line only
     pred_standard = extract_answer_standard(results[0])
     
-    # 향상된 답변 추출도 시도
+    # also try the improved extraction
     pred_enhanced = extract_answer_enhanced(results[0])
     
-    # 더 나은 점수를 주는 것을 선택
+    # keep whichever scores higher
     scores_standard = compute_scores_official(gold_list, pred_standard)
     scores_enhanced = compute_scores_official(gold_list, pred_enhanced)
     
-    # F1 점수가 더 높은 것을 선택 (타이일 때는 표준 우선)
+    # keep the higher F1 (ties go to the standard answer)
     if scores_enhanced["f1"] > scores_standard["f1"]:
         return scores_enhanced
     else:
         return scores_standard
 
 
-# 호환성을 위한 기존 함수들 (squad_metrics 사용하는 버전도 유지)
+# legacy helpers kept for compatibility (squad_metrics variants included)
 def compute_scores(gold_list, pred):
     """
-    기존 호환성을 위한 함수 (squad_metrics 기반)
+    Legacy compatibility helper (squad_metrics based).
     """
     f1_sum = 0.0
     em_sum = 0.0
@@ -359,7 +359,7 @@ def compute_scores(gold_list, pred):
 
 
 def em(gold_list, pred):
-    """기존 호환성을 위한 em 함수"""
+    """Legacy exact-match helper kept for compatibility."""
     em_sum = 0.0
     if len(gold_list) > 1:
         for i in range(len(gold_list)):

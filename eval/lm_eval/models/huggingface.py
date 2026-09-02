@@ -992,7 +992,7 @@ class HFLM(TemplateLM):
         all_nlls = []
         batch_size = adaptive_batch_size or self.batch_size
         
-        # 🔧 메모리 정리를 위한 배치 카운터 추가
+        # batch counter used to trigger memory cleanup
         batch_counter = 0
         
         for i in range(0, len(all_windows), batch_size):
@@ -1008,12 +1008,12 @@ class HFLM(TemplateLM):
             # Store results with their request indices
             all_nlls.extend(zip(batch_indices, batch_nlls))
             
-            # 🔧 메모리 정리: 매 5번째 배치마다 GPU 메모리 정리
+            # memory cleanup: free GPU memory every 5th batch
             batch_counter += 1
             if batch_counter % 5 == 0:
                 torch.cuda.empty_cache()
 
-        # 🔧 최종 메모리 정리
+        # final memory cleanup
         torch.cuda.empty_cache()
 
         # Remove padding if necessary
@@ -1069,8 +1069,8 @@ class HFLM(TemplateLM):
             # the negative sign on len(toks) sorts descending - this has a few advantages:
             # - time estimates will always be over not underestimates, which is more useful for planning
             # - to know the size of a batch when going through the list, you know the first one is always the batch
-            #   padded context length. this is useful to simplify the batching logic and more importantly to make
-            #   automatic adaptive batches much much easier to implement
+            #  padded context length. this is useful to simplify the batching logic and more importantly to make
+            #  automatic adaptive batches much much easier to implement
             # - any OOMs will happen right away rather than near the end
 
             toks = req[1] + req[2]
@@ -1138,7 +1138,7 @@ class HFLM(TemplateLM):
                 assert len(continuation_enc) <= self.max_length
 
                 # how this all works (illustrated on a causal decoder-only setup):
-                #          CTX      CONT
+                #         CTX      CONT
                 # inp    0 1 2 3|4 5 6 7 8 9   <- last token is deleted by inp[:, :-1]
                 # model  \               \
                 # logits   1 2 3|4 5 6 7 8 9   <- the ctx half gets tossed out by the
@@ -1286,7 +1286,7 @@ class HFLM(TemplateLM):
                         )
                     pbar.update(1)
             
-            # 🔧 중간 변수 메모리 정리
+            # release intermediate tensors
             del multi_logits, batched_inps
             if self.backend == "seq2seq":
                 del batched_conts, batched_encoder_mask
@@ -1305,8 +1305,8 @@ class HFLM(TemplateLM):
             # the negative sign on len(toks) sorts descending - this has a few advantages:
             # - time estimates will always be over not underestimates, which is more useful for planning
             # - to know the size of a batch when going through the list, you know the first one is always the batch
-            #   padded context length. this is useful to simplify the batching logic and more importantly to make
-            #   automatic adaptive batches much much easier to implement
+            #  padded context length. this is useful to simplify the batching logic and more importantly to make
+            #  automatic adaptive batches much much easier to implement
             # - any OOMs will happen right away rather than near the end
             toks = self.tok_encode(req[0])
             return -len(toks), req[0]

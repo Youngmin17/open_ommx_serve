@@ -4,7 +4,7 @@
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
-#     http://www.apache.org/licenses/LICENSE-2.0
+#    http://www.apache.org/licenses/LICENSE-2.0
 #
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
@@ -148,20 +148,20 @@ def get_dataset(pretrained, max_seq_length=None, **kwargs):
     tokenizer_revision = kwargs.get("tokenizer_revision")
     #tokenizer = get_tokenizer(pretrained)
     if isinstance(pretrained, dict):
-        # HFLM 객체에서 전달된 딕셔너리 처리
+        # handle the dict an HFLM object passes in
         model_name = pretrained.get('name_or_path', 'togethercomputer/Llama-2-7B-32K')
         tokenizer = get_tokenizer(
             model_name, tokenizer_revision=tokenizer_revision,
             ruler_builder="ruler_fwe",
         )
     elif hasattr(pretrained, 'name_or_path'):
-        # 모델 객체에서 이름 추출
+        # extract the name from a model object
         tokenizer = get_tokenizer(
             pretrained.name_or_path, tokenizer_revision=tokenizer_revision,
             ruler_builder="ruler_fwe",
         )
     else:
-        # 문자열인 경우 그대로 사용
+        # already a string - use as is
         tokenizer = get_tokenizer(
             pretrained, tokenizer_revision=tokenizer_revision,
             ruler_builder="ruler_fwe",

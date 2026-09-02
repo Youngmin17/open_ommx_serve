@@ -29,6 +29,8 @@ def _has_non_finite(tensor: Optional[torch.Tensor]) -> bool:
 
 
 import os as _os
+import sys as _sys
+import traceback as _traceback
 
 # --- GQA extension for the FUSED KIVI quantized-matmul kernel (KIVI_FUSED_GQA=1) ---------
 # The upstream KIVI fused kernel `triton_bmm_fA_qB_outer` (or `cuda_bmm_fA_qB_outer`, which
@@ -37,14 +39,269 @@ import os as _os
 # H heads and the KV cache KH=H/n_rep, so a naive fused call shape-mismatches, and the
 # obvious `repeat_kv_quant` fix produces non-contiguous strides that the kernel's internal
 # .view()/.reshape() reject. Fix: expand the PACKED head dim KH->H *contiguously*, then the
-# fused kernel runs (no fp16 KV materialize -> the real KIVI perf/memory path). N (kv_len)
-# and K stay multiples of 64 because KIVI quantizes a full residual_length(128) block at a
-# time, so the kernel's N%64/K%64 asserts hold.
-_kivi_fused_fires = [0]
+# fused kernel runs (no fp16 KV materialize -> the real KIVI perf/memory path).
+#
+# Kernel shape contract, per call site (audited against kivi/quant/matmul.py):
+#   triton_bmm_fA_qB_outer(fA=[B,H,M,K], qB=[B,H,K,N//feat_per_int]) -> [B,H,M,N]
+#   * KEY call:   fA=query [B,H,q_len,head_dim] -> kernel K=head_dim(128),
+#                 N=#quantized key tokens. Keys are only ever quantized in whole
+#                 residual_length(=128) blocks, so N is a multiple of 128 and the kernel's
+#                 `N % 64 == 0` assert holds.
+#   * VALUE call: fA=attn_weights[..., :T_vq] -> kernel K=T_vq (grows by 1 per decode step,
+#                 NOT a multiple of 64) and N=head_dim(128), so again N%64 holds. The K axis
+#                 has no assert and does not need one: the kernel masks both of its K-axis
+#                 loads (`offs_ak < K` / `offs_bk < K`, other=0), so a ragged K is exact.
+#   * group_size(=32) satisfies the kernel's `group_size % 32 == 0` (== BLOCK_SIZE_N).
+#
+# PATH ACCOUNTING (added after the fair-comparison audit). The fused branch below is
+# DEFAULT-OFF, so a plain run measures the dequant->fp16 + repeat_kv_quant + dense-matmul
+# fallback, which materialises the whole dequantised KV expanded n_rep-fold on EVERY decode
+# step of EVERY layer (n_rep=4 for Llama-3.1-8B: 32 q heads / 8 kv heads). Whether that is a
+# handicap is a MEASURED question, and the measurement says "only at short context". H100 NVL,
+# Llama-3.1-8B, both paths prewarmed and every cell taken in both arm orders (fused_fires
+# proves which path ran), decode TPOT in ms:
+#     ctx=1024    fallback 67.98 / 70.88  ->  fused 60.24 / 59.27   fused/fallback 0.861
+#     ctx=4096    fallback 66.63 / 68.33  ->  fused 106.24 / 107.55 fused/fallback 1.584
+#     ctx=16384   fallback 144.10/130.03  ->  fused 360.51 / 338.76 fused/fallback 2.551
+# So the fused kernel is 1.16x FASTER at 1K and 1.58x / 2.55x SLOWER at 4K / 16K. The
+# default-off fallback is therefore the BETTER KIVI at every context this repo publishes
+# (>= 4096) - it is not a handicap there, and no text in this file may imply otherwise.
+# (An earlier un-prewarmed sweep reported 1.44x for fused at ctx=1024; that cell was
+# contaminated by a 57.7 s first-arm triton JIT and is retracted.) What must never again be
+# invisible is WHICH path ran, not which one is assumed to be faster:
+#   * the default stays OFF, so previously published KIVI numbers remain reproducible;
+#   * first use prints a one-time stderr notice naming the path that is actually running and
+#     the env var that switches it (silence with KIVI_QUIET=1);
+#   * fused fires and fallback fires are counted separately, and any exception that demotes
+#     the fused branch to the slow path is RECORDED (site/type/message/frame) instead of
+#     being swallowed - `kivi_fused_stats()` is the machine-readable evidence, and
+#     KIVI_FUSED_STRICT=1 still re-raises instead of falling back.
+#   * the gate covers ONLY the two decode/short-prefill helpers below. Long prefill
+#     (q_len > _PREFILL_CHUNK_THRESHOLD) goes through _chunked_prefill_attention, which
+#     dequantizes + repeat_kv_quant + dense-matmuls unconditionally and has no fused variant.
+#     Those calls are counted too (_kivi_chunked_prefill_fires, folded into fallback_fires),
+#     otherwise a 32K/64K run could report path=="fused" with fallback_fires==0 while its
+#     whole prefill ran the handicapped path - exactly the invisible handicap this
+#     accounting exists to prevent. kivi_fused_stats() derives its `path` label from that
+#     counter EXPLICITLY as well, so the label cannot regress to "fused" if the fold into
+#     fallback_fires is ever removed.
+#   * WHAT THIS MEANS FOR A PUBLISHED fused-vs-fallback COMPARISON: the PREFILL is the same
+#     unfused code in both modes. With use_flash=False and q_len > 4096 it is
+#     _chunked_prefill_attention (dequant -> fp16 -> dense); with use_flash=True (what
+#     figure/bench.py and eval/lm_eval/models/kivi_model.py both set) it is flash_attn on the
+#     un-quantised prefill tensors. Neither reads KIVI_FUSED_GQA. So TTFT is identical BY
+#     CONSTRUCTION and the ONLY thing the flag can move is DECODE (TPOT): a "fused KIVI is
+#     N x" number at 4K/8K/16K/32K is a decode-only number and must never be quoted as an
+#     end-to-end speedup. That is exactly the regime the published contexts live in.
+#   * both quantized-KV matmul paths are fp16-ONLY - the dequant fallback's
+#     unpack_and_dequant_triton_packed hard-casts its output to torch.float16
+#     (kivi/quant/new_pack.py:110) and the fused kernel allocates a torch.float16 output
+#     (kivi/quant/matmul.py:254). A bfloat16 checkpoint is rejected up front by
+#     _kivi_check_fp16 rather than mixing dtypes or dying inside triton, and nothing is cast
+#     on the caller's behalf: a silent cast would change the numerics being measured.
+_kivi_fused_fires = [0]         # fused dequant+matmul kernel invocations (list: legacy shape)
+_kivi_fallback_fires = [0]      # dequant->fp16 + repeat + dense matmul invocations
+_kivi_chunked_prefill_fires = [0]  # _chunked_prefill_attention dequant+dense calls (see below)
+_kivi_direct_fused_fires = [0]  # UNGATED upstream fused-kernel calls (cuda_bmm_fA_qB_outer
+                                # invoked directly, not through _fused_bmm_padM). None exist in
+                                # this file; the Mistral sibling has two, and it shares these
+                                # counters, so the `path` label must be able to see them -
+                                # otherwise a Mistral use_flash=True run reports "unused" while
+                                # a fused kernel is firing on every decode step.
+_kivi_fused_errors = []         # deduped [{site,type,msg,where,count}] fused->fallback demotions
+_kivi_fused_errors_total = [0]  # total demotions, including any dropped by the dedupe cap
+_kivi_fused_errors_capped = [False]
+_KIVI_MAX_RECORDED_ERRORS = 16  # 32 layers x N steps must not grow the record without bound
+_kivi_notice_done = [False]     # one-time "which path am I on" stderr notice
+_kivi_direct_notice_done = [False]  # one-time notice for the UNGATED fused call sites
+_KIVI_KERNEL_BLOCK_M = 32       # must match BLOCK_SIZE_M in matmul.py::triton_bmm_fA_qB_outer
+
+
+def _kivi_stderr(msg):
+    """Diagnostics go to stderr only: the benchmark harnesses parse stdout."""
+    _sys.stderr.write(msg if msg.endswith("\n") else msg + "\n")
+    _sys.stderr.flush()
+
+
+_KIVI_ENV_FALSEY = ("0", "", "false", "off", "no")
+
+
+def _kivi_env_flag(name):
+    """The single truthiness rule for every KIVI_* gate in this file: "0", "", "false", "off"
+    and "no" (any case, surrounding whitespace ignored) mean OFF; anything else means ON.
+
+    BEHAVIOUR CHANGE (wave 2), deliberate: KIVI_FUSED_STRICT used to be read as
+    bool(_os.environ.get("KIVI_FUSED_STRICT")), and bool("0") is True - so `KIVI_FUSED_STRICT=0`,
+    the obvious way to spell "off", actually armed strict mode and turned any fused-path
+    demotion into a hard abort. kivi_fused_stats()["strict"] used the same expression and so
+    faithfully reported strict=True for a run the user had switched off. Both now go through
+    this helper, so the gate and the reported gate state agree with each other and with
+    KIVI_FUSED_GQA / KIVI_QUIET. The change can only turn a spurious raise into normal
+    (recorded, warned, demoted) operation - never a raise into a silent pass, because
+    "1"/"true"/"on"/anything-else still mean strict."""
+    return _os.environ.get(name, "0").strip().lower() not in _KIVI_ENV_FALSEY
+
+
+def _kivi_quiet():
+    """KIVI_QUIET=1 silences the informational path notice. It deliberately does NOT
+    silence fused-path error warnings: a quiet run may hide a notice, never a failure."""
+    return _kivi_env_flag("KIVI_QUIET")
+
+
+def _kivi_path_notice_once(n_rep):
+    """One-time stderr notice stating which quantized-KV matmul path this process runs.
+
+    Emitted on first *use* (not at import), because the gate is an env var that a caller may
+    set after importing. It is informational only - it changes no behaviour."""
+    if _kivi_notice_done[0]:
+        return
+    _kivi_notice_done[0] = True
+    if _kivi_quiet():
+        return
+    if _fused_gqa_enabled():
+        _kivi_stderr(
+            "[kivi] quantized-KV matmul path: FUSED (KIVI_FUSED_GQA=%r).\n"
+            "[kivi]   Packed-int dequant+matmul kernel; no fp16 KV materialize. GQA heads are\n"
+            "[kivi]   expanded on the PACKED cache (n_rep=%d).\n"
+            "[kivi]   Demotions back to the dequant fallback are counted and recorded:\n"
+            "[kivi]   kivi_fused_stats(). KIVI_FUSED_STRICT=1 turns a demotion into a raise.\n"
+            "[kivi]   Silence this notice with KIVI_QUIET=1."
+            % (_os.environ.get("KIVI_FUSED_GQA"), n_rep)
+        )
+    else:
+        _kivi_stderr(
+            "[kivi] quantized-KV matmul path: DEQUANT-FALLBACK (KIVI_FUSED_GQA is off).\n"
+            "[kivi]   Every step dequantizes the packed low-bit KV to fp16 and expands it\n"
+            "[kivi]   n_rep=%d-fold (GQA) before a dense matmul. This is NOT the fused KIVI\n"
+            "[kivi]   kernel: it is more memory-hungry than KIVI can be. It is NOT uniformly\n"
+            "[kivi]   slower - measured H100 decode TPOT has the fused kernel 1.16x faster at\n"
+            "[kivi]   ctx=1024 but 1.58x / 2.55x SLOWER at ctx=4096 / 16384, so at every\n"
+            "[kivi]   context this repo publishes THIS path is the faster one.\n"
+            "[kivi]   A fused GQA path lives in this same file (_repeat_head_contig +\n"
+            "[kivi]   _fused_bmm_padM); enable it with KIVI_FUSED_GQA=1 (add KIVI_FUSED_STRICT=1\n"
+            "[kivi]   to make a fused failure raise instead of demoting to this path).\n"
+            "[kivi]   Path evidence at runtime: kivi_fused_stats(). Silence: KIVI_QUIET=1."
+            % (n_rep,)
+        )
+
+
+def _kivi_record_fused_error(site, exc):
+    """Record a fused->fallback demotion instead of swallowing it (no silent fallback).
+
+    Deduped on (site, type, message) so a 32-layer x N-step run cannot spam either the log
+    or the record; one stderr warning per unique entry, counts kept for all of them."""
+    _kivi_fused_errors_total[0] += 1
+    frames = _traceback.extract_tb(exc.__traceback__)
+    where = ("%s:%d in %s" % (frames[-1].filename, frames[-1].lineno, frames[-1].name)
+             if frames else "<no traceback>")
+    etype, emsg = type(exc).__name__, str(exc)
+    for rec in _kivi_fused_errors:
+        if rec["site"] == site and rec["type"] == etype and rec["msg"] == emsg:
+            rec["count"] += 1
+            return
+    if len(_kivi_fused_errors) < _KIVI_MAX_RECORDED_ERRORS:
+        _kivi_fused_errors.append(
+            {"site": site, "type": etype, "msg": emsg, "where": where, "count": 1})
+        # Under KIVI_FUSED_STRICT the caller re-raises right after this, so do not tell the
+        # user a fallback number is coming - nothing is measured at all in that case.
+        outcome = ("and KIVI_FUSED_STRICT is set, so this run is about to abort."
+                   if _kivi_fused_strict() else
+                   "and was demoted to the dequant+dense fallback - the number you are\n"
+                   "[kivi]   about to measure is the UNFUSED path, not the one you asked for.\n"
+                   "[kivi]   (Unfused is not automatically slower: measured H100 decode TPOT\n"
+                   "[kivi]   makes it 1.16x slower at ctx=1024 but 1.58x/2.55x FASTER at\n"
+                   "[kivi]   ctx=4096/16384. Either way the label must match the kernel.)")
+        _kivi_stderr(
+            "[kivi] WARNING: fused GQA path failed %s\n"
+            "[kivi]   site=%s  %s: %s\n"
+            "[kivi]   at %s\n"
+            "[kivi]   Without KIVI_FUSED_STRICT this demotes silently to the unfused path.\n"
+            "[kivi]   Full record: kivi_fused_stats()."
+            % (outcome, site, etype, emsg, where))
+    elif not _kivi_fused_errors_capped[0]:
+        _kivi_fused_errors_capped[0] = True
+        _kivi_stderr(
+            "[kivi] WARNING: fused-path error record capped at %d unique entries; further\n"
+            "[kivi]   distinct failures are counted in errors_total only."
+            % (_KIVI_MAX_RECORDED_ERRORS,))
+
+
+def kivi_fused_stats():
+    """Which quantized-KV matmul path actually ran, as machine-readable evidence.
+
+    Returns a dict:
+      enabled        bool      - KIVI_FUSED_GQA gate state, re-read at call time
+      strict         bool      - KIVI_FUSED_STRICT (a fused failure raises instead of demoting)
+      gate_env       str|None  - raw KIVI_FUSED_GQA value, for provenance capture
+      fused_fires    int       - fused dequant+matmul kernel calls made through the gate
+      direct_fused_fires int   - UNGATED fused-kernel calls (the Mistral sibling's use_flash
+                                 attention calls cuda_bmm_fA_qB_outer directly); they count as
+                                 fused for `path` but are kept separate so the gate's own
+                                 effect stays readable
+      fallback_fires int       - dequant->fp16 + repeat + dense matmul calls (all sites)
+      chunked_prefill_fires int - the subset of those that came from the long-prefill path,
+                                  which has NO fused variant at all (see PATH ACCOUNTING)
+      path           str       - "fused" | "dequant-fallback" | "mixed" | "unused"
+      errors         list      - [{site,type,msg,where,count}] fused->fallback demotions
+      errors_total   int       - total demotions (>= sum of counts if the record was capped)
+
+    `path == "mixed"` means some layers/steps ran fused and some did not: any published
+    latency from such a run is a blend of two kernels and must not be quoted as either. A run
+    with chunked_prefill_fires > 0 can therefore never read "fused", which is correct: the long
+    prefill has no fused variant, so such a run IS a blend (and its TTFT is the unfused one -
+    see PATH ACCOUNTING)."""
+    fused = _kivi_fused_fires[0]
+    direct = _kivi_direct_fused_fires[0]
+    fallback = _kivi_fallback_fires[0]
+    chunked = _kivi_chunked_prefill_fires[0]
+    # `chunked` is already folded into `fallback` at the call site, so `fallback or chunked` is
+    # redundant TODAY. It is written out anyway: the whole point of this label is that an
+    # unfused long prefill can never be reported as "fused", and that guarantee must not depend
+    # on a double-count in a different function that a later edit could quietly drop.
+    any_fused = fused + direct
+    any_unfused = fallback or chunked
+    if any_fused and any_unfused:
+        path = "mixed"
+    elif any_fused:
+        path = "fused"
+    elif any_unfused:
+        path = "dequant-fallback"
+    else:
+        path = "unused"
+    return {
+        "enabled": _fused_gqa_enabled(),
+        "strict": _kivi_fused_strict(),
+        "gate_env": _os.environ.get("KIVI_FUSED_GQA"),
+        "fused_fires": fused,
+        "direct_fused_fires": direct,
+        "fallback_fires": fallback,
+        "chunked_prefill_fires": chunked,
+        "path": path,
+        "errors": [dict(rec) for rec in _kivi_fused_errors],
+        "errors_total": _kivi_fused_errors_total[0],
+    }
+
+
+def kivi_reset_fused_stats():
+    """Zero the counters/records (e.g. after warmup, before the measured window). The
+    one-time path notice is NOT re-armed: it describes the process, not the window."""
+    _kivi_fused_fires[0] = 0
+    _kivi_direct_fused_fires[0] = 0
+    _kivi_fallback_fires[0] = 0
+    _kivi_chunked_prefill_fires[0] = 0
+    del _kivi_fused_errors[:]
+    _kivi_fused_errors_total[0] = 0
+    _kivi_fused_errors_capped[0] = False
 
 
 def _repeat_head_contig(x, n_rep):
-    """[B, KH, *rest] -> [B, KH*n_rep, *rest], contiguous (valid strides for the fused kernel)."""
+    """[B, KH, *rest] -> [B, KH*n_rep, *rest], contiguous (valid strides for the fused kernel).
+
+    Head ordering is torch.repeat_interleave(dim=1) semantics - each KV head repeated n_rep
+    times CONSECUTIVELY (out head h reads in head h // n_rep), identical to repeat_kv /
+    repeat_kv_quant below. A tiling order (h % KH) would pair every query head with the wrong
+    KV head and no shape assert would catch it, so this is proven by
+    _selfcheck_repeat_head_contig()."""
     if n_rep == 1:
         return x.contiguous()
     B, KH = x.shape[0], x.shape[1]
@@ -52,11 +309,22 @@ def _repeat_head_contig(x, n_rep):
     return x[:, :, None].expand(B, KH, n_rep, *rest).reshape(B, KH * n_rep, *rest).contiguous()
 
 
-def _fused_bmm_padM(group_size, fA, qB, sc, zp, bits, BM=32):
+def _fused_bmm_padM(group_size, fA, qB, sc, zp, bits, BM=_KIVI_KERNEL_BLOCK_M):
     """qbmm_kernel assumes M is a multiple of BLOCK_SIZE_M(=32); decode has M=1, which would
-    read rows 1..31 out of bounds. Pad the query rows up to a multiple of 32 (zeros), run the
-    fused dequant+matmul, slice back. This is the missing piece that lets the fused KIVI kernel
-    run on the GQA single-token decode."""
+    read rows 1..31 of the A operand out of bounds: matmul.py:66 builds a_ptrs with
+    offs_am[:, None] over a full BLOCK_SIZE_M tile and matmul.py:84 loads it with mask
+    `offs_ak < K` only - the K axis is masked, the M axis of that load is not. (The *store*
+    at matmul.py:109-111 is M-masked, `offs_cm < M`, so the risk is an OOB read, not a
+    corrupted output.) Pad the query rows up to a multiple of 32 (zeros), run the fused
+    dequant+matmul, slice back. This is the missing piece that lets the fused KIVI kernel run
+    on the GQA single-token decode.
+
+    The padding cannot pollute the result: the kernel is row-wise in M (accumulator is
+    (BLOCK_SIZE_M, BLOCK_SIZE_N) and tl.dot keeps row m dependent on A row m only), the
+    appended rows are exact zeros, and they are sliced off. Proven by
+    _selfcheck_fused_bmm_padM(). BM must track
+    BLOCK_SIZE_M in kivi/quant/matmul.py::triton_bmm_fA_qB_outer, which hardcodes 32 on both
+    of its config branches."""
     B, H, M, K = fA.shape
     r = M % BM
     if r != 0:
@@ -66,10 +334,77 @@ def _fused_bmm_padM(group_size, fA, qB, sc, zp, bits, BM=32):
 
 
 def _fused_gqa_enabled():
-    return _os.environ.get("KIVI_FUSED_GQA", "0") not in ("0", "", "false", "off", "no")
+    return _kivi_env_flag("KIVI_FUSED_GQA")
+
+
+def _kivi_fused_strict():
+    """KIVI_FUSED_STRICT=1: a fused->fallback demotion re-raises instead of demoting, so a
+    latency can never be measured on a path the caller did not ask for. See _kivi_env_flag for
+    the "0 now means off" fix."""
+    return _kivi_env_flag("KIVI_FUSED_STRICT")
+
+
+def _kivi_check_fp16(site, **tensors):
+    """Reject a non-fp16 model AT THE BOUNDARY, loudly, instead of casting it or dying deep.
+
+    Both quantized-KV matmul paths in this file are float16-only, and neither of them says so:
+      * the dequant fallback calls kivi/quant/new_pack.py::unpack_and_dequant_triton_packed,
+        which hard-casts with `data = data.to(torch.float16)` (new_pack.py:110). A bfloat16
+        query therefore meets an fp16 key inside torch.matmul and dies with a dtype error
+        raised from a line that mentions neither KIVI nor the constraint;
+      * the fused path calls kivi/quant/matmul.py::triton_bmm_fA_qB_outer, which allocates its
+        output as `torch.empty(..., dtype=torch.float16)` (matmul.py:254) and whose kernel
+        finishes with `accumulator.to(tl.float16)` (matmul.py:105) - a bfloat16 operand either
+        faults inside triton or produces an fp16 buffer the caller goes on to read as bf16.
+    Every other model path in this repo runs bf16 by default, so this is a foot-gun that a
+    benchmark hits the first time KIVI is pointed at a non-fp16 checkpoint.
+
+    Note which tensors are checked: the packed cache itself is int32, so its FLOAT dtype lives
+    in the scale/zero-point tensors (triton_quantize_and_pack_along_last_dim allocates them
+    with dtype=data.dtype, new_pack.py:257-258). Checking query/attn-weights plus the scales
+    is what actually catches a bf16 checkpoint.
+
+    This deliberately does NOT cast. A silent cast would change the numerics under measurement
+    and hide the fact that KIVI was never evaluated in the dtype that was asked for; the caller
+    must load the model with torch_dtype=torch.float16, which is KIVI's own published recipe."""
+    for name, tensor in tensors.items():
+        if tensor is not None and tensor.dtype != torch.float16:
+            raise TypeError(
+                "[kivi] %s: the quantized-KV matmul path is float16-ONLY, but %s is %s. "
+                "unpack_and_dequant_triton_packed() hard-casts its output to torch.float16 "
+                "(kivi/quant/new_pack.py:110) and triton_bmm_fA_qB_outer() allocates a "
+                "torch.float16 output (kivi/quant/matmul.py:254), so neither the fused nor the "
+                "dequant path can serve %s. Load the model with torch_dtype=torch.float16 "
+                "(KIVI's published recipe). No cast is applied on your behalf - that would "
+                "silently change the numerics being measured."
+                % (site, name, tensor.dtype, tensor.dtype))
+
+
+def _kivi_direct_fused_notice_once(where):
+    """One-time notice for an UNGATED fused-kernel call site (see _kivi_direct_fused_fires).
+
+    It cannot reuse _kivi_path_notice_once: that notice reports the KIVI_FUSED_GQA gate, and an
+    ungated site runs the fused kernel whatever the gate says - printing "DEQUANT-FALLBACK"
+    there would be an outright false statement about which kernel is running."""
+    if _kivi_direct_notice_done[0]:
+        return
+    _kivi_direct_notice_done[0] = True
+    if _kivi_quiet():
+        return
+    _kivi_stderr(
+        "[kivi] quantized-KV matmul path: FUSED (UNGATED) at %s.\n"
+        "[kivi]   This call site invokes the upstream cuda_bmm_fA_qB_outer directly and does\n"
+        "[kivi]   NOT read KIVI_FUSED_GQA, so the gate does not describe it. Counted as\n"
+        "[kivi]   direct_fused_fires in kivi_fused_stats(). Silence this notice with\n"
+        "[kivi]   KIVI_QUIET=1." % (where,))
 
 
 def _fallback_key_quant_matmul(query_states, key_states_quant_trans, key_scale_trans, key_mn_trans, group_size, bits, n_rep):
+    # fp16 gate first, before any work and before the notice: both branches below are fp16-only.
+    _kivi_check_fp16("_fallback_key_quant_matmul",
+                     query_states=query_states, key_scale_trans=key_scale_trans,
+                     key_mn_trans=key_mn_trans)
+    _kivi_path_notice_once(n_rep)
     if _fused_gqa_enabled():
         try:
             qk = _repeat_head_contig(key_states_quant_trans, n_rep)   # [B,H,D,T//feat]
@@ -78,16 +413,24 @@ def _fallback_key_quant_matmul(query_states, key_states_quant_trans, key_scale_t
             out = _fused_bmm_padM(group_size, query_states, qk, sc, zp, bits)
             _kivi_fused_fires[0] += 1
             return out
-        except Exception:
-            if _os.environ.get("KIVI_FUSED_STRICT"):
+        except Exception as exc:
+            # No silent fallback: record type/message/frame (and warn once) before demoting.
+            _kivi_record_fused_error("_fallback_key_quant_matmul", exc)
+            if _kivi_fused_strict():
                 raise
     # Fallback: dequantize to fp16, expand, dense matmul (works for any GQA layout).
+    _kivi_fallback_fires[0] += 1
     key_states_trans = unpack_and_dequant_triton_packed(key_states_quant_trans, key_scale_trans, key_mn_trans, group_size, bits)
     key_states_trans = repeat_kv_quant(key_states_trans, n_rep)
     return torch.matmul(query_states, key_states_trans)
 
 
 def _fallback_value_quant_matmul(attn_weights, value_states_quant, value_scale, value_mn, group_size, bits, n_rep):
+    # fp16 gate first: attn_weights carries the model dtype (softmax is cast back to
+    # query_states.dtype at every call site), value_scale/value_mn carry the cache dtype.
+    _kivi_check_fp16("_fallback_value_quant_matmul",
+                     attn_weights=attn_weights, value_scale=value_scale, value_mn=value_mn)
+    _kivi_path_notice_once(n_rep)
     if _fused_gqa_enabled():
         try:
             vq = _repeat_head_contig(value_states_quant, n_rep)       # [B,H,T_v,D//feat]
@@ -96,12 +439,16 @@ def _fallback_value_quant_matmul(attn_weights, value_states_quant, value_scale, 
             out = _fused_bmm_padM(group_size, attn_weights, vq, sc, zp, bits)
             _kivi_fused_fires[0] += 1
             return out
-        except Exception:
-            if _os.environ.get("KIVI_FUSED_STRICT"):
+        except Exception as exc:
+            # No silent fallback: record type/message/frame (and warn once) before demoting.
+            _kivi_record_fused_error("_fallback_value_quant_matmul", exc)
+            if _kivi_fused_strict():
                 raise
+    _kivi_fallback_fires[0] += 1
     value_states = unpack_and_dequant_triton_packed(value_states_quant, value_scale, value_mn, group_size, bits)
     value_states = repeat_kv_quant(value_states, n_rep)
     return torch.matmul(attn_weights, value_states)
+
 
 
 # Chunked prefill attention: avoids materialising the full [B, H, S, S] attention matrix.
@@ -127,6 +474,30 @@ def _chunked_prefill_attention(
 ):
     B, H, S, D = query_states.shape
     dtype = query_states.dtype
+
+    # This path has NO fused variant: it always dequantizes the packed KV to fp16 and expands
+    # it n_rep-fold before a dense matmul, whatever KIVI_FUSED_GQA says. Count and announce it
+    # so a long-context run cannot report path=="fused" while its prefill ran the unfused path
+    # (which at these contexts is also the FASTER path - see the measured table in PATH
+    # ACCOUNTING; "unfused" is a provenance statement here, never a performance one).
+    #
+    # State it plainly, because this is the regime the published contexts live in: THE LONG
+    # PREFILL IS UNFUSED IN BOTH MODES. Flipping KIVI_FUSED_GQA does not change a single
+    # instruction executed here (with use_flash=True - what figure/bench.py and
+    # eval/lm_eval/models/kivi_model.py set - prefill does not even reach this function; it
+    # runs flash_attn on the un-quantised tensors, equally gate-independent). Therefore TTFT is
+    # identical BY CONSTRUCTION between the two modes, and a fused-vs-fallback comparison at
+    # ctx > _PREFILL_CHUNK_THRESHOLD is a DECODE-ONLY comparison. Report such a ratio as TPOT,
+    # never as an end-to-end or TTFT speedup.
+    if key_states_quant_trans is not None or value_states_quant is not None:
+        # fp16 gate: unpack_and_dequant_triton_packed below returns fp16 unconditionally, so a
+        # bf16 query would fail inside torch.matmul rather than here (see _kivi_check_fp16).
+        _kivi_check_fp16("_chunked_prefill_attention",
+                         query_states=query_states, key_scale_trans=key_scale_trans,
+                         value_scale=value_scale)
+        _kivi_path_notice_once(n_rep)
+        _kivi_chunked_prefill_fires[0] += 1
+        _kivi_fallback_fires[0] += 1
 
     # --- unpack quantised key (transposed form: [B, KH, D, T_k_quant]) ---
     if key_states_quant_trans is not None:
@@ -1272,3 +1643,125 @@ class LlamaForCausalLM_KIVI_eval(LlamaPreTrainedModel):
                 tuple(past_state.index_select(0, beam_idx.to(past_state.device)) for past_state in layer_past),
             )
         return reordered_past
+
+
+def _selfcheck_repeat_head_contig(verbose=True):
+    """CPU-only proof that _repeat_head_contig reproduces repeat_kv / repeat_kv_quant head
+    ordering: torch.repeat_interleave along dim 1 (each KV head repeated n_rep times
+    consecutively), never a tile order. Also checks the two properties the fused kernel
+    needs: contiguity (it does .view()/.reshape() internally) and dtype preservation (the
+    packed cache is int32, the scales are fp16)."""
+    ok = True
+    cases = [(1, 8, 4, (128, 8)), (2, 4, 2, (5, 3)), (1, 3, 1, (2, 2)),
+             (1, 2, 3, (4,)), (2, 8, 4, (16, 4, 2))]
+    for i, (B, KH, n_rep, rest) in enumerate(cases):
+        torch.manual_seed(1000 + i)
+        for dtype in (torch.float32, torch.int32):
+            if dtype.is_floating_point:
+                x = torch.randn(B, KH, *rest, dtype=dtype)
+            else:
+                x = torch.randint(-2 ** 30, 2 ** 30, (B, KH) + tuple(rest), dtype=dtype)
+            got = _repeat_head_contig(x, n_rep)
+            ref = torch.repeat_interleave(x, n_rep, dim=1)
+            assert got.shape == ref.shape, "shape %s != %s" % (got.shape, ref.shape)
+            assert got.dtype == x.dtype, "dtype changed: %s -> %s" % (x.dtype, got.dtype)
+            assert got.is_contiguous(), "fused kernel requires contiguous strides"
+            assert torch.equal(got, ref), "head ordering != torch.repeat_interleave(dim=1)"
+            if x.dim() == 4 and "repeat_kv_quant" in globals():
+                assert torch.equal(got, repeat_kv_quant(x, n_rep)), "!= repeat_kv_quant"
+            if x.dim() == 4 and "repeat_kv" in globals():
+                assert torch.equal(got, repeat_kv(x, n_rep)), "!= repeat_kv"
+        # explicit ordering witness: head kh carries the constant value kh, so out head h
+        # must carry h // n_rep (repeat_interleave) and not h % KH (tiling).
+        ident = torch.arange(KH, dtype=torch.float32).view(1, KH, *([1] * len(rest)))
+        ident = ident.expand(B, KH, *rest).contiguous()
+        out = _repeat_head_contig(ident, n_rep)
+        H = KH * n_rep
+        want = torch.arange(H, dtype=torch.float32).div(n_rep).floor()
+        tiled = torch.arange(H, dtype=torch.float32).remainder(KH)
+        seen = out.reshape(B, H, -1)[0, :, 0]
+        assert torch.equal(seen, want), "head map %s != interleave %s" % (seen, want)
+        if KH > 1 and n_rep > 1:
+            assert not torch.equal(seen, tiled), "head map is the tiled order - wrong"
+        if verbose:
+            print("  [ok] repeat_head_contig B=%d KH=%d n_rep=%d rest=%s head_map=%s"
+                  % (B, KH, n_rep, tuple(rest), [int(v) for v in seen.tolist()]))
+    if verbose:
+        print("_selfcheck_repeat_head_contig: PASS (%d cases)" % len(cases))
+    return ok
+
+
+def _selfcheck_fused_bmm_padM(verbose=True):
+    """CPU-only proof that the M-padding in _fused_bmm_padM (a) always hands the kernel an M
+    that is a multiple of BLOCK_SIZE_M - the kernel does not mask its M axis - (b) appends
+    exact zeros, and (c) returns rows [0, M) bit-identical to the unpadded result.
+
+    The triton kernel cannot run on CPU, so it is replaced for the duration of the check by
+    a stand-in with the same contract (row-wise batched GEMM, dequant elided). Operands are
+    small integers held in fp32, so every product and sum is exact and `torch.equal` is a
+    legitimate bit-exact comparison independent of BLAS blocking."""
+    g = globals()
+    had = "triton_bmm_fA_qB_outer" in g
+    saved = g.get("triton_bmm_fA_qB_outer")
+    seen = {}
+
+    def _stand_in(group_size, fA, qB, sc, zp, bits):
+        assert fA.shape[2] % _KIVI_KERNEL_BLOCK_M == 0, \
+            "kernel got M=%d, not a multiple of BLOCK_SIZE_M=%d (would read OOB)" % (
+                fA.shape[2], _KIVI_KERNEL_BLOCK_M)
+        assert fA.is_contiguous(), "kernel does fA.view(-1, M, K): needs contiguous input"
+        seen["fA"] = fA
+        return torch.matmul(fA, qB)
+
+    try:
+        g["triton_bmm_fA_qB_outer"] = _stand_in
+        cases = [(1, 8, 1, 128, 256),   # decode: M=1 (the case the padding exists for)
+                 (1, 2, 33, 64, 128),   # M just over a block boundary
+                 (2, 4, 32, 64, 64),    # M already a multiple of 32: no padding at all
+                 (1, 1, 7, 16, 32)]
+        for i, (B, H, M, K, N) in enumerate(cases):
+            torch.manual_seed(2000 + i)
+            fA = torch.randint(-4, 5, (B, H, M, K)).float()
+            qB = torch.randint(-4, 5, (B, H, K, N)).float()
+            out = _fused_bmm_padM(32, fA, qB, None, None, 2)
+            ref = torch.matmul(fA, qB)
+            padded = seen["fA"]
+            assert padded.shape[2] % _KIVI_KERNEL_BLOCK_M == 0
+            assert padded.shape[2] - M < _KIVI_KERNEL_BLOCK_M, "over-padded"
+            if padded.shape[2] > M:
+                assert torch.equal(padded[:, :, M:], torch.zeros_like(padded[:, :, M:])), \
+                    "pad rows are not exact zeros"
+            assert torch.equal(padded[:, :, :M], fA), "padding perturbed the real rows"
+            assert out.shape == ref.shape, "%s != %s" % (out.shape, ref.shape)
+            assert torch.equal(out, ref), "padded result differs on rows [0, M)"
+            if verbose:
+                print("  [ok] fused_bmm_padM B=%d H=%d M=%d->%d K=%d N=%d bit-exact"
+                      % (B, H, M, padded.shape[2], K, N))
+    finally:
+        if had:
+            g["triton_bmm_fA_qB_outer"] = saved
+        else:
+            g.pop("triton_bmm_fA_qB_outer", None)
+    if verbose:
+        print("_selfcheck_fused_bmm_padM: PASS (%d cases)" % len(cases))
+    return True
+
+
+if __name__ == "__main__":
+    # CPU-only self-check of the fused-GQA helpers. Running this file directly needs the
+    # kivi package + transformers (imported at module top); on a bare machine run the same
+    # checks standalone by exec'ing just these helpers, e.g.
+    #   python - <<'EOF'
+    #   import ast, torch
+    #   src = open("baseline/kivi/models/llama_kivi_eval.py").read()
+    #   want = {"_repeat_head_contig", "_fused_bmm_padM", "repeat_kv_quant",
+    #           "_selfcheck_repeat_head_contig", "_selfcheck_fused_bmm_padM"}
+    #   ns = {"torch": torch, "_KIVI_KERNEL_BLOCK_M": 32}
+    #   for node in ast.parse(src).body:
+    #       if isinstance(node, ast.FunctionDef) and node.name in want:
+    #           exec(compile(ast.Module([node], []), "<x>", "exec"), ns)
+    #   ns["_selfcheck_repeat_head_contig"](); ns["_selfcheck_fused_bmm_padM"]()
+    #   EOF
+    _selfcheck_repeat_head_contig()
+    _selfcheck_fused_bmm_padM()
+    print("kivi_fused_stats():", kivi_fused_stats())

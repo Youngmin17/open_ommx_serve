@@ -76,7 +76,7 @@ class KVQuantLM(HFLM):
         use_pow2: Union[bool, str, int] = False,
         use_sliding_window: Union[bool, str, int] = False,
         window_size: int = 32,
-        #  Group quantisation options
+        # Group quantisation options
         use_group_quant: Union[bool, str, int] = False,
         group_size: int = 1024,
         attention_sink_num: int = 5,
@@ -88,21 +88,21 @@ class KVQuantLM(HFLM):
         decode_only: Union[bool, str, int] = False,
         distance_ceiling: int = 32,
         debug_mode: Union[bool, str, int] = False,
-        max_gen_toks: int = 32,  # 생성 관련 파라미터 (HFLM에 전달하지 않음)
-        #  Sliding Window FP4 관련 파라미터
+        max_gen_toks: int = 32,  # generation parameter; not forwarded to HFLM
+        # sliding-window FP4 parameters
         sliding_window_use_fp4_key: Union[bool, str, int] = False,
         sliding_window_use_fp4_value: Union[bool, str, int] = False,
-        #  Outlier 관련 파라미터
+        # outlier parameters
         outlier_precision_key: str = "int",
         outlier_precision_value: str = "int",
         detect_outliers_key: Union[bool, str, int] = True,
         detect_outliers_value: Union[bool, str, int] = True,
         outlier_method: str = "original",
         outliers_per_group: Union[int, str] = 0,
-        #  Decode FP4 강제 옵션
+        # force-FP4-on-decode option
         decode_use_fp4_key: Union[bool, str, int] = False,
         decode_use_fp4_value: Union[bool, str, int] = False,
-        #  Weight Quantization options
+        # Weight Quantization options
         use_weight_quant: Union[bool, str, int] = False,
         weight_bits: int = 2,
         weight_group_size: int = 64,
@@ -126,16 +126,16 @@ class KVQuantLM(HFLM):
         use_group_quant = _to_bool(use_group_quant)
         use_weight_quant = _to_bool(use_weight_quant)
         
-        #  Sliding Window FP4 파라미터 파싱
+        # parse the sliding-window FP4 parameters
         sliding_window_use_fp4_key = _to_bool(sliding_window_use_fp4_key)
         sliding_window_use_fp4_value = _to_bool(sliding_window_use_fp4_value)
         
-        #  Outlier 파라미터 파싱
+        # parse the outlier parameters
         detect_outliers_key = _to_bool(detect_outliers_key)
         detect_outliers_value = _to_bool(detect_outliers_value)
         outliers_per_group = _to_int_or_none(outliers_per_group) or 0
         
-        # 🔧 INT 파라미터 타입 변환 (빈 문자열 처리)
+        # coerce int parameters, tolerating empty strings
         prefill_key_bits = _to_int_or_none(prefill_key_bits)
         prefill_value_bits = _to_int_or_none(prefill_value_bits)
         decode_key_bits = _to_int_or_none(decode_key_bits)
@@ -143,23 +143,23 @@ class KVQuantLM(HFLM):
         key_bits = _to_int_or_none(key_bits)
         value_bits = _to_int_or_none(value_bits)
         weight_outlier_group_size = _to_int_or_none(weight_outlier_group_size)
-        # weight_lr_path: 빈 문자열을 None으로 변환
+        # weight_lr_path: empty string becomes None
         if isinstance(weight_lr_path, str) and weight_lr_path.strip() == '':
             weight_lr_path = None
         if weight_lr_path:
             logger.info(f"[KVQuantLM] Loading calibrated V params from: {weight_lr_path}")
         
-        # ✅ disable_exllama 파라미터 처리 (HFLM에 직접 전달하면 TypeError 발생 가능)
+        # handle disable_exllama here; forwarding it to HFLM can raise TypeError
         disable_exllama = hf_kwargs.pop("disable_exllama", False)
         if isinstance(disable_exllama, str):
             disable_exllama = disable_exllama.lower() == "true"
 
-        # 생성 관련 파라미터 저장 (HFLM에 전달하지 않음)
+        # keep generation parameters locally; not forwarded to HFLM
         self._max_gen_toks = max_gen_toks
 
         # ------------------------------------------------------------------
         # 2.  Let the parent class do the heavy lifting – downloads model,
-        #     builds tokenizer, sets up Accelerate, etc.
+        #    builds tokenizer, sets up Accelerate, etc.
         # ------------------------------------------------------------------
         # ------------------------------------------------------------------
         # 2. Load and modify config BEFORE calling super().__init__
@@ -170,7 +170,7 @@ class KVQuantLM(HFLM):
         config = AutoConfig.from_pretrained(pretrained)
         
         # ================================================================
-        # 🔧 FIX: Auto-detect and apply RoPE scaling for 32K models
+        # FIX: Auto-detect and apply RoPE scaling for 32K models
         # ================================================================
         is_together_32k = "togethercomputer" in pretrained.lower() and "32k" in pretrained.lower()
         
@@ -192,7 +192,7 @@ class KVQuantLM(HFLM):
                 config.max_position_embeddings = 32768
                 logger.info(f"[KVQuantLM] Set max_position_embeddings: 32768")
         
-        # ✅ GPTQ disable_exllama 적용
+        # apply GPTQ disable_exllama
         if disable_exllama and hasattr(config, "quantization_config"):
             logger.info("[KVQuantLM] Disabling Exllama backend as requested")
             if isinstance(config.quantization_config, dict):
@@ -200,29 +200,29 @@ class KVQuantLM(HFLM):
             else:
                 setattr(config.quantization_config, "disable_exllama", True)
              
-        #  캐시 디렉토리 설정 (환경변수 우선, 미설정시 기본값 사용)
+        # cache directory: environment variable wins, else the default
         os.environ.setdefault('HF_HOME', os.path.expanduser('~/.cache/huggingface'))
         os.environ.setdefault('TORCH_HOME', os.path.expanduser('~/.cache/torch'))
         os.environ.setdefault('HF_DATASETS_CACHE', os.path.join(os.environ['HF_HOME'], 'datasets'))
         logger.info(f"[KVQuantLM] Cache directories: HF_HOME={os.environ['HF_HOME']}")
         
-        #  GPU 메모리 최적화 설정
+        # GPU memory optimization settings
         if 'device_map' not in hf_kwargs:
-            # 병렬 처리 대신 단일 GPU 사용 (사용자가 요청한 대로 단순화)
+            # single GPU instead of parallel execution (deliberately simplified)
             hf_kwargs['device_map'] = "auto"
             logger.info(f"[KVQuantLM] Using default device_map='auto'")
 
-        # ✅ Low CPU memory 옵션 (샤드별 순차 로딩으로 Commit 공간 절약)
+        # low-CPU-memory loading: shard by shard, saving commit space
         if 'low_cpu_mem_usage' not in hf_kwargs:
             hf_kwargs['low_cpu_mem_usage'] = True
 
-        # ✅ Offload folder 설정 (극단적 OOM 대비)
+        # offload folder, for the extreme OOM case
         if 'offload_folder' not in hf_kwargs:
             offload_folder = os.path.join(QUANT_DIR, '.offload')
             os.makedirs(offload_folder, exist_ok=True)
             hf_kwargs['offload_folder'] = offload_folder
         
-        #  HFLM의 dtype 매개변수를 사용하여 torch_dtype 설정 (중복 전달 방지)
+        # set torch_dtype from HFLM's dtype argument, avoiding a duplicate kwarg
         if 'dtype' in hf_kwargs:
             del hf_kwargs['dtype']
 
@@ -234,7 +234,7 @@ class KVQuantLM(HFLM):
             **hf_kwargs,
         )
         
-        # 모델 로드 후 상태 확인
+        # check state after the model is loaded
         if hasattr(self, '_model') and self._model is not None:
             model_dtype = next(self._model.parameters()).dtype
             logger.info(f"[KVQuantLM] Model loaded. Dtype: {model_dtype}, Device: {self._model.device}")
@@ -243,7 +243,7 @@ class KVQuantLM(HFLM):
                 logger.warning("[KVQuantLM] Model is in FP32! Converting to BFloat16 to save memory...")
                 self._model = self._model.to(torch.bfloat16)
 
-            # ✅ Gradient checkpointing 활성화 (메모리 절약)
+            # enable gradient checkpointing to save memory
             try:
                 self._model.gradient_checkpointing_enable()
                 logger.info("[KVQuantLM] Gradient checkpointing enabled")
@@ -252,7 +252,7 @@ class KVQuantLM(HFLM):
 
         # ------------------------------------------------------------------
         # 3.  Apply our KV‑cache quantisation in‑place.  We operate on the
-        #     *unwrapped* model (self.model property does that for us).
+        #    *unwrapped* model (self.model property does that for us).
         # ------------------------------------------------------------------
         logger.info("[KVQuantLM] Applying KV‑cache quantisation …")
         config = getattr(self.model, 'config', None)
@@ -275,10 +275,10 @@ class KVQuantLM(HFLM):
                 # forward group quant options
                 use_group_quant=use_group_quant,
                 group_size=group_size,
-                #  Sliding Window FP4 매개변수 추가
+                # add the sliding-window FP4 arguments
                 sliding_window_use_fp4_key=sliding_window_use_fp4_key,
                 sliding_window_use_fp4_value=sliding_window_use_fp4_value,
-                #  Outlier 매개변수 추가
+                # add the outlier arguments
                 outlier_precision_key=outlier_precision_key,
                 outlier_precision_value=outlier_precision_value,
                 detect_outliers_key=detect_outliers_key,

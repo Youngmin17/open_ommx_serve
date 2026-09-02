@@ -1,7 +1,7 @@
 """lm-eval adapter for Kitty (2-bit paged KV). generate_until only (CoQA / generation).
 
 Kitty's KittyCache is a static-page cache driven by a MANUAL decode loop (see
-baseline/kv/kitty/_kitty_tpot_bench.py) — it does NOT integrate with HF `.generate()`
+baseline/kitty/_kitty_tpot_bench.py) — it does NOT integrate with HF `.generate()`
 (which would allocate its own cache and bypass the 2-bit quant). So generate_until here
 prefills the context into a fresh KittyCache then greedily decodes token-by-token through
 the Kitty 2-bit attention kernel, which is exactly the quantized-KV decode path under test.

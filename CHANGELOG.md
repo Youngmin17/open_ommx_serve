@@ -50,3 +50,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the serving path, the bench and the eval harness.
 - HF-eager arms measure batched decode and report a synchronized median step with
   percentiles, with an optional static KV cache so the arm is not paying allocation.
+- KIVI baseline arms cover Llama and Mistral end to end, and the KVQuant adapter binds
+  through the same registry as the other comparison arms.
+- Task-harness comments are English throughout (CoQA and the five RULER utilities), which
+  is the last Korean text on the evaluation path.

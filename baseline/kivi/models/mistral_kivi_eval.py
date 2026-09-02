@@ -88,15 +88,114 @@ def _has_non_finite(tensor: Optional[torch.Tensor]) -> bool:
     return tensor is not None and not torch.isfinite(tensor).all()
 
 
+# --- fused-KIVI path accounting, SHARED with the Llama sibling ---------------------------
+# llama_kivi_eval.py owns the fused-GQA extension, the fp16 gate and the provenance counters
+# (read its PATH ACCOUNTING block for the full contract). This module imports them instead of
+# cloning them, for one reason: the counters must be process-wide. A duplicated counter set
+# would let a Mistral run report path=="unused" from kivi.models.llama_kivi_eval.kivi_fused_stats
+# - the accessor every harness in this repo actually calls (figure/bench.py:260) - while a
+# fused kernel was firing on every decode step of every layer. That is exactly the misreport
+# this accounting exists to prevent, so the two modules deliberately share one set of globals.
+#
+# Import direction is clean: llama_kivi_eval imports nothing from this module (nor from any
+# other kivi.models module), so there is no cycle. Both files are siblings inside the
+# kivi.models package (baseline/kivi/models/__init__.py exists; baseline/kivi itself is a PEP
+# 420 namespace package reached with baseline/ on sys.path). The relative import is tried
+# first because it is independent of what the top-level package is named; the absolute form
+# covers a caller that put baseline/kivi/models on sys.path directly. If BOTH fail the
+# ImportError propagates - a Mistral run whose path evidence is missing must not start.
+try:
+    from .llama_kivi_eval import (
+        _fused_bmm_padM,
+        _fused_gqa_enabled,
+        _kivi_chunked_prefill_fires,
+        _kivi_check_fp16,
+        _kivi_direct_fused_fires,
+        _kivi_direct_fused_notice_once,
+        _kivi_fallback_fires,
+        _kivi_fused_fires,
+        _kivi_fused_strict,
+        _kivi_path_notice_once,
+        _kivi_record_fused_error,
+        _repeat_head_contig,
+        kivi_fused_stats,
+        kivi_reset_fused_stats,
+    )
+except ImportError:
+    from kivi.models.llama_kivi_eval import (
+        _fused_bmm_padM,
+        _fused_gqa_enabled,
+        _kivi_chunked_prefill_fires,
+        _kivi_check_fp16,
+        _kivi_direct_fused_fires,
+        _kivi_direct_fused_notice_once,
+        _kivi_fallback_fires,
+        _kivi_fused_fires,
+        _kivi_fused_strict,
+        _kivi_path_notice_once,
+        _kivi_record_fused_error,
+        _repeat_head_contig,
+        kivi_fused_stats,
+        kivi_reset_fused_stats,
+    )
+
+# kivi_fused_stats / kivi_reset_fused_stats are re-exported on purpose: a Mistral harness that
+# does `from kivi.models.mistral_kivi_eval import kivi_fused_stats` gets the same counters as a
+# Llama one, not a second empty set. __all__ is not defined in this module (it uses star
+# imports from transformers), so the names being module attributes is what makes that work.
+
+
 def _fallback_key_quant_matmul(query_states, key_states_quant_trans, key_scale_trans, key_mn_trans, group_size, bits, n_rep):
-    # Dequantize first, then use plain torch.matmul — safe for GQA head expansion.
+    # fp16 gate first, before any work and before the notice: both branches below are fp16-only
+    # (unpack_and_dequant_triton_packed hard-casts to torch.float16 at new_pack.py:110, and the
+    # fused kernel allocates a torch.float16 output at matmul.py:254). Nothing is cast here.
+    _kivi_check_fp16("mistral._fallback_key_quant_matmul",
+                     query_states=query_states, key_scale_trans=key_scale_trans,
+                     key_mn_trans=key_mn_trans)
+    _kivi_path_notice_once(n_rep)
+    if _fused_gqa_enabled():
+        try:
+            qk = _repeat_head_contig(key_states_quant_trans, n_rep)   # [B,H,D,T//feat]
+            sc = _repeat_head_contig(key_scale_trans, n_rep)          # [B,H,D,G]
+            zp = _repeat_head_contig(key_mn_trans, n_rep)             # [B,H,D,G]
+            out = _fused_bmm_padM(group_size, query_states, qk, sc, zp, bits)
+            _kivi_fused_fires[0] += 1
+            return out
+        except Exception as exc:
+            # No silent fallback: record type/message/frame (and warn once) before demoting.
+            # The site string is prefixed "mistral." so a record cannot be confused with the
+            # identically-named Llama helper when both models ran in one process.
+            _kivi_record_fused_error("mistral._fallback_key_quant_matmul", exc)
+            if _kivi_fused_strict():
+                raise
+    # Fallback: dequantize to fp16, expand, dense matmul — safe for GQA head expansion.
+    _kivi_fallback_fires[0] += 1
     key_states_trans = unpack_and_dequant_triton_packed(key_states_quant_trans, key_scale_trans, key_mn_trans, group_size, bits)
     key_states_trans = repeat_kv_quant(key_states_trans, n_rep)
     return torch.matmul(query_states, key_states_trans)
 
 
 def _fallback_value_quant_matmul(attn_weights, value_states_quant, value_scale, value_mn, group_size, bits, n_rep):
-    # Dequantize first, then use plain torch.matmul — safe for GQA head expansion.
+    # fp16 gate first: attn_weights carries the model dtype (softmax is cast back to
+    # query_states.dtype at every call site), value_scale/value_mn carry the cache dtype.
+    _kivi_check_fp16("mistral._fallback_value_quant_matmul",
+                     attn_weights=attn_weights, value_scale=value_scale, value_mn=value_mn)
+    _kivi_path_notice_once(n_rep)
+    if _fused_gqa_enabled():
+        try:
+            vq = _repeat_head_contig(value_states_quant, n_rep)       # [B,H,T_v,D//feat]
+            sc = _repeat_head_contig(value_scale, n_rep)             # [B,H,T_v,G]
+            zp = _repeat_head_contig(value_mn, n_rep)                # [B,H,T_v,G]
+            out = _fused_bmm_padM(group_size, attn_weights, vq, sc, zp, bits)
+            _kivi_fused_fires[0] += 1
+            return out
+        except Exception as exc:
+            # No silent fallback: record type/message/frame (and warn once) before demoting.
+            _kivi_record_fused_error("mistral._fallback_value_quant_matmul", exc)
+            if _kivi_fused_strict():
+                raise
+    # Fallback: dequantize to fp16, expand, dense matmul — safe for GQA head expansion.
+    _kivi_fallback_fires[0] += 1
     value_states = unpack_and_dequant_triton_packed(value_states_quant, value_scale, value_mn, group_size, bits)
     value_states = repeat_kv_quant(value_states, n_rep)
     return torch.matmul(attn_weights, value_states)
@@ -113,6 +212,28 @@ def _chunked_prefill_attention(
 ):
     B, H, S, D = query_states.shape
     dtype = query_states.dtype
+
+    # This path has NO fused variant: it always dequantizes the packed KV to fp16 and expands
+    # it n_rep-fold before a dense matmul, whatever KIVI_FUSED_GQA says. Count and announce it
+    # so a long-context run cannot report path=="fused" while its prefill ran the unfused path
+    # (which at these contexts is also the FASTER path - see the measured table in the Llama
+    # sibling's PATH ACCOUNTING; "unfused" here is provenance, never a performance claim).
+    #
+    # State it plainly, because this is the regime the published contexts live in: THE LONG
+    # PREFILL IS UNFUSED IN BOTH MODES. Flipping KIVI_FUSED_GQA does not change a single
+    # instruction executed here (and with use_flash=True prefill does not even reach this
+    # function - MistralFlashAttention_KIVI runs flash_attn on the un-quantised tensors, which
+    # is equally gate-independent). Therefore TTFT is identical BY CONSTRUCTION between the two
+    # modes, and a fused-vs-fallback comparison at ctx > _PREFILL_CHUNK_THRESHOLD is a
+    # DECODE-ONLY comparison. Report such a ratio as TPOT, never as end-to-end or TTFT.
+    if key_states_quant_trans is not None or value_states_quant is not None:
+        _kivi_check_fp16("mistral._chunked_prefill_attention",
+                         query_states=query_states, key_scale_trans=key_scale_trans,
+                         value_scale=value_scale)
+        _kivi_path_notice_once(n_rep)
+        _kivi_chunked_prefill_fires[0] += 1
+        _kivi_fallback_fires[0] += 1
+
     if key_states_quant_trans is not None:
         key_q = unpack_and_dequant_triton_packed(key_states_quant_trans, key_scale_trans, key_mn_trans, group_size, k_bits)
         key_q = repeat_kv_quant(key_q, n_rep)
@@ -520,6 +641,19 @@ class MistralFlashAttention_KIVI(MistralAttention_KIVI_eval):
             # import ipdb; ipdb.set_trace()
 
             if key_states_quant_trans is not None:
+                # UNGATED fused call site. Unlike the _fallback_* helpers above, this upstream
+                # code invokes cuda_bmm_fA_qB_outer whatever KIVI_FUSED_GQA says, so the gate
+                # does not describe it and the gated notice would misname it. It is left
+                # exactly as upstream wrote it - rerouting it through the gated helpers would
+                # change which kernel a published Mistral number was measured on - but it is no
+                # longer invisible: it is counted as direct_fused_fires, and the fp16-only
+                # constraint of the kernel (matmul.py:254 allocates a torch.float16 output) is
+                # checked here rather than being discovered inside triton.
+                _kivi_check_fp16("MistralFlashAttention_KIVI.key(cuda_bmm_fA_qB_outer)",
+                                 query_states=query_states, key_scale_trans=key_scale_trans,
+                                 key_mn_trans=key_mn_trans)
+                _kivi_direct_fused_notice_once("MistralFlashAttention_KIVI.forward (key)")
+                _kivi_direct_fused_fires[0] += 1
                 key_states_quant_trans_repeat = repeat_kv_quant(key_states_quant_trans, self.num_key_value_groups)
                 key_scale_trans_repeat = repeat_kv_quant(key_scale_trans, self.num_key_value_groups)
                 key_mn_trans_repeat = repeat_kv_quant(key_mn_trans, self.num_key_value_groups)
@@ -580,6 +714,13 @@ class MistralFlashAttention_KIVI(MistralAttention_KIVI_eval):
                 value_states_full_repeat = repeat_kv(value_states_full, self.num_key_value_groups)
                 attn_output = torch.matmul(attn_weights, value_states_full_repeat)
             else:
+                # UNGATED fused call site (see the key-side comment above): counted, dtype
+                # checked, kernel choice left untouched.
+                _kivi_check_fp16("MistralFlashAttention_KIVI.value(cuda_bmm_fA_qB_outer)",
+                                 attn_weights=attn_weights, value_scale=value_scale,
+                                 value_mn=value_mn)
+                _kivi_direct_fused_notice_once("MistralFlashAttention_KIVI.forward (value)")
+                _kivi_direct_fused_fires[0] += 1
                 value_states_quant_repeat = repeat_kv_quant(value_states_quant, self.num_key_value_groups)
                 value_scale_repeat = repeat_kv_quant(value_scale, self.num_key_value_groups)
                 value_mn_repeat = repeat_kv_quant(value_mn, self.num_key_value_groups)

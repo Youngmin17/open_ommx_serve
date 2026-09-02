@@ -4,7 +4,7 @@
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
-#     http://www.apache.org/licenses/LICENSE-2.0
+#    http://www.apache.org/licenses/LICENSE-2.0
 #
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
@@ -281,7 +281,7 @@ def generate_samples(
         desc=f"Generating synthetic samples: {type_haystack} | {max_seq_length}",
     ):
         used_haystack = num_haystack
-        max_attempts = 100  # 무한루프 방지를 위한 최대 시도 횟수
+        max_attempts = 100  # attempt cap, guards against an infinite loop
         attempt = 0
         success = False
         
@@ -308,14 +308,14 @@ def generate_samples(
                 if used_haystack > incremental:
                     used_haystack -= incremental
                 else:
-                    # used_haystack가 더 이상 줄일 수 없으면 더 작은 값으로 시도
+                    # if used_haystack cannot shrink further, retry with a smaller value
                     used_haystack = max(1, used_haystack - 1)
                     if used_haystack <= 0:
                         print(f"[WARNING] Failed to generate sample {index} after {attempt+1} attempts. Skipping...")
                         break
                 attempt += 1
         
-        # 성공적으로 생성되지 않으면 샘플을 건너뛰기
+        # skip the sample if generation did not succeed
         if not success:
             print(f"[WARNING] Skipping sample {index} due to generation failure")
             continue
