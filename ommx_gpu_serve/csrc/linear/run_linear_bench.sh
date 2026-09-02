@@ -13,8 +13,13 @@ set -o pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/../../.." && pwd)"          # open_ommx_serve root
 GPU="${GPU:-0}"; TAG="${TAG:-h200}"
+# A value-taking flag is checked for its value FIRST. `shift 2` with only ONE argument left
+# fails and shifts NOTHING, and there is no `set -u` here (see the header) to turn the unbound
+# $2 into an exit -- so `run_linear_bench.sh --gpu` used to spin in this loop forever, printing
+# nothing. Fail with the usage instead.
 while [ $# -gt 0 ]; do case "$1" in
-  --gpu) GPU="$2"; shift 2;; --tag) TAG="$2"; shift 2;;
+  --gpu|--tag) [ $# -ge 2 ] || { echo "$1 needs a value; usage: $0 [--gpu N] [--tag h200]"; exit 2; }
+               case "$1" in --gpu) GPU="$2";; --tag) TAG="$2";; esac; shift 2;;
   *) echo "unknown opt: $1"; exit 2;; esac; done
 
 : "${OMMX_CUTLASS_DIR:?set OMMX_CUTLASS_DIR to a CUTLASS 4.4.2 tree (mixed_dtype_utils.hpp)}"

@@ -8,7 +8,12 @@ cluster wave (cap=2) runs FIRST, BEFORE any latency/bench. It:
      this packer IS the contract (mirror of attention/pack.py + codec.py);
   2. computes the fp32 reference dequant W_ref the kernels MUST reproduce;
   3. builds + runs the consolidated kernels and asserts cos>=0.999, max_diff<tol, y_finite,
-     firing>0 for: base decode (M=1/8), base prefill (M=32), and base+outlier decode (M=1).
+     firing>0 for: base decode (M=1/8), base prefill (M=32), base+outlier decode (M=1),
+     and base+outlier at M>1 through sparse_correct's OTHER (At = A^T, bf16 C) call
+     convention — decode M=8 and prefill M=32. The M>1 cases were added after a
+     PASSING 5/5 run of this gate failed to catch a caller that sent the M==1 argument
+     list at every M: coverage of one branch of `if (M == 1) ... else ...` is not
+     coverage of the ABI.
 
 Run (ommx conda env, sm_80 or sm_90a Hopper):
     PYTHONNOUSERSITE=1 python test_ommx_linear_parity.py
@@ -174,6 +179,39 @@ def main():
     mod.sparse_correct(y, x, None, code, scale, oindex, ocode, ms, mcen,
                        N, 1, K, gs, q["npv"], gs, "i2f4")                  # += outlier
     ok &= _gate("decode M=1 base+outlier", y, x.float() @ Wr.t())
+
+    # ---- BASE + FP4 OUTLIER at M>1: THE OTHER HALF OF sparse_correct's ABI ----
+    # Everything above this line calls sparse_correct exactly once, at M=1. That is the
+    # reason this gate reported PASS 5/5 while `integration/vllm/linear_method.py` sent
+    # the M==1 argument list at every M and killed every prefill step of every recipe
+    # with npv>0. The kernel ends with
+    #
+    #   if (M == 1) { TORCH_CHECK(A_opt.has_value(),  "M==1 correct needs A");  go1(...); }
+    #   else        { TORCH_CHECK(At_opt.has_value(), "M>1 correct needs At"); goM(...); }
+    #
+    # so M>1 is a DIFFERENT CALL, not the same call with a bigger number:
+    #   * the activation goes in as At = A^T, a CONTIGUOUS [K, M] bf16 buffer — goM's
+    #     kernels index it `At[(size_t)k * M + m]`, and the host wrapper does NOT check
+    #     contiguity, so a bare `x.t()` view would be read as dense and give a plausible
+    #     wrong answer rather than an error;
+    #   * the base output goes in as C, bf16 [M, N] (`out_or_C.data_ptr<at::BFloat16>()`),
+    #     NOT the fp32 [1,N] `out` of the M==1 branch.
+    # Both M>1 base kernels are covered because they return different dtypes:
+    # prefill_wmma gives bf16 (`torch::empty({M,N}, A.options())`) and needs no cast,
+    # decode_base gives fp32 (`torch::zeros(..., kFloat32)`) and does.
+    for M, base in ((8, "decode"), (32, "prefill")):
+        x = (torch.randn(M, K, device=dev) * 0.1).to(torch.bfloat16)
+        if base == "prefill":
+            C = mod.prefill_wmma(x, code, scale, zp, N, M, K, gs, False, "i2f4", 1)
+        else:
+            C = mod.decode_base(x, code, scale, zp, N, K, gs, False, "i2f4", 1).to(
+                torch.bfloat16)                       # fp32 base -> the bf16 C goM wants
+        At = x.t().contiguous()                       # [K, M] — the .contiguous() is the ABI
+        assert At.shape == (K, M) and At.is_contiguous() and At.dtype == torch.bfloat16
+        mod.sparse_correct(C, None, At, code, scale, oindex, ocode, ms, mcen,
+                           N, M, K, gs, q["npv"], gs, "i2f4")
+        ok &= _gate(f"{base} M={M} base+outlier (M>1 At convention)", C,
+                    x.float() @ Wr.t())
 
     fs = dict(mod.fire_stats()); print(f"[fire_stats] {fs}")
     ok &= fs.get("decode_calls", 0) > 0 and fs.get("outlier_calls", 0) > 0

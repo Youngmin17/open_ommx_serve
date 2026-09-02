@@ -40,6 +40,45 @@ SEQ_GROUPS = [
 ]
 
 
+#: Special (pure-FP4) layers seen during an export run. They are NOT exportable as
+#: calibration decisions -- see _export_decisions -- and a partial export must be visible.
+_EXPORT_SKIPPED = []
+
+
+def _export_decisions(root, name, dec):
+    """Write one module's quantization DECISIONS for ``w_packer --calibrated``.
+
+    The packer re-encodes these itself, so what travels is the DECISIONS (which lanes are
+    outliers, the group scale/zero-point, the FP4 range map) plus ``W``, the solver's own
+    dequantized result. The packer's gate then asserts dequant(planes) == W exactly, which
+    is what makes "the bundle is the model the solver measured" checkable rather than
+    assumed.
+
+    REFUSES a non-power-of-two scale here rather than at pack time: without ``--pow2`` the
+    solver picks full-precision scales, the E8M0 plane can only store an exponent byte, and
+    an export that looks fine now would be rejected (or worse, rounded) hours later.
+    """
+    import os as _os
+    from safetensors.torch import save_file as _save
+    if dec is None:
+        raise RuntimeError(f"{name}: --export-decisions is set but the solver recorded "
+                           f"none (record_decisions was not enabled before fasterquant)")
+    sc = dec["scale"]
+    exp = torch.log2(sc.clamp_min(1e-38))
+    off = float((exp - torch.round(exp)).abs().max())
+    if off > 1e-6:
+        raise RuntimeError(
+            f"{name}: the solver chose scales that are not powers of two (max log2 "
+            f"deviation {off:.3e}). The OMMX weight format stores ONE EXPONENT BYTE per "
+            f"group, so these cannot be packed without discarding exactly what the "
+            f"calibration chose. Re-run with --pow2.")
+    _os.makedirs(root, exist_ok=True)
+    # Module name == the checkpoint tensor name without ".weight", which is what
+    # w_packer.CalibrationSource looks up.
+    _save({k: v.contiguous() for k, v in dec.items()},
+          _os.path.join(root, name + ".safetensors"))
+
+
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--model", default="meta-llama/Llama-3.1-8B-Instruct")
@@ -89,6 +128,12 @@ def parse_args():
     p.add_argument("--eval-tasks", default="",
                    help="comma list of lm-eval tasks (e.g. mmlu,arc_challenge,hellaswag,niah). If set, run "
                         "lm-eval on the baked INT2+FP4 model instead of wikitext PPL.")
+    p.add_argument("--export-decisions", default=None, metavar="DIR",
+                   help="write each calibrated module's quantization DECISIONS to DIR for "
+                        "`w_packer pack --calibrated DIR`. Requires --pow2: the OMMX "
+                        "weight format stores a power-of-two group scale, so scales chosen "
+                        "without it cannot be packed. Special (pure-FP4) layers are not "
+                        "exportable and are reported at the end.")
     p.add_argument("--num-fewshot", type=int, default=0)
     p.add_argument("--eval-limit", type=int, default=0, help="limit examples per task (0=all; for smoke)")
     p.add_argument("--eval-batch-size", default="auto", help="lm-eval batch size (int or 'auto')")
@@ -166,6 +211,19 @@ class OMMXWeightQuantizer:
         if input_correct:
             self.cov_corr = torch.zeros((columns, columns), device=dev)
             self.fp_inp = []                                 # clean inputs [tokens, I], popped per add_batch
+        # DECISION RECORDING (opt-in, off by default so nothing changes for eval runs).
+        # fasterquant returns Q, the DEQUANTIZED weight -- and re-quantizing Q with the
+        # packer's min/max path is NOT idempotent (measured max|W_ref2-W_ref1|=5.2e-2,
+        # different codes AND scales), so a bundle packed from Q silently throws this
+        # calibration away. The packer's --calibrated path instead consumes the per-group
+        # DECISIONS, which are exactly what _group_params already froze: zero-point,
+        # scale, outlier mask and FP4 range map. Recording them here is the only place
+        # they exist.
+        self.record_decisions = False
+        self.decisions = None
+        #: Storage dtype of the zero-point, matched to the bundle format (w_packer's
+        #: default recipe is BF16). Applied inside _store_zp before the codes are chosen.
+        self.zp_dtype = torch.bfloat16
 
     @torch.no_grad()
     def add_batch(self, inp):
@@ -203,6 +261,24 @@ class OMMXWeightQuantizer:
         return torch.ones_like(idx[:, :1]), torch.zeros_like(idx[:, :1])
 
     @torch.no_grad()
+    def _store_zp(self, z):
+        """Round the zero-point to the dtype the BUNDLE stores, BEFORE codes are chosen.
+
+        This function used to say "z stays BF16 (OMMX-allowed)" in a comment while keeping
+        z in float32. The weight format stores a BF16 zero-point, and the packer rounds it
+        on the way to disk -- so codes chosen against an f32 z are every one of them
+        fractionally mismatched to the z the kernel reads back. Measured through the
+        export path: max|dequant(planes) - solver Q| = 2.4e-4 instead of 0, which the
+        packer's calibration gate (correctly) refuses.
+
+        Deciding against the stored value costs nothing and makes the solver's own output
+        exactly reproducible from the bundle -- i.e. the accuracy you measure is the
+        accuracy you ship.
+        """
+        if self.zp_dtype is None or self.zp_dtype == torch.float32:
+            return z
+        return z.to(self.zp_dtype).to(z.dtype)
+
     def _group_params(self, Wg, col):
         # Wg: [O, gs] CURRENT (error-corrected) weights of this group. Returns frozen group params,
         # mirroring weight_quantizer(mode="decode") restricted to one group. zero-point z=min_vals (BF16,
@@ -235,6 +311,7 @@ class OMMXWeightQuantizer:
 
         if len(scale_cands) == 1 and len(deltas) == 1:
             scale, z = scale_cands[0], min_vals                         # no search (backward-compatible)
+            z = self._store_zp(z)
         else:
             # Per-row search over (scale, z) minimizing dense-INT2 reconstruction error. hess_aware weights
             # each input channel by its Hessian diagonal H[i,i] (input energy) -> the OUTPUT-error proxy
@@ -250,7 +327,7 @@ class OMMXWeightQuantizer:
             best_mse = torch.full_like(s0, float("inf"))
             for sc in scale_cands:
                 for dl in deltas:
-                    z_c = min_vals + dl * sc
+                    z_c = self._store_zp(min_vals + dl * sc)
                     q = torch.round((Wg - z_c) / sc).clamp(0, self.qmax) * sc + z_c
                     mse = (((q - Wg) ** 2) * w_imp).sum(dim=-1, keepdim=True) / denom    # [O,1]
                     take = mse < best_mse
@@ -307,6 +384,15 @@ class OMMXWeightQuantizer:
 
         Q = torch.zeros_like(W)
         gmv = gsc = gom = gms = gmc = None
+        rec = None
+        if self.record_decisions:
+            G = self.columns // gs
+            rec = dict(
+                zp=torch.zeros(self.rows, G, dtype=torch.float32),
+                scale=torch.zeros(self.rows, G, dtype=torch.float32),
+                omask=torch.zeros(self.rows, G, gs, dtype=torch.bool),
+                map_scale=torch.ones(self.rows, G, dtype=torch.float32),
+                map_center=torch.zeros(self.rows, G, dtype=torch.float32))
         for i1 in range(0, self.columns, blocksize):
             i2 = min(i1 + blocksize, self.columns)
             count = i2 - i1
@@ -322,6 +408,13 @@ class OMMXWeightQuantizer:
                 d = Hinv1[i, i]
                 if col % gs == 0:                            # group boundary: freeze params on live W1
                     gmv, gsc, gom, gms, gmc = self._group_params(W1[:, i:i + gs], col)
+                    if rec is not None:
+                        g = col // gs
+                        rec["zp"][:, g] = gmv.detach().float().cpu()
+                        rec["scale"][:, g] = gsc.detach().float().cpu()
+                        rec["omask"][:, g] = gom.detach().cpu()
+                        rec["map_scale"][:, g] = gms.detach().float().cpu()
+                        rec["map_center"][:, g] = gmc.detach().float().cpu()
                 q = self._quant_col(w, col % gs, gmv, gsc, gom, gms, gmc)
                 Q1[:, i] = q
                 err1 = (w - q) / d
@@ -339,6 +432,12 @@ class OMMXWeightQuantizer:
 
         if torch.any(torch.isnan(Q)) or torch.any(torch.isinf(Q)):
             raise ValueError("NaN/Inf in quantizer output Q")
+        if rec is not None:
+            # Q is stored alongside the decisions: the packer re-encodes THESE values, and
+            # its gate asserts dequant(planes) == Q exactly, so a drift between what the
+            # solver measured and what gets shipped cannot pass silently.
+            rec["W"] = Q.detach().float().cpu()
+            self.decisions = rec
         return Q.to(out_dtype)
 
     def free(self):
@@ -726,8 +825,19 @@ def main():
         if m.is_special_layer:
             q = m._get_special_layer_decode_q_weight().detach()
             kind = "spec"
+            # A special layer is PURE FP4 -- a different number system from the INT2+FP4
+            # bundle format, with no per-group INT2 codes to record. Exporting it as a
+            # calibration decision would claim the packer can reproduce something it
+            # cannot, so it is reported instead (see the export summary).
+            if a.export_decisions:
+                _EXPORT_SKIPPED.append(_FULL_NAME.get(id(m), name))
         else:
+            if a.export_decisions:
+                quantizers[name].record_decisions = True
             q = quantizers[name].fasterquant(m.weight.data, blocksize=a.blocksize, percdamp=a.percdamp)
+            if a.export_decisions:
+                _export_decisions(a.export_decisions, _FULL_NAME.get(id(m), name),
+                                  quantizers[name].decisions)
             quantizers[name].free()
             kind = "int2"
         m.cache = {"prefill_q_weight": q, "decode_q_weight": q, "mode": "decode"}
@@ -735,6 +845,20 @@ def main():
         m.weight.data = torch.zeros((1, 1), device=device, dtype=torch.float16)
         return kind
 
+    # Module names inside the layer loop are LAYER-RELATIVE ("self_attn.q_proj"), so they
+    # repeat across all 32 layers. w_packer.CalibrationSource looks a module up by its
+    # CHECKPOINT name, and exporting under the relative name silently overwrote every layer
+    # into 7 files (measured: "exported 224 modules" but 7 on disk, each holding the last
+    # layer's decisions). Resolve the full name by module identity instead.
+    _FULL_NAME = {id(mod): nm for nm, mod in model.named_modules()}
+
+    if a.export_decisions and not a.pow2:
+        # Checked BEFORE the solve, not after: a calibration run is expensive and its
+        # output would be unpackable. The format stores a power-of-two group scale.
+        raise SystemExit(
+            "--export-decisions requires --pow2: the OMMX weight format stores ONE "
+            "exponent byte per group, so the full-precision scales the solver picks "
+            "without --pow2 cannot be packed without discarding the calibration.")
     tcal = time.time()
     n_int2, n_spec = 0, 0
     _LAYER_OFFLOAD = bool(os.environ.get("OMMX_LAYER_OFFLOAD"))  # bound GPU mem for big MoE solve
@@ -863,6 +987,31 @@ def main():
                                 outlier_percent=a.outlier_percent, use_pow2=a.pow2, sparse_nm=_snm)
         gc.collect(); torch.cuda.empty_cache()
     print(f"[INFO] baked: {n_int2} INT2 layers, {n_spec} special(FP4) layers")
+    if a.export_decisions:
+        # A partial export is the dangerous outcome: w_packer refuses a directory that
+        # does not cover every quantized tensor, but the operator should learn WHY here,
+        # where the reason (special layers are pure FP4, a different number system) is
+        # still in view.
+        _written = len([f for f in os.listdir(a.export_decisions)
+                        if f.endswith(".safetensors")]) if os.path.isdir(a.export_decisions) else 0
+        print(f"[INFO] exported decisions: {_written} file(s) on disk for {n_int2} "
+              f"calibrated module(s) -> {a.export_decisions}")
+        if _written != n_int2:
+            # Counting the bake calls instead of the files is how a name collision hid:
+            # 224 modules were "exported" into 7 files, each holding the last layer's.
+            raise SystemExit(
+                f"[FATAL] wrote {_written} decision file(s) for {n_int2} calibrated "
+                f"module(s). Names must be unique per module (full checkpoint path); a "
+                f"collision means later layers overwrote earlier ones and the export is "
+                f"unusable.")
+        if _EXPORT_SKIPPED:
+            print(f"[WARN] {len(_EXPORT_SKIPPED)} special(FP4) layer(s) were NOT exported "
+                  f"(pure FP4 has no per-group INT2 codes to record): "
+                  f"{_EXPORT_SKIPPED[:4]}{' ...' if len(_EXPORT_SKIPPED) > 4 else ''}")
+            print("[WARN] `w_packer pack --calibrated` will REFUSE this directory until "
+                  "those layers are covered. Re-run with --special-first-k 0 "
+                  "--special-last-k 0 --special-projs '' to calibrate every layer as "
+                  "INT2, or pack that subset separately.")
 
     # ARC NaN RCA (nan-trace: layers.2.mlp.down_proj in_maxabs=inf): the layer-2 SwiGLU intermediate
     # overflows fp16 (max 65504) on short arc sequences -> inf -> down_proj -> NaN; mmlu/wikitext (long,

@@ -50,6 +50,19 @@ def _prepare_cu13_env() -> None:
     inc = Path(prefix, "lib", pyver, "site-packages/nvidia/cu13/include")
     if inc.is_dir():
         os.environ["CPATH"] = f"{inc}:{os.environ.get('CPATH', '')}"
+    # LINK time (distinct from LD_LIBRARY_PATH below, which is LOAD time). torch emits
+    # ``-L$CUDA_HOME/lib64``; a cu13 conda env keeps ``libcudart.so`` in ``lib/``, so the
+    # link dies as ``/usr/bin/ld: cannot find -lcudart`` and the parity gate cannot run at
+    # all. gcc searches ``LIBRARY_PATH`` for ``-l``, and the nvcc/g++ children inherit this
+    # environ, so prepending the env's own lib dirs here fixes it in-process. Guarded on the
+    # library actually being there, and only the dirs of THIS env (the one torch itself was
+    # loaded from) are added, so it can never pull in a foreign CUDA runtime.
+    for _cand in (Path(prefix, "lib"), Path(prefix, "lib64")):
+        if not (_cand / "libcudart.so").exists():
+            continue
+        _cur = os.environ.get("LIBRARY_PATH", "")
+        if str(_cand) not in _cur.split(":"):
+            os.environ["LIBRARY_PATH"] = f"{_cand}:{_cur}" if _cur else str(_cand)
     libdir = str(Path(prefix, "lib"))
     if Path(libdir, "libstdc++.so.6").exists() and \
             libdir not in os.environ.get("LD_LIBRARY_PATH", "").split(":"):

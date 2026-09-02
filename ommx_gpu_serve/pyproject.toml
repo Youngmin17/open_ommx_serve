@@ -4,12 +4,18 @@
 # Standalone packaging for the OMMX GPU attention serving kernels.
 #
 # This package is the SELF-CONTAINED attention serving unit: the canonical Triton
-# paged-decode kernel + KV pack/codec + the framework adapters (vLLM / SGLang /
-# LMCache / PyTorch / JAX). It depends ONLY on torch (+ triton at GPU runtime) and
-# the chosen serving framework as an optional extra — NOT on the parent ``ommx``
-# repo. ``csrc/linear`` (the CUTLASS linear/fusion kernels, built by
-# ``build_serve.py``) is intentionally NOT part of this package: the attention
-# decode path is PURE Triton and needs no C++/CUTLASS compilation to import or run.
+# paged-decode kernel + KV pack/codec + the vLLM v1 attention adapter. vLLM is the
+# ONLY framework adapter this release ships (walk ``integration/`` to confirm: it
+# holds ``vllm/`` and ``common/`` and nothing else); earlier drafts of this comment
+# also listed SGLang / LMCache / PyTorch / JAX, none of which exist as code here.
+# It depends ONLY on torch (+ triton at GPU runtime) and the serving framework as an
+# optional extra — NOT on the parent ``ommx`` repo. ``csrc/linear`` (the CUTLASS
+# linear/fusion kernels, built by ``csrc/linear/build_ommx_linear.py``) is still not a
+# PACKAGE here — the attention decode path is PURE Triton and needs no C++/CUTLASS
+# compilation to import or run, and nothing in this tree imports csrc as a module. Its
+# SOURCES are now shipped as package-data, because the ommx_w weight-quant serving path
+# (integration/vllm/linear_method.py) JIT-compiles them at weight-load time; see the
+# [tool.setuptools.package-data] note below.
 #
 # Package layout note: the project directory is itself named ``ommx_gpu_serve`` and
 # the existing tests import ``ommx_gpu_serve.attention.*``. To keep that import path
@@ -24,7 +30,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "ommx-gpu-serve"
 version = "0.1.0"
-description = "OMMX standalone low-bit (i2f4/i2/itf4) attention serving kernels + framework adapters"
+description = "OMMX standalone low-bit (i2f4/i2/itf4) attention serving kernels + vLLM v1 adapter"
 requires-python = ">=3.10"
 license = { text = "Apache-2.0" }
 # torch is the only hard dep; the decode kernels JIT-compile via triton lazily on
@@ -35,23 +41,82 @@ dependencies = ["torch>=2.4.0"]
 
 [project.optional-dependencies]
 triton = ["triton>=3.0.0"]
-vllm = ["vllm>=0.11"]
-sglang = ["sglang>=0.5"]
-dev = ["pytest", "numpy"]
+# vLLM floor is 0.21, NOT 0.11: the backend subclasses `vllm.v1.attention.backend` /
+# `v1.attention.backends.flash_attn` and overrides `FlashAttentionImpl.do_kv_cache_update`
+# — none of which exist in a 0.11-era tree — and integration/vllm/preflight.py refuses to
+# start below that floor (MIN_VLLM_VERSION = (0, 21)). Declaring 0.11 here just deferred
+# the same failure from install time to run time.
+vllm = ["vllm>=0.21"]
+# No `sglang` extra: there is no SGLang adapter in this release (``integration/``
+# ships ``vllm/`` and ``common/`` only), so the extra's sole effect was to install a
+# multi-GB serving framework for zero lines of code. Re-add it in the same commit
+# that adds ``integration/sglang``, not before.
+#
+# `bench` is what ``ommx_gpu_serve.bench``'s plotters need: plot_results.py and
+# plot_fig7_single_bars.py import matplotlib (and numpy) at MODULE scope, and the
+# package is shipped (see the `packages` list below), so those imports have to be
+# declared somewhere. They are NOT hard deps — bench_e2e_a100.py / e2e_to_figure.py,
+# the modules that produce the JSON, import neither, so a plain install stays light.
+# Scope note kept on purpose: declaring the extra makes the PACKAGING correct, it does
+# not by itself make a plotter import-clean. plot_fig7_single_bars.py used to render at
+# MODULE scope and die on a missing output dir; that was a SOURCE fix, not a packaging
+# one — it now renders inside `build_figure()`/`main()` behind an
+# `if __name__ == "__main__"` guard and calls `os.makedirs(out_dir, exist_ok=True)`.
+# With this extra installed both bench plotters import cleanly; without it they raise
+# ModuleNotFoundError, which is the honest failure.
+bench = ["matplotlib", "numpy"]
+# `numpy` deliberately dropped from `dev`: no module under ommx_gpu_serve/tests/
+# imports it (`grep -rn numpy ommx_gpu_serve/tests/*.py` is empty). numpy is a
+# bench-plotter dependency and is declared once, above.
+dev = ["pytest"]
+# `ommx_w` — the WEIGHT-quant serving path (integration/vllm/linear_method.py, selected
+# as `--quantization ommx_w`). This extra did not exist while csrc/linear/ was only a
+# standalone microbench: its build dependency was declared once, in the REPO-ROOT
+# pyproject.toml `[linear]` extra, because the code that needed it was not in this
+# package. That is no longer true — linear_method.process_weights_after_loading() calls
+# csrc/linear/build_ommx_linear.build(), which goes through
+# torch.utils.cpp_extension.load() and SHELLS OUT to the `ninja` EXECUTABLE. So a user
+# who installs only this package and selects ommx_w now has a real, in-package need for
+# it, and the extra states it here.
+#   The wheel is necessary but NOT sufficient: it drops the `ninja` BINARY into
+#   <env>/bin, which is on PATH only while that env is ACTIVATED. Invoking
+#   /path/to/env/bin/python directly does NOT put <env>/bin on PATH and the JIT build
+#   still dies with "RuntimeError: Ninja is required to load C++ extensions".
+#   The second measured requirement cannot be packaged at all:
+#   export LIBRARY_PATH="$CONDA_PREFIX/lib:$CONDA_PREFIX/lib64" on cu13 conda envs, or
+#   the link fails as "/usr/bin/ld: cannot find -lcudart".
+# The root `[linear]` extra still exists and still covers the standalone microbench
+# (which additionally wants matplotlib/numpy for its plotter); this one is the minimal
+# SERVING requirement.
+ommx_w = ["ninja"]
 
-# vLLM discovers OMMX through one re-entrant general plugin per worker: it registers
-# the OMMX canonical attention backend under AttentionBackendEnum.CUSTOM. The entry
-# point imports lazily and is idempotent; selecting it requires --attention-backend
-# CUSTOM (or the equivalent attention_config) at LLM construction.
+# vLLM discovers OMMX through one re-entrant general plugin per worker. It registers
+# TWO independent things: the OMMX canonical attention backend under
+# AttentionBackendEnum.CUSTOM (KV quantization; select with --attention-backend CUSTOM or
+# the equivalent attention_config) and the OMMX weight-quant method under the name
+# "ommx_w" (select with --quantization ommx_w plus a packed OMMX_W_SafeTensor bundle).
+# The entry point imports lazily and is idempotent; either axis can be used alone.
 [project.entry-points."vllm.general_plugins"]
 ommx_gpu_serve = "ommx_gpu_serve.integration.vllm.plugin:register"
 
 [tool.setuptools]
 # Anchor the top-level package name to this directory (see layout note above).
 package-dir = { "ommx_gpu_serve" = "." }
-# Explicit package list (not find-based) so csrc/ and serve/ — the OFF-LIMITS
-# linear/fusion CUTLASS side — are never swept into the attention package. New
-# subpackages (integration.vllm, bench) are added here as they land.
+# Explicit package list (not find-based) so csrc/linear/ — the OFF-LIMITS
+# linear/fusion CUTLASS side — is never swept into the attention package. New
+# subpackages (integration.vllm, bench) are added here as they land. Neither
+# csrc/linear/ nor hf_eager/ carries an ``__init__.py``: they are PYTHONPATH source
+# dirs (see run.sh's `PYTHONPATH=...:$REPO/ommx_gpu_serve/hf_eager`), not importable
+# subpackages, so their absence from this list is deliberate, not an omission.
+#
+# `ommx_gpu_serve.tests` IS shipped (it is listed below, not omitted by accident):
+# tests/ holds the only correctness gates that cover the SERVED path — the pool/store
+# byte-parity gate test_kv_pool_parity.py, the bit-accounting gate, the slot-allocator
+# gate and the preflight-guard gate. They are CPU-only and import-clean without vllm /
+# triton / a GPU (the one CUDA case is `gpu`-MARKED and SKIPS, not passes, with no device),
+# so shipping them costs an installed user nothing and lets them re-run the gates the
+# README cites against the code they actually installed rather than against the repo
+# checkout. `pytest` itself stays in the `dev` extra — the package does not depend on it.
 packages = [
     "ommx_gpu_serve",
     "ommx_gpu_serve.attention",
@@ -59,4 +124,37 @@ packages = [
     "ommx_gpu_serve.integration.common",
     "ommx_gpu_serve.integration.vllm",
     "ommx_gpu_serve.bench",
+    # The OFFLINE weight path (quantizer + OMMX_W_SafeTensor + packer CLI). It is pure
+    # torch, imports with no vllm / triton / GPU, and ships for the same reason tests/
+    # does: `ommx_gpu_serve.tests.test_w_packer` is in the wheel and imports
+    # `ommx_gpu_serve.linear`, so omitting it turned those gates into a
+    # ModuleNotFoundError on an INSTALLED tree while staying green in a source checkout.
+    # This list is explicit (not find-based), so a new subpackage is invisible until it
+    # is named here.
+    "ommx_gpu_serve.linear",
+    "ommx_gpu_serve.tests",
 ]
+
+# ommx_gpu_serve/tests/__init__.py points the reader at ``README.md`` in that
+# directory for the exact commands. A wheel carries only .py files unless the data
+# is declared, so without this the shipped tests package would reference a file the
+# install does not contain.
+[tool.setuptools.package-data]
+# csrc/linear/ is NOT a package (no __init__.py, absent from the `packages` list above,
+# and that stays true — integration/vllm/linear_method.py loads the builder BY FILE PATH
+# precisely so this decision is not quietly reversed). But the ommx_w SERVING path
+# JIT-compiles ommx_linear.cu at weight-load time, so an installed wheel without these
+# sources can only fail — loudly, with "the OMMX linear kernel builder is missing", which
+# is a worse outcome than shipping ~200 KB of source. Data files, not modules.
+"ommx_gpu_serve" = [
+    "csrc/linear/build_ommx_linear.py",
+    "csrc/linear/ommx_linear.cu",
+    "csrc/linear/ommx_sm90_mixed_input_fused.hpp",
+    "csrc/linear/test_ommx_linear_parity.py",
+    "csrc/linear/README.md",
+]
+"ommx_gpu_serve.tests" = ["README.md"]
+# Same reason: a wheel carries only .py unless the data is declared, and
+# ommx_gpu_serve/linear/__init__.py points the reader at this README for the format
+# spec, the bit budget table and the verified/UNVERIFIED split.
+"ommx_gpu_serve.linear" = ["README.md"]
