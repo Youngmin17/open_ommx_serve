@@ -57,3 +57,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - LiveCodeBench-v6 KV-quantization comparison (`eval/lcb/`): four KV-quant methods and a
   bf16 control on one generative path, quantized at the `transformers` `Cache.update()`
   boundary so every arm shares a code path and MoE models are supported unchanged.
+- `run.sh` validates that every flag was given a value instead of silently consuming the
+  next flag, resolves the GPU it was asked for, and moves a stale output aside rather than
+  collecting it as this run's result.
+- README documents named recipes, the `ommx_w` offline-pack and serving flow, and what a
+  quoted number does and does not cover.
