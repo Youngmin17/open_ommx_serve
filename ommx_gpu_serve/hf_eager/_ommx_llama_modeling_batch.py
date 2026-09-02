@@ -4,8 +4,9 @@
 # modeling owns a per-layer single-sequence CanonicalKVStore, this owns a per-layer
 # SHARED MultiSeqKVPool (kv_pool.py) — ONE quantized-plane pool for all B requests +
 # per-request tables — and drives the SAME ommx_paged_decode_attention_canonical op
-# over num_seqs=B in ONE kernel launch (mirroring the vLLM backend's batched route,
-# backend.py:501-561 _route_decode_batched + _batched_kv_update:420-432).
+# over num_seqs=B in ONE kernel launch (mirroring the vLLM backend's batched route:
+# OMMXCanonicalImpl._route_decode_batched + OMMXCanonicalImpl._batched_kv_update in
+# ommx_gpu_serve/integration/vllm/backend.py).
 #
 # Split (identical contract to the B=1 file, per layer):
 #   * PREFILL (q_len > 1): eager/flash/sdpa attention over the bf16 K/V for each of the
@@ -20,21 +21,32 @@
 # SHADOW-FREE: with OMMX_KV_RING=1 (set by the bench) the pool's k_hist/v_hist are a
 # per-request RING of only sink ∪ recent ∪ the live group (ring_cap ~= sink+recent+2*gt
 # rows/req, INDEPENDENT of max_seq_len) instead of the [num_seqs, max_seq_len, H, D] bf16
-# SHADOW that OOMs at B>1 long-ctx (the 64GB B>1 OOM the user reported). The quantized
-# planes (the ≤3-bit bulk) hold the rest. This file works WITH or WITHOUT the ring (the
+# SHADOW that OOMs at B>1 long-ctx. (No measurement of that OOM is shipped in this
+# release, so it is stated as the shape argument it is — [num_seqs, max_seq_len, H, D]
+# bf16 grows with B AND with ctx — not as a GPU-capacity number.) The quantized
+# planes hold the rest. ("Quantized", not "≤3-bit": this file packs whatever recipe the
+# caller's env resolves to, and under the published canonical one the benches here set —
+# npv=6, gt=32, gc=32, outlier map ON, pow2 — the pool's own planes sum to 4.375 bit/elem
+# avg. ≤3 bit needs a DIFFERENT recipe, gt=64 + gc=64 + map OFF, that no accuracy result
+# here was measured under.) This file works WITH or WITHOUT the ring (the
 # pool sizing is gated internally); the bench sets the ring.
 #
-# LAW (silent-fallback, CLAUDE.md §2.3 #5): the batched decode must actually fire the
-# OMMX batched kernel over num_seqs=B (NOT a B=1 python loop, NOT a bf16 fallback). We
-# emit a one-time BATCHED_DECODE_FIRED marker from the decode path + assert B>1 reached
-# the single-launch op (the bench reads the marker counter back).
+# LAW #5 (no silent fallback — the convention the serving code uses throughout): the
+# batched decode must actually fire the OMMX batched kernel over num_seqs=B (NOT a
+# B=1 python loop, NOT a bf16 fallback). We emit a one-time BATCHED_DECODE_FIRED
+# marker from the decode path + assert B>1 reached the single-launch op (the bench
+# reads the marker counter back).
 #
-# Sources verified while writing (file:line):
-#   - ommx_gpu_serve/attention/kv_pool.py             MultiSeqKVPool API (ring + batched)
-#   - ommx_gpu_serve/attention/paged_decode.py:2374    kernel signature
-#   - ommx_gpu_serve/integration/vllm/backend.py:501   _route_decode_batched (call mirror)
-#   - ommx_gpu_serve/integration/vllm/backend.py:420   _batched_kv_update uniform append
-#   - baseline/kv/ommx_hf/_ommx_llama_modeling.py       the working B=1 modeling (mirror)
+# Sources verified while writing. Cited by SYMBOL, not by line: these files are under
+# active edit and a line number rots silently, while a symbol stays greppable
+# (`grep -n "def <symbol>" <file>`).
+#   - ommx_gpu_serve/attention/kv_pool.py         MultiSeqKVPool API (ring + batched)
+#   - ommx_gpu_serve/attention/paged_decode.py    ommx_paged_decode_attention_canonical
+#                                                 (kernel signature + plane ABI docstring)
+#   - ommx_gpu_serve/integration/vllm/backend.py  OMMXCanonicalImpl._route_decode_batched
+#                                                 (call mirror) and ._batched_kv_update
+#                                                 (its UNIFORM single-token fast path)
+#   - ommx_gpu_serve/hf_eager/_ommx_llama_modeling.py  the working B=1 modeling (mirror)
 
 from typing import Callable, Optional, Union
 
@@ -224,8 +236,9 @@ class LlamaAttention(nn.Module):
     # ── OMMX pool + workspace lifecycle ─────────────────────────────────────────
 
     def _ommx_resolve_cfg(self, *, force: bool = False):
-        # mirror _ommx_llama_modeling.py:201 (B=1) — max_context=None lets OMMX_ATTN_MAXCTX
-        # drive the per-request plane sizing (the bench sets it per ctx).
+        # mirror LlamaAttention._ommx_resolve_cfg in _ommx_llama_modeling.py (the B=1 file)
+        # — max_context=None lets OMMX_ATTN_MAXCTX drive the per-request plane sizing (the
+        # bench sets it per ctx).
         if self._ommx_cfg is None or force:
             self._ommx_cfg = resolve_serving_config(
                 head_dim=self.head_dim,
@@ -237,12 +250,14 @@ class LlamaAttention(nn.Module):
         return self._ommx_cfg
 
     def _ommx_make_pool(self, device, num_seqs: int) -> MultiSeqKVPool:
-        # mirror backend.py pool construction (the metadata builder's pool(...)). The pool
+        # mirror the pool construction the served path uses (OMMXBatchedStepManager.pool in
+        # integration/vllm/metadata.py). The pool
         # holds num_seqs plane blocks + per-request bf16 ring (ring_cap rows/req under
         # OMMX_KV_RING) — NOT the [num_seqs, max_seq_len, H, D] bf16 shadow.
         import os
         cfg = self._ommx_resolve_cfg(force=True)
-        # NOTE: MultiSeqKVPool always packs V as i2 (kv_pool.py:127 v_main = D//4 uint8) — it
+        # NOTE: MultiSeqKVPool always packs V as i2 (MultiSeqKVPool.__init__ allocates
+        # ``self.v_main`` as [P_cap, ps, H, D//4] uint8, i.e. 4 codes/byte) — it
         # has NO bf16-V branch (unlike CanonicalKVStore). So OMMX_ATTN_V_BF16 is IGNORED in
         # the batched pool; V is always quantized i2 here. (# VERIFY: if a bf16-V batched
         # variant is needed, MultiSeqKVPool must grow a v_format arg first.)
@@ -263,9 +278,9 @@ class LlamaAttention(nn.Module):
         return pool
 
     def _ommx_make_ws(self, device, B: int):
-        # mirror backend.py:474 _ommx_ws_batched: ONE fixed-address batched decode workspace,
-        # sized at worst-case geometry (num_kv_splits from max_context, cap rows = B). No
-        # per-step alloc; reused every decode step.
+        # mirror backend.py's OMMXCanonicalImpl._ommx_ws_batched: ONE fixed-address batched
+        # decode workspace, sized at worst-case geometry (num_kv_splits from max_context, cap
+        # rows = B). No per-step alloc; reused every decode step.
         if self._ommx_ws is not None and self._ommx_ws["o"].shape[0] >= B:
             return self._ommx_ws
         H, D = self.num_attention_heads, self.head_dim
@@ -286,7 +301,7 @@ class LlamaAttention(nn.Module):
         }
         return self._ommx_ws
 
-    # ── batched decode kernel call (mirror backend.py:501-548 _route_decode_batched) ──
+    # ── batched decode kernel call (mirror OMMXCanonicalImpl._route_decode_batched) ──
 
     def _ommx_decode_batched(self, query_states: torch.Tensor) -> torch.Tensor:
         """One BATCHED OMMX decode step. ``query_states`` is HF-layout [B, Hq, q_len=1, D]
@@ -298,7 +313,8 @@ class LlamaAttention(nn.Module):
         ws = self._ommx_make_ws(query_states.device, B)
         slots = list(range(B))   # batch row b -> pool slot b (contiguous; uniform batch)
 
-        # q -> [B, Hq, D] (mirror backend.py:520 `q = query.view(-1, H, D)[:B]`). HF-layout
+        # q -> [B, Hq, D] (mirror `q = query.view(-1, H, D)[:B]` in
+        # OMMXCanonicalImpl._route_decode_batched). HF-layout
         # query_states is [B, Hq, q_len=1, D]; slice the single decode token -> [B, Hq, D].
         q = query_states[:, :, 0, :].contiguous()       # [B, Hq, D]
 
@@ -374,7 +390,8 @@ class LlamaAttention(nn.Module):
             # New batch (prefill): (RE)BUILD this layer's pool + workspace at the right size
             # for THIS ctx and THIS B. Drop the old pool/ws first so its memory is reclaimed
             # (the bench sweeps ctx/B against one model instance; OMMX_ATTN_MAXCTX is set per
-            # ctx). Mirror _ommx_llama_modeling.py:341 but for the shared pool.
+            # ctx). Mirror the prefill branch of LlamaAttention.forward in
+            # _ommx_llama_modeling.py (the B=1 file) but for the shared pool.
             self._ommx_pool = None
             self._ommx_ws = None
             self._ommx_B = int(B)
@@ -395,8 +412,10 @@ class LlamaAttention(nn.Module):
                 **kwargs,
             )
             # Pack each request's prompt into the shared pool. key/value_states are
-            # [B, Hkv, T, D]; per request permute to [T, Hkv, D] (the pool's append_block
-            # layout, kv_pool.py:184). Each request owns its contiguous pool slot block.
+            # [B, Hkv, T, D]; per request permute to [T, Hkv, D] — the layout
+            # MultiSeqKVPool.append_block documents ("Stash request ``req``'s prefill block
+            # bf16 K/V ``[T, H, D]`` then regroup."). Each request owns its contiguous
+            # pool slot block.
             for r in range(B):
                 K_pack = key_states[r].transpose(0, 1).contiguous()    # [T, Hkv, D]
                 V_pack = value_states[r].transpose(0, 1).contiguous()  # [T, Hkv, D]
@@ -411,7 +430,9 @@ class LlamaAttention(nn.Module):
             # key/value_states: [B, Hkv, q_len=1, D] -> [B, Hkv, D] (one new row per request).
             k_rows = key_states[:, :, 0, :].contiguous()     # [B, Hkv, D]
             v_rows = value_states[:, :, 0, :].contiguous()   # [B, Hkv, D]
-            # ONE scatter + GPU regroup over the B requests (mirror backend.py:429-431). This
+            # ONE scatter + GPU regroup over the B requests (mirror the UNIFORM fast path of
+            # OMMXCanonicalImpl._batched_kv_update, which calls pool.append_decode_batched
+            # once instead of looping per request). This
             # also advances each request's seq_len + packs completed groups into the pool.
             if self._ommx_decode_device:
                 # DEVICE path: seed the pool's device seq buffer ONCE (first decode step

@@ -48,3 +48,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Flat-bitmap outlier positions on the KV axis, alongside relidx7 and combinadic.
 - Named recipes are selectable with one flag (`OMMX_RECIPE` / `--recipe` / `--preset`) on
   the serving path, the bench and the eval harness.
+- HF-eager arms measure batched decode and report a synchronized median step with
+  percentiles, with an optional static KV cache so the arm is not paying allocation.

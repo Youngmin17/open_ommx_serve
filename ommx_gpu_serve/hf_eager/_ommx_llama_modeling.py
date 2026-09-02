@@ -1,13 +1,15 @@
 # OMMX canonical-KV-quant modeling for Llama (HF-eager, full-model, B=1).
 #
-# Mirrors baseline/kv/kitty/_kitty_llama_modeling.py one-for-one, swapping Kitty's
+# Mirrors baseline/kitty/_kitty_llama_modeling.py one-for-one, swapping Kitty's
 # 2-bit paged decode kernel for the OMMX canonical paged-decode attention. The OMMX
 # decode kernel is vLLM-INDEPENDENT (pure tensor ABI) — this file drives it directly
 # from an HF eager forward so OMMX decode can be measured full-model, the same way
 # KIVI / Kitty are, for a fair B=1 long-context TPOT comparison.
 #
 # Split (identical to Kitty's prefill(flash) / decode(custom-kernel) contract):
-#   * PREFILL (q_len > 1): flash_attention_2 over the bf16 K/V (same as Kitty), then
+#   * PREFILL (q_len > 1): the caller's ``config._attn_implementation`` over the bf16
+#     K/V (same as Kitty; the benches pick flash_attention_2 when flash-attn is
+#     importable, else sdpa — NOT eager, which is O(ctx^2) at long context), then
 #     pack the whole prompt into a per-layer CanonicalKVStore via append_block().
 #   * DECODE  (q_len == 1): append the new bf16 K/V row, regroup any completed
 #     32-token scale-group, and call ommx_paged_decode_attention_canonical over the
@@ -17,12 +19,16 @@
 # bf16 set (sink ∪ recent ∪ the group being packed); the bulk prefix is quantized
 # (i2f4 K + i2 V). Each layer owns its own store.
 #
-# Sources verified while writing (file:line cited in the bench RISKS):
-#   - ommx_gpu_serve/attention/kv_store.py            CanonicalKVStore API
-#   - ommx_gpu_serve/attention/paged_decode.py:2374   kernel signature
-#   - ommx_gpu_serve/integration/vllm/backend.py:792  _route_decode (eager call mirror)
-#   - ommx_gpu_serve/integration/vllm/config.py:153   resolve_serving_config (env recipe)
-#   - ommx_gpu_serve/attention/tests/test_reference_op_parity.py:63  append_block+decode_inputs flow
+# Sources verified while writing. Cited by SYMBOL, not by line: every one of these
+# files is under active edit and a line number rots silently, while a symbol is
+# greppable (`grep -n "def <symbol>" <file>`).
+#   - ommx_gpu_serve/attention/kv_store.py        CanonicalKVStore API (append_block /
+#                                                 decode_inputs, the flow mirrored here)
+#   - ommx_gpu_serve/attention/paged_decode.py    ommx_paged_decode_attention_canonical
+#                                                 (kernel signature + plane ABI docstring)
+#   - ommx_gpu_serve/integration/vllm/backend.py  OMMXCanonicalImpl._route_decode
+#                                                 (the eager call this file mirrors)
+#   - ommx_gpu_serve/integration/vllm/config.py   resolve_serving_config (env recipe)
 
 from typing import Callable, Optional, Union
 
@@ -199,12 +205,14 @@ class LlamaAttention(nn.Module):
     # ── OMMX store + workspace lifecycle ────────────────────────────────────────
 
     def _ommx_resolve_cfg(self, *, force: bool = False):
-        # mirror backend.py:335 resolve_serving_config(head_dim, n_q_heads, n_kv_heads,
-        # max_context). max_context drives k_hist/plane sizing + the kv-split workspace.
+        # mirror backend.py's OMMXCanonicalImpl._ommx_cfg, i.e. resolve_serving_config(
+        # head_dim, n_q_heads, n_kv_heads, max_context). max_context drives k_hist/plane
+        # sizing + the kv-split workspace.
         #
         # IMPORTANT (memory): the planes are sized to max_context, so sizing it from the
-        # model's max_position_embeddings (131072 for Llama-3.1) would allocate ~17GB of
-        # ≤3-bit planes PER LAYER-sweep. The bench sets OMMX_ATTN_MAXCTX per ctx (= ctx +
+        # model's max_position_embeddings (131072 for Llama-3.1) would size EVERY quantized
+        # plane, in EVERY layer, to 131072 tokens for a sweep whose longest context is a
+        # fraction of that. The bench sets OMMX_ATTN_MAXCTX per ctx (= ctx +
         # decode steps); resolve_serving_config(max_context=None) reads that env. We pass
         # max_context=None so the env wins, and re-resolve on ``force`` (a new prefill /
         # new ctx) so the store is rebuilt at the right size for each ctx in the sweep.
@@ -219,9 +227,10 @@ class LlamaAttention(nn.Module):
         return self._ommx_cfg
 
     def _ommx_make_store(self, device) -> CanonicalKVStore:
-        # mirror backend.py:356-363 CanonicalKVStore(...) construction. v_format follows
-        # OMMX_ATTN_V_BF16 (default i2 = shadow-free quantized V). The window (sink/recent/
-        # group/page) + group_channels come straight from the resolved env recipe.
+        # mirror the CanonicalKVStore(...) construction in backend.py's
+        # OMMXCanonicalImpl._ommx_store. v_format follows OMMX_ATTN_V_BF16 (default i2 =
+        # shadow-free quantized V). The window (sink/recent/group/page) + group_channels
+        # come straight from the resolved env recipe.
         import os
         cfg = self._ommx_resolve_cfg(force=True)
         v_bf16 = os.environ.get("OMMX_ATTN_V_BF16", "0").strip().lower() not in {"0", "false", "off", "no", ""}
@@ -242,8 +251,9 @@ class LlamaAttention(nn.Module):
         return st
 
     def _ommx_make_ws(self, device):
-        # mirror backend.py:763-790 _ommx_ws: ONE fixed-address decode workspace per layer,
-        # sized at worst-case geometry (num_kv_splits from max_context). No per-step alloc.
+        # mirror backend.py's OMMXCanonicalImpl._ommx_ws: ONE fixed-address decode workspace
+        # per layer, sized at worst-case geometry (num_kv_splits from max_context). No
+        # per-step alloc.
         if self._ommx_ws is not None:
             return self._ommx_ws
         H, D = self.num_attention_heads, self.head_dim
@@ -265,7 +275,7 @@ class LlamaAttention(nn.Module):
         }
         return self._ommx_ws
 
-    # ── decode kernel call (mirror backend.py:792-836 _route_decode EXACTLY) ─────
+    # ── decode kernel call (mirror OMMXCanonicalImpl._route_decode EXACTLY) ─────
 
     def _ommx_decode(self, query_states: torch.Tensor) -> torch.Tensor:
         """One OMMX decode step. ``query_states`` is HF-layout [B=1, Hq, q_len=1, D]
@@ -275,8 +285,9 @@ class LlamaAttention(nn.Module):
         st = self._ommx_store
         ws = self._ommx_make_ws(query_states.device)
 
-        # q -> [1, Hq, D] (batch=1, head_num=Hq, D): the kernel's q layout (paged_decode.py
-        # :2542 `batch, head_num = q.shape[0], q.shape[1]`). query_states is HF-layout
+        # q -> [1, Hq, D] (batch=1, head_num=Hq, D): the kernel's q layout
+        # (ommx_paged_decode_attention_canonical opens with
+        # `batch, head_num = int(q.shape[0]), int(q.shape[1])`). query_states is HF-layout
         # [B=1, Hq, q_len=1, D]; slice the single decode token then make contiguous (post-RoPE
         # query_states need not be contiguous, so use an explicit slice+contiguous, NOT .view).
         q = query_states[:, :, 0, :].contiguous()       # [1, Hq, D]
@@ -285,10 +296,14 @@ class LlamaAttention(nn.Module):
         pl = di["planes"]
         sm_scale = float(self.scaling)
         # FIXED num_kv_splits (max-context-sized, constant across a decode sequence). Now that
-        # attn_logits is correctly D+1-strided, this fixed count is EXACT (test_long_nsplits.py:
-        # cos 0.99997 for ns in {1,2,4,8,16,254}). Keep it FIXED (not per-seq auto) so the Triton
-        # kernel's num_kv_splits constexpr never changes mid-sequence -> no JIT recompile churn
-        # during decode (a per-seq value recompiled as seq grew -> p99 spikes, inflated TPOT).
+        # attn_logits is correctly D+1-strided, the split count no longer changes the answer:
+        # the per-split lse lane has its own column, so any ns merges to the same result.
+        # (The bring-up sweep behind that statement, cos 0.99997 for ns in {1,2,4,8,16,254},
+        # ran under the dev-tree gate ``tests/test_long_nsplits.py``, NOT shipped here — no
+        # shipped test in this release reproduces it.) Keep it FIXED (not per-seq auto) so
+        # the Triton kernel's num_kv_splits constexpr never changes mid-sequence -> no JIT
+        # recompile churn during decode (a per-seq value recompiled as seq grew -> p99
+        # spikes, inflated TPOT).
         cur_num_kv_splits = int(ws["num_kv_splits"])
 
         ommx_paged_decode_attention_canonical(
@@ -312,7 +327,8 @@ class LlamaAttention(nn.Module):
             attn_logits=ws["attn_logits"], qzp_buf=ws["qzp_buf"],
             packed_start_offset=int(di["packed_start_offset"]),
         )
-        # ws["o"] is [1, Hq, D] f32 (backend.py:783). Return as [1(B), 1(q_len), Hq, D]
+        # ws["o"] is [1, Hq, D] f32 (allocated by _ommx_make_ws above, same shape backend.py's
+        # OMMXCanonicalImpl._ommx_ws uses). Return as [1(B), 1(q_len), Hq, D]
         # so the LlamaAttention reshape `.reshape(*input_shape, -1)` (input_shape=(B,q_len))
         # concatenates the head dim — same memory layout Kitty/eager produce after their
         # transpose(1,2) (i.e. [B, q_len, Hq, D]).
@@ -365,9 +381,10 @@ class LlamaAttention(nn.Module):
                 scaling=self.scaling,
                 **kwargs,
             )
-            # Pack the prompt into the quantized store. CanonicalKVStore expects bf16
-            # K/V as [T, Hkv, D] (test_reference_op_parity.py:53-63). key/value_states
-            # are [B=1, Hkv, T, D] -> squeeze batch, permute to [T, Hkv, D].
+            # Pack the prompt into the quantized store. CanonicalKVStore.append_block
+            # expects bf16 K/V as [T, Hkv, D] (its own docstring: "a prefill block of
+            # bf16 K/V ``[T, H, D]`` each"). key/value_states are [B=1, Hkv, T, D] ->
+            # squeeze batch, permute to [T, Hkv, D].
             K_pack = key_states[0].transpose(0, 1).contiguous()    # [T, Hkv, D]
             V_pack = value_states[0].transpose(0, 1).contiguous()  # [T, Hkv, D]
             self._ommx_store.append_block(K_pack.to(torch.bfloat16), V_pack.to(torch.bfloat16))
