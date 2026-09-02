@@ -14,7 +14,9 @@ The CSV schema (run.sh canonical, one row per cell):
   ttft_p50,ttft_p99,tpot_p50,tpot_p99
 
 Runs on a CPU-only box (no GPU, no torch). matplotlib uses the Agg backend so it
-writes PNGs without a display.
+writes PNGs without a display, and is imported lazily (_pyplot) so that importing this
+module -- it ships inside the declared `ommx_gpu_serve.bench` package -- never requires a
+plotting stack. Asking it to actually plot without one still fails loudly.
 
     python -m ommx_gpu_serve.bench.plot_results --csv runs/<id>/results.csv --out runs/<id>
 """
@@ -25,9 +27,22 @@ import csv
 import os
 from collections import defaultdict
 
-import matplotlib
-matplotlib.use("Agg")  # headless: write PNGs, never open a display
-import matplotlib.pyplot as plt  # noqa: E402
+
+def _pyplot():
+    """Import pyplot lazily, on the headless Agg backend.
+
+    `import matplotlib` at module scope made this file un-importable wherever matplotlib is
+    absent -- and `ommx_gpu_serve.bench` is a DECLARED, SHIPPED package while matplotlib is
+    in none of its extras, so `import ommx_gpu_serve.bench.plot_results` raised
+    ModuleNotFoundError even for `--help`. Importing here keeps the module importable and
+    still fails with the same loud ModuleNotFoundError at the moment a plot is requested;
+    main() forces that moment BEFORE the per-facet try/except, so a missing matplotlib can
+    never be reported as three skipped figures and a rc=0 `PLOT_DONE n=0`.
+    """
+    import matplotlib
+    matplotlib.use("Agg")  # headless: write PNGs, never open a display
+    import matplotlib.pyplot as plt
+    return plt
 
 
 def _read(csv_path):
@@ -45,6 +60,15 @@ def _read(csv_path):
                     r[k] = float(r[k])
                 except (KeyError, ValueError, TypeError):
                     r[k] = float("nan")
+            # DROP CELLS THE SWEEP ITSELF MARKED NOT-OK. bench_e2e_a100 writes an `ok`
+            # column and forces ok=False on every cell of an arm that OOMed, errored, or
+            # could not prove the OMMX decode route fired (law #5: no silent fallback);
+            # e2e_to_figure.py already gates on exactly that field. Without the same gate
+            # here, `plot_results.py --csv <sweep>.csv` drew an "OMMX route not proven"
+            # row as a published OMMX line -- the failure the gate exists to prevent, one
+            # tool downstream. A CSV with no `ok` column is unaffected.
+            if "ok" in r and str(r["ok"]).strip().lower() not in ("true", "1", "yes", ""):
+                continue
             rows.append(r)
     return rows
 
@@ -69,6 +93,7 @@ def plot_tpot_vs_ctx(rows, out_dir, suite_filter=None):
             by_arm[r["arm"]].append(r)
     if not by_arm:
         return None
+    plt = _pyplot()
     fig, ax = plt.subplots(figsize=(8, 5))
     for arm in sorted(by_arm):
         pts = sorted(by_arm[arm], key=lambda r: r["ctx"])
@@ -102,6 +127,7 @@ def plot_ttft_vs_batch(rows, out_dir, suite_filter=None):
             by_arm[r["arm"]].append(r)
     if not by_arm:
         return None
+    plt = _pyplot()
     fig, ax = plt.subplots(figsize=(8, 5))
     for arm in sorted(by_arm):
         pts = sorted(by_arm[arm], key=lambda r: r["batch"])
@@ -140,6 +166,7 @@ def plot_ablation_bar(rows, out_dir):
     arms = sorted({r["arm"] for r in sub})
     tpot = {r["arm"]: r["tpot_p50"] for r in sub}
     p99 = {r["arm"]: (r["tpot_p99"] if _finite(r["tpot_p99"]) else r["tpot_p50"]) for r in sub}
+    plt = _pyplot()
     fig, ax = plt.subplots(figsize=(8, 5))
     xs = range(len(arms))
     vals = [tpot[a] for a in arms]
@@ -167,7 +194,19 @@ def main():
     os.makedirs(out_dir, exist_ok=True)
     rows = _read(args.csv)
     if not rows:
-        raise SystemExit(f"[plot] no rows in {args.csv}")
+        # "no rows" also covers "every row was gated out by ok=False" -- say so, or the
+        # operator reads it as an empty file and goes looking for the wrong bug.
+        raise SystemExit(
+            f"[plot] nothing to plot from {args.csv}: it has no data rows, or every row "
+            f"carries ok=False (a cell that OOMed, errored, or could not prove the OMMX "
+            f"route fired). Read the `err` column of that CSV; not-ok cells are never "
+            f"plotted."
+        )
+
+    # Import the plotting stack HERE, outside the per-facet try/except below: a missing
+    # matplotlib is a broken environment, not "a figure that could not be drawn", and must
+    # not be swallowed three times and reported as PLOT_DONE n=0 with rc=0.
+    _pyplot()
 
     # Comparison line plots use the attention-backend rows (OMMX vs FA3 vs triton);
     # fall back to no filter if a CSV has no 'attn' suite (e.g. a linear-only run).
