@@ -54,3 +54,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   through the same registry as the other comparison arms.
 - Task-harness comments are English throughout (CoQA and the five RULER utilities), which
   is the last Korean text on the evaluation path.
+- LiveCodeBench-v6 KV-quantization comparison (`eval/lcb/`): four KV-quant methods and a
+  bf16 control on one generative path, quantized at the `transformers` `Cache.update()`
+  boundary so every arm shares a code path and MoE models are supported unchanged.
