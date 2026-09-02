@@ -40,3 +40,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The A100/H200 end-to-end bench records the resolved recipe and vLLM version with each
   cell, and demotes a batch size whose sentinel says the request was served by bf16
   FlashAttention instead of the OMMX route.
+- KV serving route fails loudly. A route that cannot run raises with the reason named
+  instead of falling through to bf16, `ommx_route_health()` reports what actually fired,
+  and slot allocation raises `OMMXSlotAllocationError` rather than reusing a slot.
+- PACKED-ONLY KV mode: the bf16 page write is skipped so the OMMX sidecar is the only
+  copy, which is what turns the format's byte saving into cache capacity.
+- Flat-bitmap outlier positions on the KV axis, alongside relidx7 and combinadic.
+- Named recipes are selectable with one flag (`OMMX_RECIPE` / `--recipe` / `--preset`) on
+  the serving path, the bench and the eval harness.

@@ -30,9 +30,15 @@ step's host seam). ``regroup`` reuses ``ommx_pack_kv_canonical_block`` and mirro
 
 CPU-verifiable: a request's pool planes (gathered via its ``req_to_token`` /
 ``req_to_group``) dequant BIT-EXACT (``dequant_kv_canonical``, max_diff == 0) to a
-standalone single-seq ``CanonicalKVStore`` packing the same sequence (dev-tree gate
-``tests/test_kv_pool.py``, not shipped here; the shipped end-to-end correctness check is
-``ommx_gpu_serve/hf_eager/_ommx_hf_batch_test.py``).
+standalone single-seq ``CanonicalKVStore`` packing the same sequence. That gate now
+SHIPS as ``ommx_gpu_serve/tests/test_kv_pool_parity.py``, and it asserts something
+strictly stronger than this paragraph promised: the packed PLANES THEMSELVES are
+byte-identical (``torch.equal`` on the raw uint8/int8/bf16 tensors, so a divergence
+cannot hide behind a dequant that happens not to see it), across a ragged multi-slot
+batch with ``OMMX_KV_RING`` both OFF and ON. It runs on CPU with no vLLM, no triton and
+no GPU; the CUDA repeat of the same parity is ``gpu``-marked and SKIPS (does not pass)
+without a device. The complementary end-to-end check is
+``ommx_gpu_serve/hf_eager/_ommx_hf_batch_test.py``.
 """
 from __future__ import annotations
 
@@ -40,7 +46,37 @@ from typing import Optional, Sequence
 
 import torch
 
+# ── OMMX_RECIPE resolution (see recipes.resolve_env for the model + why) ─────────
+#
+# Resolution model (a): every reader of a recipe-controlled env var expands
+# ``OMMX_RECIPE`` itself, via this idempotent call, BEFORE it reads ``os.environ``.
+# Before this, ``OMMX_RECIPE`` was expanded only inside
+# ``integration/vllm/config.resolve_serving_config``; the raw ``os.environ.get``
+# reads below therefore ignored a named preset in any process where that call had
+# not already happened — silently, with a plausible shipped-recipe answer. The knobs
+# read raw in this file are recipe-controlled: both registered KV presets set
+# ``OMMX_KV_RING=1``, ``OMMX_KV_GPU_PACK=1`` and ``OMMX_KV_OUTLIER_MAP=1``, none of
+# which is the bare default (ring in particular defaults OFF = the full bf16 shadow).
+# The call is a no-op single dict lookup when OMMX_RECIPE is unset, never overwrites
+# an explicitly-set var, and raises (listing the known names) on an unknown one.
+#
+# The import is LAZY (inside the wrapper, not at module scope) for one measured reason:
+# ``ommx_gpu_serve/__init__`` imports this module, so a module-scope
+# ``from ..recipes import ...`` puts ``ommx_gpu_serve.recipes`` in sys.modules DURING
+# the package __init__, and ``python3 -m ommx_gpu_serve.recipes`` — the documented CLI,
+# and what ``run.sh --recipe`` shells out to — then emits
+# "RuntimeWarning: 'ommx_gpu_serve.recipes' found in sys.modules after import of
+# package 'ommx_gpu_serve' ... this may result in unpredictable behaviour" on every
+# invocation. Deferring the import to the first CALL keeps that command clean.
+
+
+def _resolve_recipe_env():
+    from ..recipes import resolve_env
+    return resolve_env()
+
+
 from .kv_window import CANONICAL_GROUP_TOKENS, WindowSpec
+from .pack import OUTLIER_REPRS as _OUTLIER_REPRS
 from .pack import ommx_pack_kv_canonical_block
 
 _OVAL_BYTES = {4: lambda k: (k + 1) // 2}
@@ -81,8 +117,13 @@ class MultiSeqKVPool:
         self.k = int(outliers_per_vector)
         self.outlier_select = str(outlier_select).lower()
         self.outlier_repr = str(outlier_repr).lower()
+        if self.outlier_repr not in _OUTLIER_REPRS:
+            raise ValueError(
+                f"outlier_repr must be one of {_OUTLIER_REPRS}; got {outlier_repr!r}")
         self.use_pow2 = bool(use_pow2)
         import os as _os
+        # OMMX_RECIPE -> os.environ before the first raw read in this constructor.
+        _resolve_recipe_env()
         if kv_outlier_map is None:
             _raw = _os.environ.get("OMMX_KV_OUTLIER_MAP")
             kv_outlier_map = (_raw not in {"0", "false", "off", "no"}) if _raw else True
@@ -140,10 +181,25 @@ class MultiSeqKVPool:
         else:
             self.k_fp4_mapscale = None
             self.k_fp4_mapcenter = None
+        # OUTLIER-POSITION plane: exactly ONE of the three membership-equivalent index
+        # encodings is allocated (the other two stay None) — mirror of
+        # CanonicalKVStore.__init__:
+        #   relidx7 (DEFAULT)  k_oidx  ceil(7k/8) B per (group, head, channel) frame
+        #   combinadic         k_crank ceil(log2 C(gt,k)/8) B  — the storage floor
+        #   bitmap             k_obmp  ceil(gt/8) B  — the paper's flat N-bit-per-group
+        #                                              mask; FLAT in k (1.0 bit/element)
+        self.k_obmp = None
         if self.k > 0 and self.outlier_repr == "relidx7":
             idx_fb = (7 * self.k + 7) // 8
             self.k_oidx = torch.zeros(self.G_cap, self.H, self.D, idx_fb,
                                       dtype=torch.uint8, device=dev)
+            self.k_crank = None
+        elif self.k > 0 and self.outlier_repr == "bitmap":
+            from .codec import bitmap_index_bytes
+            fb = bitmap_index_bytes(self.gt)
+            self.k_obmp = torch.zeros(self.G_cap, self.H, self.D, fb,
+                                      dtype=torch.uint8, device=dev)
+            self.k_oidx = None
             self.k_crank = None
         elif self.k > 0:  # combinadic
             from .codec import combinadic_index_bytes
@@ -175,6 +231,10 @@ class MultiSeqKVPool:
         #     pinned [0:sink), recent positions sliding modulo Rrec). Quantized planes
         #     (the ≤3-bit bulk) are UNCHANGED — only k_hist/v_hist/tail sizing changes.
         import os as _os2
+        # OMMX_KV_RING is set by BOTH registered presets and defaults OFF, so this is
+        # the read where an unresolved OMMX_RECIPE changed what actually got allocated
+        # (full [num_seqs, max_seq_len, H, D] bf16 shadow instead of the ring).
+        _resolve_recipe_env()
         _ring_raw = _os2.environ.get("OMMX_KV_RING")
         self.kv_ring = bool(_ring_raw) and _ring_raw not in {"0", "false", "off", "no"}
         if self.kv_ring:
@@ -524,6 +584,8 @@ class MultiSeqKVPool:
                 self.k_oval[gp0:gp1] = planes["k_oval"][psl_g]
                 if self.outlier_repr == "relidx7":
                     self.k_oidx[gp0:gp1] = planes["k_oidx"][psl_g]
+                elif self.outlier_repr == "bitmap":
+                    self.k_obmp[gp0:gp1] = planes["k_obmp"][psl_g]
                 else:
                     self.k_crank[gp0:gp1] = planes["k_crank"][psl_g]
                 if self.kv_outlier_map:
@@ -583,7 +645,9 @@ class MultiSeqKVPool:
         """
         import os as _os
         # GPU-PACK default ON for relidx7/i2f4 (bit-exact, device-invariant) — no D2H/H2D
-        # round-trip; combinadic always falls back to CPU (pack.py rank_bytes.cpu).
+        # round-trip; the flat BITMAP is device-clean too (_pack_bitmap_frames is pure
+        # vectorized bit-twiddling); combinadic always falls back to CPU (rank_bytes.cpu).
+        _resolve_recipe_env()          # OMMX_RECIPE -> os.environ, before the read
         gpu_pack = (_os.environ.get("OMMX_KV_GPU_PACK", "1") not in {"0", "false", "off", "no"}
                     and self.outlier_repr != "combinadic")
         pdev = self.device if gpu_pack else "cpu"
@@ -619,6 +683,8 @@ class MultiSeqKVPool:
             self.k_oval[gp0:gp1] = planes["k_oval"].to(dev)
             if self.outlier_repr == "relidx7":
                 self.k_oidx[gp0:gp1] = planes["k_oidx"].to(dev)
+            elif self.outlier_repr == "bitmap":
+                self.k_obmp[gp0:gp1] = planes["k_obmp"].to(dev)
             else:
                 self.k_crank[gp0:gp1] = planes["k_crank"].to(dev)
             if self.kv_outlier_map:
@@ -651,6 +717,7 @@ class MultiSeqKVPool:
         return {
             "k_base": self.k_base, "k_scale": self.k_scale, "k_zp": self.k_zp,
             "k_oidx": self.k_oidx, "k_oval": self.k_oval, "k_crank": self.k_crank,
+            "k_obmp": self.k_obmp,
             "k_fp4_mapscale": self.k_fp4_mapscale,
             "k_fp4_mapcenter": self.k_fp4_mapcenter,
             "v_main": self.v_main, "v_scale": self.v_scale, "v_zp": self.v_zp,
@@ -685,6 +752,7 @@ class MultiSeqKVPool:
             "k_oidx": self.k_oidx.index_select(0, gidx) if self.k_oidx is not None else None,
             "k_oval": self.k_oval.index_select(0, gidx) if self.k_oval is not None else None,
             "k_crank": self.k_crank.index_select(0, gidx) if self.k_crank is not None else None,
+            "k_obmp": self.k_obmp.index_select(0, gidx) if self.k_obmp is not None else None,
             "k_fp4_mapscale": (self.k_fp4_mapscale.index_select(0, gidx)
                                if self.k_fp4_mapscale is not None else None),
             "k_fp4_mapcenter": (self.k_fp4_mapcenter.index_select(0, gidx)

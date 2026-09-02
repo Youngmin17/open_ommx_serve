@@ -16,25 +16,91 @@ SHADOW mode, EAGER single-batch (step1 first slice):
     routes UNIFORM SINGLE-TOKEN DECODE through ``ommx_gpu_serve::paged_decode`` and
     falls back to bf16 FlashAttention otherwise.
 
+SLIDING-WINDOW LAYERS ARE NEVER OMMX-ROUTED, AND SAY SO. The plugin registers CUSTOM
+for whatever model is loaded, but every OMMX route here is gated on
+``sliding_window == (-1, -1)``: an alternating SWA/full model (Mistral, Gemma-2,
+Ministral) gets OMMX on its full-attention layers and stock bf16 FlashAttention, out of
+vLLM's own paged cache, on its sliding-window ones. Correct, but PARTIAL — and it used
+to be invisible, because the sentinel of such a run looked exactly like a fully routed
+Llama run. Both halves of the carve-out now record evidence (``SW_BYPASS_BF16`` on the
+write, ``SW_BYPASS_BF16_READ`` on the read, plus
+``ommx_route_health()["sliding_window_bypass"]``), so "OMMX served this model" and
+"OMMX served part of this model" are distinguishable after the fact.
+
 CUDA-graph: declared ``UNIFORM_SINGLE_TOKEN_DECODE``; the eager slice runs with
 ``enforce_eager=True`` (the sidecar append uses a python seq index — NOT yet a
 slot-mapping scatter, so it is not capture-safe). FULL-graph capture + the paged
 multi-batch store is the follow-up (the build-seam scatter in ``metadata.py``).
 
-PACKED-ONLY capacity mode (the ~4.6x KV compression — the headline OMMX benefit
-over FA3) is implemented in ``packed_only.py`` and gated by ``OMMX_KV_PACKED_ONLY=1``
-(default OFF; SHADOW stays the correctness-first baseline). It patches
+PACKED-ONLY capacity mode (the KV compression — the headline OMMX benefit over FA3)
+is implemented in ``packed_only.py`` and gated by ``OMMX_KV_PACKED_ONLY=1`` (default
+OFF; SHADOW stays the correctness-first baseline). It patches
 ``Attention.get_kv_cache_spec`` so the bf16 paged-cache page budget shrinks by the
-OMMX ≤3-bit ratio -> vLLM admits ~4.6x more KV blocks (the capacity win is visible in
-vLLM's own "GPU KV cache size: <N> tokens" / "Maximum concurrency <Y>x" log lines).
+OMMX-vs-bf16 byte ratio -> vLLM budgets proportionally more KV blocks.
+
+  MEASURED KV FOOTPRINT — RETRACTS THE "≤3-bit" / "~4.6x" CLAIMS THIS DOCSTRING USED
+  TO MAKE. Obtained by SUMMING THE REAL ALLOCATED ``MultiSeqKVPool`` TENSORS (not by
+  evaluating a formula), Llama-3.1-8B geometry:
+    canonical PUBLISHED recipe — i2f4, 6 outliers/vector, relative-index 7,
+      group_tokens=32, group_channels=32, OMMX_KV_OUTLIER_MAP=1, pow2 (int8 scale):
+        K+V = 8.750 bit per K/V element PAIR = 4.375 bit/elem -> 32/8.75 = 3.66x
+    same recipe with OMMX_KV_OUTLIER_MAP=0:
+        K+V = 7.750 -> 3.875 bit/elem -> 4.13x
+    group_tokens=64 + group_channels=64 + OMMX_KV_OUTLIER_MAP=0:
+        K+V = 5.875 -> 2.938 bit/elem -> 5.45x   (the ONLY "≤3-bit" configuration)
+  So the recipe the ACCURACY results were produced with is 4.375 bit/elem = 3.66x.
+  Reaching ≤3 bit needs group_tokens=64 + group_channels=64 + OMMX_KV_OUTLIER_MAP=0
+  (at group_channels=32 the same knobs give 6.250 bit/pair = 3.125 avg, NOT ≤3),
+  i.e. a DIFFERENT number system from the one the accuracy numbers used — the
+  compression figure and the accuracy figure must never be quoted from different
+  recipes in one sentence.
+  (What vLLM applies to the page budget: PACKED-ONLY calls
+  ``packed_only.ommx_bits_per_elem(head_size)`` with NO keyword overrides, so the recipe
+  comes from the ENV — the same env the pool itself reads. Under the published recipe
+  (``OMMX_ATTN_OUTLIERS=6 OMMX_ATTN_POW2=1 OMMX_KV_GROUP_TOKENS=32
+  OMMX_KV_GROUP_CHANNELS=32``) that returns K 6.000 / V 2.750 = 8.750 bit = 3.657x,
+  IDENTICAL to the measured plane footprint above — verified by calling the function and
+  by summing the real ``MultiSeqKVPool`` tensors independently.
+  Two ways to get a different number out of it, both of which mean the env was not the
+  published recipe: with NOTHING set it falls back to k=3 + bf16 scale (8.250 bit,
+  3.88x), and at k=6 but ``use_pow2`` unset it gives 9.250 bit (3.46x) because the scale
+  reverts from an int8 pow2 exponent to bf16. Always state which recipe a ratio belongs
+  to; ``packed_only.kv_bits_breakdown()`` prints the resolved recipe alongside the
+  number for exactly this reason.)
+
 The INT2 sidecar is the real backing store + decode op; the SHRUNK bf16 paged cache
 is a BYTE-BUDGET RESERVATION ONLY — never written (``do_kv_cache_update`` skips the
 paged write) and never read (a full-prompt prefill runs varlen FlashAttention
 directly on the in-batch q/k/v; the KIVI sink/recent residual lives in the store's
-own buffers). Steps neither packed route can serve raise loudly — over the shrunk
-pages there is no valid bf16 fallback.
+own buffers). Because it is a reservation that never stores a token, vLLM's own
+"GPU KV cache size: <N> tokens" / "Maximum concurrency <Y>x" log lines merely RESTATE
+that reservation — they are NOT a validated OMMX capacity result, and quoting them as
+one attributes to OMMX a number vLLM computed from a head_size we asked it to shrink.
+The only capacity claim backed by measurement is the pool-tensor byte count above.
+Steps neither packed route can serve raise loudly — over the shrunk pages there is no
+valid bf16 fallback.
+
+FAILURE POLICY (law #5, NO SILENT FALLBACK) — DEFAULT CHANGED: an OMMX route failure
+is now FATAL. Every OMMX route (the sidecar write in ``do_kv_cache_update``, and the
+single-batch / batched / batched-graph decode reads) used to answer a failure by
+latching ``layer._ommx_dead`` and returning False, which handed the step to bf16
+FlashAttention. Measured consequence on vLLM 0.21, whose defaults are
+``enable_prefix_caching=True`` (vllm/config/cache.py:91) and
+``enable_chunked_prefill=True`` (vllm/config/scheduler.py:84) — BOTH unsupported by
+the non-paged sidecar: a Llama-3.1-8B run with ``--attention-backend CUSTOM`` wrote
+``KV_UPDATE_DEAD`` to the sentinel and then produced output BYTE-IDENTICAL to the
+bf16 reference (228/228 chars), while the same config with prefix caching OFF
+produced a genuinely different (OMMX) continuation. A fluent, fast, wrong-backend run
+is the worst possible failure mode for a benchmark, so it no longer happens silently:
+the evidence is recorded and the exception RE-RAISES. ``OMMX_ALLOW_BF16_FALLBACK=1``
+opts back into degrading, and then does so LOUDLY (one-time stderr+logger banner,
+``_DEGRADED`` latch, ``ommx_route_health()["degraded"] == True`` for a bench to
+assert on). ``OMMX_STRICT=1`` (``cfg.strict``) stays the STRONGER knob: it raises even
+when the opt-in is set.
 """
 from __future__ import annotations
+
+import sys
 
 import torch
 from vllm.v1.attention.backend import AttentionCGSupport
@@ -53,25 +119,69 @@ from ommx_gpu_serve.attention.paged_decode import (
     ommx_paged_decode_attention_canonical,
 )
 from .config import resolve_serving_config
-from .metadata import (OMMXBatchedStepManager, OMMXStepManager,
-                       detect_full_prefill, detect_step_route)
+from .metadata import (STEP_ROUTE_UNCLASSIFIED, OMMXBatchedStepManager,
+                       OMMXStepManager, detect_full_prefill, detect_step_route)
 from .packed_only import packed_only_enabled
+from .preflight import ommx_preflight_check
 
 OMMX_BACKEND_CLASS_PATH = "ommx_gpu_serve.integration.vllm.backend.OMMXCanonicalBackend"
 
 
 def _env_on(name: str) -> bool:
-    return os.environ.get(name, "0").strip().lower() not in {"0", "false", "off", ""}
+    """Route-env truthiness: ``0|false|off|no|<empty>`` = OFF, anything else = ON.
+
+    THE SET IS THE PACKAGE-WIDE ONE and ``"no"`` is in it on purpose. This helper used
+    to omit ``"no"`` while ``config._env_bool``, ``metadata._env_on``,
+    ``kv_pool``/``kv_store``'s pool flags and ``plugin.py`` all included it, so ONE
+    spelling meant opposite things depending on which module read it. What that bought,
+    concretely: ``OMMX_ALLOW_BF16_FALLBACK=no`` ENABLED the bf16 degrade (the operator
+    had just written the word "no"), and ``OMMX_ABL_SKIP_WRITE=no`` turned ON a
+    PARITY-BREAKING ablation whose whole effect is to make the decode read stale KV.
+    Both are safety-critical knobs, so the divergence is now closed here rather than
+    documented as a quirk.
+
+    ONE MIRROR IS STILL STALE, DELIBERATELY LEFT FOR ITS OWNER:
+    ``preflight._backend_env_on`` copies the OLD set verbatim (its docstring names this
+    function as the authority) and ``tests/test_preflight_guards.py`` pins that copy by
+    parametrizing ``OMMX_ATTN_BATCHED="no"``. Until those two are updated together,
+    preflight reads ``"no"`` as ON where this reads it OFF — i.e. preflight assumes a
+    B>1 step is reachable when the backend would not batch, so it can only REFUSE a run
+    the backend would have served. That direction is fail-closed (a refusal costs a
+    re-run; the reverse would publish a FlashAttention number as OMMX), which is why it
+    is safe to land this half first.
+    """
+    return os.environ.get(name, "0").strip().lower() not in {
+        "", "0", "false", "off", "no"}
 
 
 def _env_int(name: str, default: int) -> int:
+    """Integer env knob. Unset/blank -> ``default``; MALFORMED -> ``ValueError``.
+
+    Raising is the package law (``packed_only._env_int``: "a malformed value RAISES
+    (law: no silent fallback)"; ``config._env_int`` parses unguarded and so raises too).
+    This helper used to swallow the ``ValueError`` and substitute ``default``, which on
+    its one consumer -- ``OMMX_ATTN_MAX_NUM_SEQS``, a DIRECT HBM MULTIPLIER (the pool is
+    ``num_seqs * max_model_len`` bytes per layer, eagerly allocated) -- turned a typo
+    into a silent 256-slot pool: the operator asked for a small pool and got the 256-slot
+    one instead — which at vLLM's defaults (max_model_len=131072, Llama-3.1-8B geometry)
+    is the 35.11 GiB/layer x 32 = 1123.5 GiB projection recorded at
+    ``_MAX_NUM_SEQS_DEFAULT`` below, i.e. the first B>1
+    step OOMs inside the write path, where a dead-latch used to hand every subsequent
+    step to bf16 FlashAttention. The error names the variable and the value so the fix is
+    obvious from the traceback.
+    """
     raw = os.environ.get(name)
     if raw is None or str(raw).strip() == "":
         return int(default)
     try:
         return int(raw)
-    except ValueError:
-        return int(default)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"[ommx] {name}={raw!r} is not an integer. Unset it to use the default "
+            f"({int(default)}), or give it a whole number. Refusing to substitute the "
+            "default for a malformed value: this knob sizes an eagerly allocated "
+            "per-layer pool, so a silently ignored value is an OOM, not a typo."
+        ) from exc
 
 
 # CUDA-graph-capable path (capture-safe write + host build-seam). Default OFF so the
@@ -86,7 +196,7 @@ _GRAPH = _env_on("OMMX_ATTN_GRAPH")
 # routing a B>1 decode through them corrupts requests 1..B-1 (the confirmed garbage).
 # OMMX_ATTN_BATCHED=1 is now only a FORCE-OVERRIDE: route even a B==1 decode through the
 # batched pool (eager-only; do not combine with OMMX_ATTN_GRAPH). pool cap =
-# OMMX_ATTN_MAX_NUM_SEQS.
+# _resolved_max_num_seqs().
 _BATCHED = _env_on("OMMX_ATTN_BATCHED")
 # CUDA-graph-CAPTURABLE batched (B>1) decode. When ON, a B>1 uniform-decode session
 # routes the WRITE + READ through the fixed-address device-buffer paths
@@ -97,7 +207,69 @@ _BATCHED = _env_on("OMMX_ATTN_BATCHED")
 # the small out-of-graph step. Closes the eager-vs-fullgraph B>1 TPOT gap. Default OFF
 # (the validated eager batched path stays the correctness baseline).
 _BATCHED_GRAPH = _env_on("OMMX_ATTN_BATCHED_GRAPH")
-_MAX_NUM_SEQS = _env_int("OMMX_ATTN_MAX_NUM_SEQS", 256)
+# ── OMMX pool slot cap (num_seqs) ─────────────────────────────────────────────
+# ``MultiSeqKVPool`` is NOT paged: it allocates O(num_seqs * max_model_len) bytes PER
+# LAYER, EAGERLY, at the first B>1 step — so this number is a direct HBM multiplier,
+# and a hard-coded 256 was the measured cause of a real OOM. At vLLM defaults
+# (max_model_len=131072, Llama-3.1-8B geometry) 256 slots project to 35.11 GiB per
+# layer x 32 layers = 1123.5 GiB; the observed failure on an H100 NVL was
+# "CUDA out of memory. Tried to allocate 514.00 MiB ... 383.81 MiB is free", after
+# which the write path latched dead and the engine silently served bf16 (see the
+# FAILURE POLICY paragraph in the module docstring).
+# The engine ALREADY knows the real concurrency ceiling — it is
+# ``vllm_config.scheduler_config.max_num_seqs``, the most requests the scheduler will
+# ever run at once. Resolution is a MIN, NOT a precedence chain — write it as the
+# arithmetic it is, because the "env > engine > 256" shorthand has already produced two
+# self-contradicting operator messages (preflight.py repeats the warning):
+#     cap = max(1, min(OMMX_ATTN_MAX_NUM_SEQS or 256, scheduler_config.max_num_seqs))
+# So the env can only LOWER the cap: OMMX_ATTN_MAX_NUM_SEQS=512 under --max-num-seqs 128
+# resolves to 128, not 512. NEVER exceeding the engine value once it is known: slots the
+# scheduler can never fill are pure wasted HBM, and that waste is exactly what OOMs.
+# Floored at 1.
+# CONSEQUENCE FOR metadata.py's ERROR TEXT: the min() means the env can no longer push
+# the cap ABOVE the engine's max_num_seqs, so metadata.py's slot-exhaustion advice
+# ("raise OMMX_ATTN_MAX_NUM_SEQS to at least / above the engine's max_num_seqs") now
+# tops out at exactly the engine value. That is enough for the exhaustion case (the
+# scheduler can never make more than max_num_seqs requests live at once, so cap ==
+# max_num_seqs always suffices); the remaining remedy for a dummy/capture batch that
+# still cannot find B free slots is to LOWER --max-num-seqs, not to raise the env.
+# Every consumer (``_bmanager`` / ``_ommx_ws_batched`` / ``_preflight_once``) MUST read
+# ``_resolved_max_num_seqs()``. There is deliberately NO raw module constant holding
+# the effective value, so a future consumer cannot re-introduce the 256 by reading a
+# stale name.
+_MAX_NUM_SEQS_DEFAULT = 256
+# The EXPLICIT operator override, or None when the env is unset/blank (then the engine
+# value decides). A MALFORMED value now RAISES out of ``_env_int`` at import (see that
+# helper): this is a direct HBM multiplier, so substituting the 256 default for a typo
+# allocates the pool the operator was trying to shrink.
+_MAX_NUM_SEQS_ENV = (
+    _env_int("OMMX_ATTN_MAX_NUM_SEQS", _MAX_NUM_SEQS_DEFAULT)
+    if str(os.environ.get("OMMX_ATTN_MAX_NUM_SEQS", "")).strip() != "" else None)
+# ``scheduler_config.max_num_seqs``, captured ONCE by OMMXCanonicalMetadataBuilder
+# (the earliest object holding the whole vllm_config). Stays None if unreadable, and
+# then the resolution falls back to the env/default exactly as before.
+_ENGINE_MAX_NUM_SEQS = None
+
+
+def _resolved_max_num_seqs() -> int:
+    """The pool slot cap actually used::
+
+        max(1, min(OMMX_ATTN_MAX_NUM_SEQS or 256, scheduler_config.max_num_seqs))
+
+    A MIN, not a precedence chain: the env is an override only in the DOWNWARD
+    direction. With the engine at ``--max-num-seqs 128``, ``OMMX_ATTN_MAX_NUM_SEQS=512``
+    resolves to 128 — the env does not win. (The "env > engine > 256" prose this
+    docstring used to carry is the shorthand that produced two contradicting operator
+    messages; ``preflight.py`` keeps a comment block warning against re-introducing it.)
+    Capped by the engine's ``max_num_seqs`` whenever that is known (a pool larger than
+    the scheduler can ever fill is wasted HBM), floored at 1 (``MultiSeqKVPool``
+    clamps <=0 to 1 and would then alias every request onto slot 0).
+    """
+    v = _MAX_NUM_SEQS_DEFAULT if _MAX_NUM_SEQS_ENV is None else int(_MAX_NUM_SEQS_ENV)
+    if _ENGINE_MAX_NUM_SEQS is not None:
+        v = min(int(v), int(_ENGINE_MAX_NUM_SEQS))
+    return max(1, int(v))
+
 # OMMX_ATTN_V_BF16=1 -> the v10a path: K stays i2f4, V is the FULL bf16 value (no V
 # quant/dequant). The canonical kernel auto-selects the StoreBf16 VFmt branch from the
 # bf16 v_main dtype. Removes the V=i2 per-element dequant ALU (the M=1 decode loss cause)
@@ -109,6 +281,11 @@ _V_BF16 = _env_on("OMMX_ATTN_V_BF16")
 #   (full_step) - (SKIP_WRITE_step) = the per-step KV pack/write cost.
 # Decode-only (n==1); prefill writes are KEPT (else the cache is empty). NOT production;
 # default OFF. Mirrors the kernel-side OMMX_ABL_* timing flags.
+# IT ANNOUNCES ITSELF WHEN ON (``_announce_parity_breaking_ablations``, called at the
+# first write): a flag whose entire purpose is to make the output WRONG must never be
+# silent. Before that, the skip was a bare ``return`` — no banner, no sentinel line — so
+# the only trace of a knowingly-wrong run was the env of the process that launched it,
+# and the sentinel still showed a clean DECODE_ROUTE_FIRED.
 _ABL_SKIP_WRITE = _env_on("OMMX_ABL_SKIP_WRITE")
 # PACKED-ONLY capacity mode (OMMX_KV_PACKED_ONLY=1, packed_only.py). The spec patch
 # shrinks the bf16 paged-cache page budget, so the pages CANNOT hold real headdim-D
@@ -126,11 +303,16 @@ _PACKED_ONLY = packed_only_enabled()
 # REAL OMMX decode still runs eager at serve. Cleared in finally (law #5: serve steps,
 # with the latch False, still raise loud rather than silently zero-serve).
 _CAPTURING = [False]
-# Flips True on the FIRST real OMMX decode-route fire (BATCHED/DECODE/*ROUTE_FIRED). Before
-# that, the process is in vLLM INIT (determine_available_memory memory-profiling dummy +
-# cudagraph capture) — synthetic decode steps with no OMMX pool that the packed guard must
-# STUB (not raise), because is_current_stream_capturing() is False for the eager memory-
-# profiling dummy. After real serving starts, the guard raises on genuine anomalies (law #5).
+# Flips True on the FIRST OMMX route fire — ANY ``*_FIRED`` tag: the decode routes
+# (BATCHED/DECODE/GRAPH) and the PACKED-ONLY prefill (PACKED_PREFILL_FIRED), which the
+# older ``"ROUTE_FIRED" in tag`` test did not match. Before that, the process is in vLLM
+# INIT (determine_available_memory memory-profiling dummy + cudagraph capture) —
+# synthetic steps with no OMMX pool that the packed guard must STUB (not raise), because
+# is_current_stream_capturing() is False for the eager memory-profiling dummy. The
+# profiling dummy cannot fire a tag (it runs with attn_metadata None, which returns early
+# in super()), so widening the latch to ``*_FIRED`` does not shorten the init window; it
+# only stops a REAL packed prefill from leaving the process looking un-started.
+# After real serving starts, the guard raises on genuine anomalies (law #5).
 _REAL_SERVE_STARTED = [False]
 # Worker-side batched-route fire counter (mutable module cell; proves the OMMX
 # batched decode actually ran in the worker process — see _route_decode_batched).
@@ -143,6 +325,20 @@ _PACKED_PREFILL_FIRES = [0]
 # logger (forwarded). Path overridable for the bench to read back.
 _FIRE_FILE = os.environ.get("OMMX_FIRE_FILE", "/tmp/ommx_route_fired.log")
 _FIRE_SEEN: set = set()
+
+# ── DEGRADE POLICY (law #5: NO SILENT FALLBACK) ───────────────────────────────
+# OFF by default: an OMMX route failure RE-RAISES and takes the engine down. See the
+# FAILURE POLICY paragraph in the module docstring for the run that forced this
+# default (a CUSTOM-backend run that emitted output byte-identical to bf16 because a
+# KV_UPDATE_DEAD latch had quietly handed every step to FlashAttention).
+# OMMX_ALLOW_BF16_FALLBACK=1 opts back into the degrade — LOUDLY, never silently.
+_ALLOW_BF16_FALLBACK = _env_on("OMMX_ALLOW_BF16_FALLBACK")
+# Latched on the FIRST degrade (reachable only with the opt-in above). Read it through
+# ommx_route_health(); a bench MUST assert degraded is False before quoting a number.
+_DEGRADED = {"reason": None, "layer": None, "step_hint": None}
+# One-time banner latch (per worker process). The banner is the thing a human sees;
+# _DEGRADED is the thing a script sees.
+_DEGRADE_BANNER_SHOWN = [False]
 
 
 def _ommx_local_rank() -> int:
@@ -165,8 +361,25 @@ def _ommx_local_rank() -> int:
 
 
 def _ommx_route_evidence(tag: str, detail: str = "") -> None:
-    """Record one-time PER-RANK route evidence to the sentinel file (+vLLM log)."""
-    if "ROUTE_FIRED" in tag:            # first real OMMX decode route -> serving started
+    """Record one-time PER-RANK route evidence to the sentinel file (+vLLM log).
+
+    TAG NAMING IS LOAD-BEARING — three consumers key off the SUFFIX:
+      ``*_DEAD`` / ``*_NOFIRE``  a route was asked to serve and did not. Both
+          ``_sentinel_dead_tags`` and ``bench_e2e_a100.py::_is_nofire_tag`` read these
+          as FAILURE (ok=False). Never give an informational tag one of these suffixes.
+      ``*_FIRED``  an OMMX route really served a step -> latches ``_REAL_SERVE_STARTED``
+          below, i.e. "this process is past vLLM init". A tag that is NOT proof of a
+          real serve step must not end in ``_FIRED``.
+      anything else  informational; the bench buckets it into ``other_tags`` and it
+          changes no verdict (``SW_BYPASS_BF16*``, ``ABL_SKIP_WRITE_ACTIVE``,
+          ``PACKED_CAPTURE_STUB``).
+    """
+    if tag.endswith("_FIRED"):          # an OMMX route really served -> past vLLM init
+        # Was ``"ROUTE_FIRED" in tag``, which missed PACKED_PREFILL_FIRED — the only
+        # fire evidence a PACKED-ONLY prefill produces. The latch therefore stayed False
+        # through a real prefill, and the packed guard below then treated the NEXT real
+        # step as a capture dummy and ZERO-FILLED it. Suffix matching cannot drift when
+        # a route tag is added (same reasoning as the bench's ``_NOFIRE``/``_DEAD``).
         _REAL_SERVE_STARTED[0] = True
     r = _ommx_local_rank()
     key = f"{tag}.r{r}"  # dedup per (tag, rank) so each TP rank fires once
@@ -191,6 +404,371 @@ def _ommx_route_evidence(tag: str, detail: str = "") -> None:
         init_logger("ommx_gpu_serve").info("[ommx] %s", line)
     except Exception:
         pass
+
+
+# Sliding-window layers this process served from the bf16 paged cache instead of OMMX:
+# id(layer) -> that layer's ``sliding_window``. PER PROCESS, like every other counter in
+# this module; the CROSS-process fact is the ``SW_BYPASS_BF16*`` sentinel tag.
+_SW_BYPASS_LAYERS: dict = {}
+# (tag, id(impl)) pairs already recorded — the per-step early-out (see below).
+_SW_BYPASS_SEEN: set = set()
+
+
+def _sw_bypass_evidence(tag: str, impl, detail: str = "") -> None:
+    """Record that a SLIDING-WINDOW layer is being served by bf16, not by OMMX.
+
+    WHY A TAG AT ALL. A mixed SWA/full-attention model (Mistral, Gemma-2, Ministral)
+    runs its full-attention layers through OMMX and its sliding-window layers through
+    stock FlashAttention over vLLM's bf16 paged cache — correct output, but only PART of
+    the model is an OMMX measurement. Without evidence, the sentinel of such a run is
+    byte-identical to a fully-OMMX-routed Llama run (``DECODE_ROUTE_FIRED`` and nothing
+    else), so partial and total coverage were indistinguishable and the bench reported
+    ok=True either way. This tag is the difference.
+
+    WHY IT IS *NOT* A ``*_DEAD`` / ``*_NOFIRE`` TAG. Those suffixes mean "an OMMX route
+    was asked to serve a step and failed", which sets ok=False in
+    ``bench_e2e_a100.py``/``ommx_route_health``. The sliding-window carve-out is a
+    DESIGNED, correct route (the read gates in ``forward`` deliberately exclude these
+    layers), so flagging it as a failure would refuse benches that are working exactly
+    as specified. It is informational: it tells the reader that OMMX's share of this run
+    is partial, and leaves the verdict to them.
+
+    Dedup is per ``(tag, rank)`` in the sentinel, so the FILE carries one line per rank
+    per path, not one per layer — the exact per-layer count lives in
+    ``ommx_route_health()["sliding_window_bypass"]`` (per process).
+
+    IT IS ON THE PER-STEP DECODE PATH, so the ``(tag, impl)`` early-out below is not
+    tidiness: a sliding-window layer calls this on EVERY step, and everything past the
+    set lookup (the rank probe, the f-string) would otherwise be per-step TPOT cost in
+    the one model family this branch exists for.
+    """
+    seen_key = (tag, id(impl))
+    if seen_key in _SW_BYPASS_SEEN:
+        return
+    _SW_BYPASS_SEEN.add(seen_key)
+    sw = getattr(impl, "sliding_window", None)
+    # ``impl`` is the per-layer FlashAttentionImpl (vLLM builds one per attention
+    # layer), so its id is a stable per-layer identity for the count below.
+    _SW_BYPASS_LAYERS[id(impl)] = sw
+    _ommx_route_evidence(
+        tag,
+        f"sliding_window={sw} impl={type(impl).__name__}@{id(impl):#x} {detail} "
+        "(one-time; EVERY sliding-window layer of this model takes the bf16 path, so "
+        "this run's OMMX coverage is PARTIAL - see ommx_route_health()"
+        "['sliding_window_bypass'])".rstrip())
+
+
+# B values (>1) whose uniform-decode step reached the bf16 fall-through instead of an
+# OMMX route. PER PROCESS; the cross-process fact is the DECODE_BF16_UNROUTED tag.
+_UNROUTED_DECODE_B: set = set()
+
+
+def _decode_unrouted_evidence(B: int, *, graph: bool) -> None:
+    """Record that a B>1 uniform decode was served by bf16, not by OMMX.
+
+    Companion to ``_sw_bypass_evidence`` for the OTHER designed bf16 carve-out on the
+    read path (see the ``else`` arm in ``forward``). Informational for the same reason:
+    the output is correct, only its ATTRIBUTION would be wrong, and a failure suffix
+    would fire on vLLM's own graph-capture dummies.
+
+    Deduped on ``B`` (a set lookup) BEFORE anything else, because this sits on the
+    per-step decode path — the rank probe and the f-string inside
+    ``_ommx_route_evidence`` must not be paid every step.
+    """
+    if B in _UNROUTED_DECODE_B:
+        return
+    _UNROUTED_DECODE_B.add(int(B))
+    _ommx_route_evidence(
+        "DECODE_BF16_UNROUTED",
+        f"B={B} graph={bool(graph)}: a uniform single-token decode of {B} requests was "
+        "served by bf16 FlashAttention (no OMMX route accepts it: the batched pool is "
+        "not active for this step and the single-batch route would answer only request "
+        "0). This run's OMMX coverage is PARTIAL - see ommx_route_health()"
+        "['unrouted_decode_b'].")
+
+
+# One-time banner latch for the parity-breaking ablation knobs read in THIS module.
+_ABL_BANNER_SHOWN = [False]
+
+
+def _announce_parity_breaking_ablations() -> None:
+    """Announce ONCE, loudly, that a PARITY-BREAKING ablation knob is active.
+
+    ``OMMX_ABL_SKIP_WRITE`` makes the decode read stale KV on purpose, to price the
+    per-step KV pack/write by difference. Its output is WRONG by construction. It used
+    to take effect through a bare ``return`` with no banner and no sentinel line, so a
+    run launched with it looked — in the sentinel, in the logs, and in
+    ``ommx_route_health()`` — exactly like a clean one, and only the launching env said
+    otherwise. That is the precise failure mode this codebase's law #5 exists to forbid,
+    and a knob that deliberately breaks parity is the last place to make an exception.
+
+    The tag is informational by design (see ``_sw_bypass_evidence`` for the suffix
+    rules): ``bench_e2e_a100.py`` runs ``abl_attn_skipwrite`` as a declared
+    ``coh=False`` arm, and giving it a ``*_DEAD`` suffix would turn that intended
+    measurement into a reported route failure.
+    """
+    if _ABL_BANNER_SHOWN[0] or not _ABL_SKIP_WRITE:
+        return
+    _ABL_BANNER_SHOWN[0] = True
+    _ommx_route_evidence(
+        "ABL_SKIP_WRITE_ACTIVE",
+        "decode KV pack/write SKIPPED - the decode reads STALE KV, so the OUTPUT OF "
+        "THIS RUN IS WRONG BY CONSTRUCTION (timing-only ablation)")
+    bar = "=" * 78
+    banner = (
+        f"\n{bar}\n"
+        "[ommx] OMMX_ABL_SKIP_WRITE IS ON - THIS RUN'S OUTPUT IS DELIBERATELY WRONG.\n"
+        "  Every decode step skips the new-token KV pack/regroup/write, so the kernel\n"
+        "  attends STALE KV. The run stays fluent and fast; its TPOT is meaningful\n"
+        "  ONLY as (full step) - (this step) = the per-step KV pack/write cost.\n"
+        "  NOTHING from it may be quoted as an accuracy, parity or capacity result.\n"
+        f"  route evidence: {_FIRE_FILE} (tag ABL_SKIP_WRITE_ACTIVE)\n"
+        "  programmatic check: ommx_route_health()['ablations']['abl_skip_write']\n"
+        f"{bar}\n")
+    sys.stderr.write(banner)
+    sys.stderr.flush()
+    try:
+        # Best-effort duplicate on the only stream a spawn worker forwards to the
+        # driver; stderr above is the authoritative copy (mirrors the degrade banner).
+        from vllm.logger import init_logger
+        init_logger("ommx_gpu_serve").error("%s", banner)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _ommx_route_failed(tag: str, exc: BaseException, *, cfg=None, layer=None,
+                       step_hint: str = "") -> None:
+    """Handle a failure inside an OMMX route: record evidence, then RAISE by default.
+
+    Precedence, strongest knob FIRST (this ordering is deliberate):
+      1. ``cfg.strict`` (OMMX_STRICT=1) -> ALWAYS re-raise, even when the bf16 opt-in
+         below is set. ``strict`` is the stronger knob, so a run that explicitly asked
+         to fail hard cannot be talked out of it by a second, weaker env.
+      2. ``OMMX_ALLOW_BF16_FALLBACK`` unset (THE DEFAULT) -> re-raise. Degrading here is
+         precisely what let a CUSTOM-backend run produce fluent, fast, byte-identical-
+         to-bf16 output that a bench would then have published as an OMMX result.
+      3. ``OMMX_ALLOW_BF16_FALLBACK=1`` -> do not raise: latch ``_DEGRADED``, print a
+         one-time banner to stderr AND vLLM's logger, and let the caller fall back.
+    The route evidence is appended FIRST in every case, so ``$OMMX_FIRE_FILE`` names the
+    cause whether the process dies here or limps on. Re-raising ``exc`` (rather than a
+    new error) preserves the original traceback and message.
+
+    HISTORICAL GAP IN THE PUBLISHED VERIFIER -- NOW CLOSED (kept as the reason the
+    bench's rule is shaped the way it is; do not "simplify" it back). bench/
+    bench_e2e_a100.py used to decide "is this an OMMX measurement?" with an EXACT tuple
+    membership test over ``("DECODE_ROUTE_NOFIRE", "BATCHED_ROUTE_NOFIRE",
+    "KV_UPDATE_DEAD")``. Of the tags THIS function writes, only ``KV_UPDATE_DEAD`` was
+    in that tuple, so the four read-path tags -- ``DECODE_ROUTE_DEAD``,
+    ``GRAPH_ROUTE_DEAD``, ``BATCHED_ROUTE_DEAD``, ``BATCHED_GRAPH_ROUTE_DEAD`` -- fell
+    into the bench's ``other_tags`` bucket and did NOT set ok=False. With
+    ``OMMX_ALLOW_BF16_FALLBACK=1`` a run that fired once at capture and then died on
+    every real step still reported ``route_fired=True``. The bench now matches by
+    SUFFIX (``bench_e2e_a100.py::_is_nofire_tag`` -> ``_NOFIRE_SUFFIXES =
+    ("_NOFIRE", "_DEAD")``), which cannot drift out of sync when a new route tag is
+    added here. Both driver-side checks are therefore trustworthy now:
+    ``ommx_route_health()`` and the bench's ok flag. If you ADD a failure tag, keep the
+    ``_DEAD`` / ``_NOFIRE`` suffix or the bench will not see it.
+    """
+    _ommx_route_evidence(tag, f"{type(exc).__name__}: {exc}")
+    if layer is not None:
+        # Kept even when we are about to raise: if a caller upstream ever chooses to
+        # swallow the exception, the latch still stops this layer from being trusted.
+        setattr(layer, "_ommx_dead", True)
+    # cfg is None when the caller could not produce one (e.g. the write path passes the
+    # CACHED _ommx_serving_cfg, which is unset if cfg construction is what failed). The
+    # getattr default then reads as "not strict", and the DEFAULT policy below raises
+    # anyway — the only way to reach the fall-through is strict False AND the opt-in set.
+    strict = bool(getattr(cfg, "strict", False))
+    if strict or not _ALLOW_BF16_FALLBACK:
+        raise exc
+    if _DEGRADED["reason"] is None:
+        _DEGRADED["reason"] = f"{tag}: {type(exc).__name__}: {exc}"
+        _DEGRADED["layer"] = (f"{type(layer).__name__}@{id(layer):#x}"
+                              if layer is not None else None)
+        _DEGRADED["step_hint"] = step_hint or (
+            f"B={_STEP.get('B')} batched_read={_STEP.get('batched_read')} "
+            f"batched_write={_STEP.get('batched_write')}")
+    if not _DEGRADE_BANNER_SHOWN[0]:
+        _DEGRADE_BANNER_SHOWN[0] = True
+        bar = "=" * 78
+        banner = (
+            f"\n{bar}\n"
+            "[ommx] DEGRADED TO bf16 - THIS RUN IS NO LONGER AN OMMX MEASUREMENT.\n"
+            f"  cause: {_DEGRADED['reason']}\n"
+            f"  step : {_DEGRADED['step_hint']}\n"
+            f"  layer: {_DEGRADED['layer']}\n"
+            "  From here the affected layer serves bf16 FlashAttention out of vLLM's\n"
+            "  paged cache. The output stays fluent and the latency stays plausible,\n"
+            "  so NOTHING downstream will look wrong - and every latency, quality or\n"
+            "  compression number taken from this run describes FlashAttention, not\n"
+            "  OMMX. Discard it or re-run without the fallback.\n"
+            "  You are seeing this instead of a crash ONLY because\n"
+            "  OMMX_ALLOW_BF16_FALLBACK is set. Unset it to make route failures fatal\n"
+            "  again; set OMMX_STRICT=1 to raise even with the opt-in set.\n"
+            f"  route evidence: {_FIRE_FILE}\n"
+            f"  programmatic check: ommx_route_health()['degraded'] is now True\n"
+            f"{bar}\n")
+        sys.stderr.write(banner)
+        sys.stderr.flush()
+        try:
+            # Best-effort DUPLICATE of what stderr already carried: vLLM's logger is the
+            # only stream forwarded from a spawn worker to the driver, but it is not
+            # importable in every context (CPU unit tests, pre-init). stderr above is the
+            # authoritative copy, so a logger failure loses nothing and must not mask the
+            # degrade itself. This mirrors _ommx_route_evidence's logger handling.
+            from vllm.logger import init_logger
+            init_logger("ommx_gpu_serve").error("%s", banner)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _sentinel_dead_tags() -> dict:
+    """Read the route sentinel(s) back and report which routes died — CROSS-PROCESS.
+
+    WHY THIS EXISTS: vLLM v1 runs the engine (and every TP rank) in its OWN spawned
+    subprocess. ``_DEGRADED`` / ``_FIRE_SEEN`` / the fire counters are therefore PER
+    PROCESS: a bench that imports this module in the DRIVER and asks ommx_route_health()
+    would read the state of a process that never served a token, and get a clean answer
+    from a run that degraded to FlashAttention in the worker. The sentinel FILE is the
+    only channel that crosses that boundary (same reasoning as _ommx_route_evidence's).
+
+    Scans the rank-0 path plus the "<base>.r<rank><ext>" siblings the TP ranks write.
+    ``readable`` is False when nothing exists or a read failed, so the caller can tell
+    "no evidence" apart from "evidence says clean" — an unreadable proof is not proof.
+
+    THE SENTINEL IS APPEND-ONLY AND IS NOT CLEARED BETWEEN RUNS. A stale ``*_DEAD`` line
+    left by an EARLIER run therefore makes this report degraded for a later, healthy one.
+    That bias is deliberately toward refusing to certify: a false "degraded" costs a
+    re-run, a false "clean" gets a FlashAttention number published as OMMX. Give each arm
+    its own ``$OMMX_FIRE_FILE`` (``bench_e2e_a100.py`` already does, per cell) so the
+    evidence describes exactly one run.
+    """
+    base, ext = os.path.splitext(_FIRE_FILE)
+    # rank 0 keeps the base name; ranks 1..7 add the suffix (see _ommx_route_evidence).
+    paths = [_FIRE_FILE] + [f"{base}.r{r}{ext}" for r in range(1, 8)]
+    tags, readable = set(), False
+    for path in paths:
+        if not os.path.exists(path):
+            continue
+        try:
+            with open(path) as fh:
+                for ln in fh:
+                    ln = ln.strip()
+                    if ln:
+                        tags.add(ln.split(" ", 1)[0])
+            readable = True
+        except OSError:
+            # Deliberately NOT swallowed into a clean result: readable stays False for
+            # this path, which the caller must treat as "no proof", not as "healthy".
+            continue
+    return {
+        "readable": readable,
+        "all_tags": sorted(tags),
+        # *_DEAD / *_NOFIRE both mean an OMMX route did not serve a step it was asked to.
+        "dead_tags": sorted(t for t in tags
+                            if t.endswith("_DEAD") or t.endswith("_NOFIRE")),
+    }
+
+
+def ommx_route_health() -> dict:
+    """PUBLIC: did this process actually serve OMMX, or did it degrade to bf16?
+
+    A bench MUST consult this (or read ``fire_file``) before attributing any number to
+    OMMX. With ``OMMX_ALLOW_BF16_FALLBACK=1`` the engine keeps producing fluent output
+    after a route failure — and that output is FlashAttention's. ``degraded is False``
+    together with a non-zero fire count / a ``*_ROUTE_FIRED`` tag is the only
+    combination that makes a measurement attributable to OMMX.
+
+    Keys:
+      degraded             True once any OMMX route failed and the opt-in absorbed it.
+      reason               "<tag>: <ExcType>: <msg>" of the FIRST failure, else None.
+      layer                identity of the layer that failed first, else None.
+      step_hint            the per-step route classification at that moment.
+      allow_bf16_fallback  how this process read OMMX_ALLOW_BF16_FALLBACK (at import).
+      strict_env           how OMMX_STRICT reads NOW (cfg.strict is seeded from it).
+      degraded_in_this_process
+                           the RAW per-process latch, separate from ``degraded`` (which
+                           also goes True on another worker's *_DEAD sentinel tag).
+      sentinel_readable    False when NO sentinel file exists or none could be read.
+                           With this False, ``degraded: False`` means "no evidence",
+                           NEVER "evidence says OMMX served".
+      fires                route-fire counters + the one-time evidence tags recorded.
+                           NOTE: under a FULL cudagraph replay the python counters do
+                           NOT advance (the replay bypasses python), so the tags are
+                           capture-time evidence and a zero counter is not proof of
+                           absence — see the GRAPH_ROUTE_FIRED comment.
+      fire_file            the sentinel path ($OMMX_FIRE_FILE). TP rank > 0 writes
+                           "<base>.r<rank><ext>" instead (see _ommx_route_evidence).
+      ablations            the knobs read in THIS module that change what is measured.
+                           ``abl_skip_write`` is PARITY-BREAKING: True means the decode
+                           read stale KV on purpose and the output is wrong by
+                           construction. ``attn_v_bf16`` is not parity-breaking but it
+                           swaps the V plane from i2 to full bf16, i.e. it is a
+                           DIFFERENT recipe with a different KV footprint, so a
+                           compression number from such a run does not describe the
+                           published recipe. Neither used to appear here at all.
+      unrouted_decode_b    batch sizes (>1) whose uniform decode reached the bf16
+                           fall-through instead of an OMMX route (graph mode, or a
+                           non-uniform step) — non-empty means PARTIAL OMMX coverage
+                           even though ``degraded`` is False. Per process; the cross-
+                           process form is the ``DECODE_BF16_UNROUTED`` sentinel tag.
+      sliding_window_bypass
+                           layers of THIS process that OMMX did not serve because they
+                           are sliding-window (Mistral / Gemma-2 / Ministral style):
+                           ``{"layers": <n>, "windows": [...]}``. n > 0 means this run's
+                           OMMX coverage is PARTIAL — the full-attention layers fired
+                           ``DECODE_ROUTE_FIRED`` while these served bf16 FlashAttention
+                           out of vLLM's paged cache. Per process; the cross-process
+                           form is the ``SW_BYPASS_BF16`` / ``SW_BYPASS_BF16_READ``
+                           sentinel tags (visible in ``fires["sentinel_tags"]``).
+    """
+    sentinel = _sentinel_dead_tags()
+    return {
+        # TRUE if EITHER this process latched a degrade OR any worker's sentinel names a
+        # *_DEAD route. The second term is what makes this key usable from the driver.
+        "degraded": (_DEGRADED["reason"] is not None
+                     or bool(sentinel["dead_tags"])),
+        "reason": _DEGRADED["reason"] or (
+            "sentinel names dead route(s): %s" % (sentinel["dead_tags"],)
+            if sentinel["dead_tags"] else None),
+        # The raw per-process latch, kept separate so a caller can tell "I degraded" from
+        # "some other process degraded and told me via the sentinel".
+        "degraded_in_this_process": _DEGRADED["reason"] is not None,
+        "layer": _DEGRADED["layer"],
+        "step_hint": _DEGRADED["step_hint"],
+        "allow_bf16_fallback": bool(_ALLOW_BF16_FALLBACK),
+        "strict_env": _env_on("OMMX_STRICT"),
+        "fires": {
+            "batched_decode": int(_BATCHED_FIRES[0]),
+            "packed_prefill": int(_PACKED_PREFILL_FIRES[0]),
+            "evidence_tags": sorted(_FIRE_SEEN),
+            # tags read back OUT of the sentinel files (cross-process; empty in a worker
+            # that has not written yet, populated in the driver after the run).
+            "sentinel_tags": sentinel["all_tags"],
+        },
+        # False when NO sentinel file exists or one could not be read. An UNREADABLE
+        # sentinel is NOT a clean bill of health: with this False, "degraded": False only
+        # means "no evidence", never "evidence says OMMX served". A bench must require
+        # sentinel_readable AND not degraded AND a *_ROUTE_FIRED tag.
+        "sentinel_readable": sentinel["readable"],
+        "fire_file": _FIRE_FILE,
+        # Knobs that change WHAT WAS MEASURED, reported next to the route verdict so a
+        # bench cannot read "not degraded" as "quotable". abl_skip_write=True means the
+        # output is wrong on purpose; attn_v_bf16=True means the KV footprint is not the
+        # published recipe's.
+        "ablations": {
+            "abl_skip_write": bool(_ABL_SKIP_WRITE),
+            "attn_v_bf16": bool(_V_BF16),
+        },
+        # B>1 uniform decodes this process answered with bf16 FlashAttention because no
+        # OMMX route accepted them (see _decode_unrouted_evidence). Non-empty = PARTIAL
+        # coverage, which "degraded": False alone does not say.
+        "unrouted_decode_b": sorted(_UNROUTED_DECODE_B),
+        "sliding_window_bypass": {
+            "layers": len(_SW_BYPASS_LAYERS),
+            "windows": sorted({str(w) for w in _SW_BYPASS_LAYERS.values()}),
+        },
+    }
 
 
 _VARLEN_FN = [None]
@@ -234,6 +812,13 @@ def _flash_varlen_fn():
 # Under CUDA graph the store is allocated ONCE at this size and reset IN PLACE, so
 # the captured tensor addresses stay valid across sequences.
 _MAX_MODEL_LEN = None
+
+# Per-worker preflight latch (preflight.py). The metadata builder is constructed ONCE
+# PER LAYER, so the unsupported-configuration guards (prefix caching / chunked prefill /
+# pool-vs-free-memory) run on the FIRST one and are latched here. A failure is kept and
+# RE-RAISED for every later builder — a guard that runs once and is then skipped is the
+# silent fallback law #5 forbids.
+_PREFLIGHT = {"done": False, "error": None, "report": None}
 
 # One step manager per worker (graph path), lazily created with model geometry.
 _MANAGER = None
@@ -296,9 +881,92 @@ def _manager(cfg, device):
 def _bmanager(cfg, device):
     global _BMANAGER
     if _BMANAGER is None:
-        _BMANAGER = OMMXBatchedStepManager(cfg, device, num_seqs=_MAX_NUM_SEQS,
+        _BMANAGER = OMMXBatchedStepManager(cfg, device,
+                                           num_seqs=_resolved_max_num_seqs(),
                                            graph=_BATCHED_GRAPH)
     return _BMANAGER
+
+
+def _hf_geometry(vllm_config) -> dict:
+    """PER-TP-RANK KV geometry + layer count from vLLM's HF config (defensive).
+
+    The metadata builder has no head counts of its own (only the Impl sees them, at
+    forward time — see ``_ommx_cfg``), so the preflight reads them from
+    ``model_config.hf_config``, the same source vLLM seeds the Impl from, and shards
+    them the way vLLM does: KV heads are REPLICATED when ``n_kv_heads < TP``, hence
+    ``max(1, ·//tp)``. This keeps the projected pool geometry equal to the per-rank
+    geometry the pool is actually built with. A value that is absent stays ``None`` —
+    the preflight then reports it as 'unknown' and raises instead of guessing (law #5).
+    """
+    mc = getattr(vllm_config, "model_config", None)
+    hf = getattr(mc, "hf_config", None)
+    txt = getattr(hf, "text_config", None)   # multimodal wrappers nest the LM config
+
+    def pick(*names):
+        for src in (hf, txt):
+            if src is None:
+                continue
+            for n in names:
+                v = getattr(src, n, None)
+                if isinstance(v, (int, float)) and not isinstance(v, bool):
+                    return int(v)
+        return None
+
+    tp = getattr(getattr(vllm_config, "parallel_config", None),
+                 "tensor_parallel_size", None)
+    tp = int(tp) if tp else 1
+    nq = pick("num_attention_heads")
+    nkv = pick("num_key_value_heads", "num_attention_heads")
+    hd = pick("head_dim")
+    if hd is None:
+        hidden = pick("hidden_size")
+        if hidden is not None and nq:
+            hd = hidden // nq
+    return {
+        "head_dim": hd,
+        "n_q_heads": (max(1, nq // tp) if nq else None),
+        "n_kv_heads": (max(1, nkv // tp) if nkv else None),
+        "num_layers": pick("num_hidden_layers", "n_layer", "num_layers"),
+        "tensor_parallel_size": tp,
+    }
+
+
+def _preflight_once(vllm_config) -> None:
+    """Run ``ommx_preflight_check`` EXACTLY ONCE per worker process; never swallow it."""
+    if _PREFLIGHT["error"] is not None:
+        raise _PREFLIGHT["error"]
+    if _PREFLIGHT["done"]:
+        return
+    geom = _hf_geometry(vllm_config)
+    # cfg carries the RECIPE knobs the pool is built from (group sizes, outlier count /
+    # repr, sink+recent window) plus the geometry above.
+    #   PLUMBING GAP (metadata.py): OMMXBatchedStepManager.pool() does NOT forward
+    #   kv_int8_scale= (nor kv_ring, which has no config field at all), so the POOL
+    #   resolves OMMX_KV_INT8_SCALE / OMMX_KV_RING from the env itself. kv_outlier_map
+    #   IS forwarded as cfg.kv_outlier_map, but config._env_bool resolves it exactly the
+    #   way preflight reads OMMX_KV_OUTLIER_MAP, so the projection matches either way.
+    #   preflight.py deliberately reads those ENVS so the projected bytes equal what
+    #   actually gets allocated rather than what the config merely declares.
+    cfg = resolve_serving_config(
+        head_dim=geom["head_dim"], n_q_heads=geom["n_q_heads"],
+        n_kv_heads=geom["n_kv_heads"], max_context=_MAX_MODEL_LEN)
+    # preflight.py is the CONSUMER of num_seqs: it projects the pool as
+    # O(num_seqs * max_model_len) bytes per layer and refuses the config when the
+    # projection exceeds OMMX_POOL_BUDGET_FRAC of free memory. Passing the RESOLVED cap
+    # (engine-aware, see _resolved_max_num_seqs) makes the projection the one that will
+    # really be allocated: at --max-num-seqs 1..8 it drops 32-256x versus the old
+    # hard-coded 256, so an honest low-concurrency config (e.g. --max-model-len 131072
+    # with a single request in flight) passes on its merits instead of needing an
+    # OMMX_UNSAFE_ALLOW_POOL_OVERSUBSCRIBE waiver.
+    try:
+        _PREFLIGHT["report"] = ommx_preflight_check(
+            vllm_config, num_seqs=_resolved_max_num_seqs(), cfg=cfg,
+            num_layers=geom["num_layers"], device=None)
+    except RuntimeError as exc:
+        # remembered so the NEXT layer's builder re-raises instead of running unguarded
+        _PREFLIGHT["error"] = exc
+        raise
+    _PREFLIGHT["done"] = True
 
 
 class OMMXCanonicalMetadataBuilder(FlashAttentionMetadataBuilder):
@@ -317,7 +985,7 @@ class OMMXCanonicalMetadataBuilder(FlashAttentionMetadataBuilder):
         # 4096 default — see _MAX_MODEL_LEN above. Robust to attribute-name /
         # positional variations: try self.vllm_config, the passed args/kwargs, then
         # the process-global current config.
-        global _MAX_MODEL_LEN
+        global _MAX_MODEL_LEN, _ENGINE_MAX_NUM_SEQS
         cfgs = [getattr(self, "vllm_config", None), kwargs.get("vllm_config")]
         cfgs += list(args)
         try:
@@ -325,14 +993,41 @@ class OMMXCanonicalMetadataBuilder(FlashAttentionMetadataBuilder):
             cfgs.append(get_current_vllm_config())
         except Exception:
             pass
+        chosen = None     # the vllm_config the sizing (and the preflight) came from
+        fallback = None   # first candidate that at least exposes a model_config
         for vc in cfgs:
+            if fallback is None and getattr(vc, "model_config", None) is not None:
+                fallback = vc
             try:
                 mml = int(vc.model_config.max_model_len)
                 if mml > 0:
                     _MAX_MODEL_LEN = mml
+                    chosen = vc
                     break
             except Exception:
                 continue
+        # Engine concurrency ceiling -> the MIDDLE term of the pool slot cap resolution
+        # (see _resolved_max_num_seqs). Read from the SAME candidate list as
+        # max_model_len, and BEFORE _preflight_once below, so the preflight projects the
+        # pool at the cap that will really be allocated instead of at a hard-coded 256.
+        # Unreadable (older/oddly-shaped config) leaves it None -> env/default as before.
+        for vc in cfgs:
+            try:
+                mns = int(vc.scheduler_config.max_num_seqs)
+            except Exception:
+                continue
+            if mns > 0:
+                _ENGINE_MAX_NUM_SEQS = mns
+                break
+        # ── PREFLIGHT (once per worker, BEFORE any forward / cudagraph capture) ────
+        # Earliest point holding the whole vllm_config, so it is where the unsupported-
+        # configuration guards live: prefix caching (shared first physical block ->
+        # shared pool slot -> cross-request KV corruption), chunked prefill (the n>1
+        # write is reset+append_block, so a continuation chunk wipes the sequence), and
+        # the O(num_seqs * max_model_len) non-paged pool footprint vs free memory.
+        # RuntimeError is deliberately NOT caught: an engine that would mis-serve or OOM
+        # must fail at startup, not thousands of tokens into a run.
+        _preflight_once(chosen if chosen is not None else fallback)
 
     @classmethod
     def get_cudagraph_support(cls, vllm_config, kv_cache_spec) -> AttentionCGSupport:
@@ -377,6 +1072,17 @@ class OMMXCanonicalMetadataBuilder(FlashAttentionMetadataBuilder):
         _LAST_COMMON_MD = common_attn_metadata
         B, uniform = detect_step_route(common_attn_metadata)
         _STEP["B"] = int(B)
+        if B == STEP_ROUTE_UNCLASSIFIED:
+            # NOT a request count — the metadata carried no readable seq_lens. Recorded
+            # once per rank so the operator learns it here (at the seam that failed)
+            # rather than only from whichever route refuses the step later. Informational
+            # tag: on its own it is not proof that a step was mis-served, and the routes
+            # that would have had to GUESS B now refuse instead (do_kv_cache_update's
+            # unclassified guard and forward's decode consumer).
+            _ommx_route_evidence(
+                "STEP_ROUTE_UNCLASSIFIED",
+                "CommonAttentionMetadata exposed no readable seq_lens; B is unknown "
+                "(NOT 1). Check the vLLM version against the validated 0.21.")
         # PACKED-ONLY prefill gate (HOST seam): forward has no host q_len/seq_len,
         # so classify "every request prefills its WHOLE sequence" here.
         _STEP["full_prefill"] = (detect_full_prefill(common_attn_metadata)
@@ -580,7 +1286,7 @@ class OMMXCanonicalImpl(FlashAttentionImpl):
             return ws
         H, D = self.num_heads, self.head_size
         cfg = self._ommx_cfg()
-        cap = max(B, int(_MAX_NUM_SEQS))
+        cap = max(B, _resolved_max_num_seqs())
         max_seq = max(1, int(cfg.max_context))
         nsplits = max(1, int(_auto_num_kv_splits(max_seq, cap, device=dev,
                                                  kv_heads=self.num_kv_heads)))
@@ -654,11 +1360,14 @@ class OMMXCanonicalImpl(FlashAttentionImpl):
             _BATCHED_FIRES[0] += 1
             _ommx_route_evidence("BATCHED_ROUTE_FIRED", f"B={B} fmt={pl['k_format']}")
             return True
-        except Exception:
-            if cfg.strict:
-                raise
-            setattr(layer, "_ommx_dead", True)
+        except Exception as e:  # noqa: BLE001
+            # FATAL by default (law #5): _ommx_route_failed records the evidence and then
+            # re-raises unless OMMX_ALLOW_BF16_FALLBACK is set (cfg.strict still forces
+            # the raise). Returning False here means the opt-in was taken, and the caller
+            # then hands a B>1 step to bf16 super() — a DEGRADED, non-OMMX result.
             mgr.dead = True
+            _ommx_route_failed("BATCHED_ROUTE_DEAD", e, cfg=cfg, layer=layer,
+                               step_hint=f"B={_STEP.get('B')} batched uniform-decode read")
             return False
 
     def _route_decode_batched_graph(self, layer, query, output) -> bool:
@@ -724,11 +1433,11 @@ class OMMXCanonicalImpl(FlashAttentionImpl):
             _ommx_route_evidence("BATCHED_GRAPH_ROUTE_FIRED",
                                  f"B={B} fmt={pl['k_format']}")
             return True
-        except Exception:
-            if cfg.strict:
-                raise
-            setattr(layer, "_ommx_dead", True)
+        except Exception as e:  # noqa: BLE001
+            # FATAL by default (law #5) — same policy as the eager batched route above.
             mgr.dead = True
+            _ommx_route_failed("BATCHED_GRAPH_ROUTE_DEAD", e, cfg=cfg, layer=layer,
+                               step_hint=f"B={_STEP.get('B')} batched-graph decode read")
             return False
 
     # ── write path: keep the bf16 cache (super) + append to the OMMX sidecar ────
@@ -744,8 +1453,17 @@ class OMMXCanonicalImpl(FlashAttentionImpl):
         # (never read). Return right after the base write. Full-attention layers keep the
         # packed behavior below. For Llama (no sliding_window) _sw is always False -> no
         # behavior change.
+        #   IT IS TAGGED (law #5). The bypass is correct, but it makes OMMX's coverage of
+        #   a mixed SWA/full model PARTIAL, and the sentinel used to say nothing about it:
+        #   the full-attention layers wrote DECODE_ROUTE_FIRED and the sliding-window
+        #   layers wrote nothing, so a half-OMMX run and a fully-OMMX run left IDENTICAL
+        #   evidence. SW_BYPASS_BF16 (write) + SW_BYPASS_BF16_READ (forward) are what make
+        #   them distinguishable; both are informational, never *_DEAD (see
+        #   _sw_bypass_evidence).
         if getattr(self, "sliding_window", (-1, -1)) != (-1, -1):
             super().do_kv_cache_update(layer, key, value, kv_cache, slot_mapping)
+            _sw_bypass_evidence("SW_BYPASS_BF16", self,
+                                "write: bf16 paged cache only, NO OMMX sidecar")
             return
         # PACKED-ONLY: the paged cache is SHRUNK (spec head_size reduced to reserve
         # the OMMX byte budget), so a headdim-D reshape_and_cache_flash into it
@@ -760,11 +1478,38 @@ class OMMXCanonicalImpl(FlashAttentionImpl):
             n = int(key.shape[0])
             cfg = self._ommx_cfg()
             max_ctx = cfg.max_context
+            # UNCLASSIFIED STEP (law #5). build() could not read this step's per-request
+            # seq_lens, so B is UNKNOWN (metadata.STEP_ROUTE_UNCLASSIFIED), not 1. Inside
+            # a batched session the write is per-request and never consults B, so it is
+            # unaffected; OUTSIDE one, the branches below pick PREFILL-vs-DECODE from
+            # ``n`` alone, and a B>1 decode batch arrives as n == B rows — which the n>1
+            # branch would take for a prefill and answer with reset + append_block,
+            # wiping the sequence. Refuse rather than guess: this raise is caught by the
+            # KV_UPDATE_DEAD handler at the bottom, which records the evidence first and
+            # then applies the module's failure policy (fatal by default).
+            if (int(_STEP.get("B", 0)) == STEP_ROUTE_UNCLASSIFIED
+                    and not _STEP["batched_write"]):
+                raise RuntimeError(
+                    "[ommx] cannot classify this step: CommonAttentionMetadata exposed "
+                    "no readable per-request seq_lens, so the number of requests is "
+                    f"unknown (n={n} rows in this write). The single-sequence write "
+                    "path decides PREFILL vs DECODE from the row count alone, which is "
+                    "only sound when B is known to be 1. Refusing to write rather than "
+                    "risk resetting a live sequence. This normally means the installed "
+                    "vLLM renamed or reshaped seq_lens/seq_lens_cpu — check the vLLM "
+                    "version against the validated 0.21 and update "
+                    "metadata.detect_step_route's field list.")
             # ABLATION (timing-only, PARITY-BREAKING): skip the per-step new-token KV
             # pack+regroup/write on a DECODE step so the kernel reads STALE KV (wrong
             # output). (full_step) - (SKIP_WRITE_step) = the per-step KV pack/write cost.
             # Prefill (n>1) is KEPT (else the cache is empty). Default OFF.
+            # ANNOUNCED, not silent: the first skip writes the ABL_SKIP_WRITE_ACTIVE tag
+            # to the sentinel and a one-time banner to stderr + the vLLM log, so a run
+            # whose output is wrong on purpose cannot be mistaken for a clean one after
+            # the fact. The announcement is placed HERE (at the first real skip) rather
+            # than at import, so it fires only when the knob actually changed a step.
             if _ABL_SKIP_WRITE and n == 1:
+                _announce_parity_breaking_ablations()
                 return
             # B-AWARE WRITE: in a batched session, EVERY write (prefill block + decode
             # row, single or multi request) feeds the shared pool — the batched decode
@@ -817,18 +1562,44 @@ class OMMXCanonicalImpl(FlashAttentionImpl):
                 st.append(key[0], value[0])
                 st.maybe_regroup()
         except Exception as e:  # noqa: BLE001
-            if self._ommx_cfg().strict:
-                raise
-            # write-path pre-latch is the ONLY path that latches _ommx_dead WITHOUT a
-            # forward-side sentinel (forward's gate short-circuits once dead) -> an empty
-            # /tmp/ommx_route_fired.log. Record it so a silent fallback names its cause.
-            _ommx_route_evidence("KV_UPDATE_DEAD", f"{type(e).__name__}: {e}")
-            setattr(layer, "_ommx_dead", True)
+            # THE MEASURED SILENT-bf16 PATH. This write-path pre-latch is the only one
+            # that latches _ommx_dead WITHOUT a forward-side sentinel (forward's gate
+            # short-circuits once dead), and it is what fired under vLLM 0.21's DEFAULTS:
+            # "ring append_block expects a fresh request slot" (chunked prefill) and
+            # "CUDA out of memory ... 514.00 MiB" (the 256-slot pool) both landed here,
+            # after which the engine served bf16 FlashAttention and produced output
+            # byte-identical to the bf16 reference. So it is FATAL by default now:
+            # _ommx_route_failed appends KV_UPDATE_DEAD to the sentinel FIRST (a fallback
+            # must always name its cause), then re-raises unless OMMX_ALLOW_BF16_FALLBACK
+            # is set; cfg.strict raises regardless. cfg is read from the CACHED attribute
+            # rather than self._ommx_cfg() so a cfg-construction failure cannot mask the
+            # original exception (missing cache -> not strict -> the default raise).
+            _ommx_route_failed("KV_UPDATE_DEAD", e,
+                               cfg=getattr(self, "_ommx_serving_cfg", None),
+                               layer=layer,
+                               step_hint=(f"n={int(key.shape[0])} B={_STEP.get('B')} "
+                                          f"batched_write={_STEP.get('batched_write')}"))
 
     # ── read path: route uniform single-token decode through the canonical op ───
 
     def forward(self, layer, query, key, value, kv_cache, attn_metadata,
                 output, output_scale=None, output_block_scale=None):
+        # SLIDING-WINDOW layers: bf16 FlashAttention out of vLLM's paged cache, tagged.
+        # BEHAVIOR-IDENTICAL to the fall-through it replaces — all three gates below
+        # already require sliding_window == (-1, -1) (the packed prefill seam, the decode
+        # route, and the PACKED no-fallback raise), so such a layer could only ever reach
+        # the final super().forward(). Stating the carve-out ONCE and up front (those
+        # three keep their own conditions) is what gives the READ path the evidence it
+        # had none of: paired with SW_BYPASS_BF16 on the write, the sentinel now
+        # distinguishes a fully-OMMX-routed model from one where OMMX served only the
+        # full-attention layers. See _sw_bypass_evidence for why it is informational
+        # rather than a *_DEAD failure tag.
+        if getattr(self, "sliding_window", (-1, -1)) != (-1, -1):
+            _sw_bypass_evidence("SW_BYPASS_BF16_READ", self,
+                                "read: bf16 FlashAttention over the vLLM paged cache")
+            return super().forward(layer, query, key, value, kv_cache, attn_metadata,
+                                   output, output_scale=output_scale,
+                                   output_block_scale=output_block_scale)
         if (_PACKED_ONLY and attn_metadata is not None
                 and output_scale is None and output_block_scale is None
                 and int(getattr(attn_metadata, "max_query_len", 0)) > 1
@@ -855,6 +1626,7 @@ class OMMXCanonicalImpl(FlashAttentionImpl):
             #     requests 1..B-1, the bug being fixed).
             #   * single-batch (B==1, never batched) -> _route_decode (the cudagraph fast
             #     path), behavior IDENTICAL to before.
+            #   * UNCLASSIFIED (B == STEP_ROUTE_UNCLASSIFIED) -> refuse; see below.
             B = int(_STEP.get("B", 0))
             if _STEP["batched_read"]:
                 m = _BMANAGER
@@ -877,6 +1649,32 @@ class OMMXCanonicalImpl(FlashAttentionImpl):
                 _ommx_route_evidence("BATCHED_ROUTE_NOFIRE", reason)
                 # B>1: do NOT fall through to the single-batch _route_decode (it would
                 # slice [:1] and corrupt requests 1..B-1). bf16 super() is the safe path.
+            elif B == STEP_ROUTE_UNCLASSIFIED:
+                # REFUSE — do not guess (law #5). ``B`` is not "small", it is UNKNOWN:
+                # build() found no readable per-request seq_lens. This branch used to be
+                # ``elif B <= 1``, which swallowed the sentinel, because an unclassified
+                # step and a genuine single request both arrived as 0. A real B=4 decode
+                # that failed classification then took the single-batch route, whose
+                # ``query.view(-1,H,D)[:1]`` / ``output...[:1].copy_()`` compute row 0
+                # and leave rows 1..B-1 UNWRITTEN — and it recorded DECODE_ROUTE_FIRED
+                # while doing it, so the bench called the run an OMMX measurement.
+                # (A genuine B==0 vLLM init/profiling dummy is NOT this case: it still
+                # reports B == 0 and still takes the single-batch branch below, where a
+                # missing store simply declines. Nothing about init changes here.)
+                _ommx_route_failed(
+                    "DECODE_ROUTE_UNCLASSIFIED_DEAD",
+                    RuntimeError(
+                        "[ommx] refusing to route an UNCLASSIFIED uniform decode step: "
+                        "CommonAttentionMetadata exposed no readable per-request "
+                        "seq_lens, so the batch size is unknown. The single-batch route "
+                        "would slice [:1] and answer only request 0, leaving any other "
+                        "request in this step unwritten while the sentinel reported a "
+                        "clean OMMX decode. Check the vLLM version against the "
+                        "validated 0.21 and update metadata.detect_step_route's field "
+                        "list; OMMX_ALLOW_BF16_FALLBACK=1 degrades this step to bf16 "
+                        "FlashAttention instead (and marks the run non-quotable)."),
+                    cfg=getattr(self, "_ommx_serving_cfg", None), layer=layer,
+                    step_hint="B=UNCLASSIFIED uniform-decode read")
             elif B <= 1:
                 if self._route_decode(layer, query, output):
                     return output
@@ -888,6 +1686,28 @@ class OMMXCanonicalImpl(FlashAttentionImpl):
                     "store=None" if getattr(layer, "_ommx_store", None) is None
                     else "dead" if getattr(layer, "_ommx_dead", False)
                     else "route_false")
+            else:
+                # B > 1 but the step was NOT classified as a batched read: bf16
+                # FlashAttention serves it (the fall-through at the bottom), correctly
+                # but NOT as OMMX. Two ways to get here, both real:
+                #   * OMMX_ATTN_GRAPH=1 -> build() never latches _BATCHED_SESSION (that
+                #     line is gated on ``not _GRAPH``), so no B>1 step ever becomes a
+                #     batched read;
+                #   * ``uniform`` False while ``max_query_len == 1`` (a request
+                #     contributing zero query tokens) -> batched_read False for a step
+                #     the single-batch route must not touch either.
+                # Neither could reach _route_decode (its [:1] slice would answer only
+                # request 0), so the bf16 fall-through is the CORRECT answer — but until
+                # this tag it was also a SILENT one: the B==1 steps of the same run had
+                # already written DECODE_ROUTE_FIRED / GRAPH_ROUTE_FIRED, so a run whose
+                # multi-request steps were all served by FlashAttention was indis-
+                # tinguishable from a fully OMMX-routed one.
+                # INFORMATIONAL, not *_NOFIRE (see _ommx_route_evidence's suffix
+                # contract): in graph mode vLLM's own cudagraph CAPTURE drives dummy
+                # uniform decodes at every capture size, i.e. at B>1, so a failure
+                # suffix here would mark every graph-mode run ok=False for steps that
+                # served no request at all. It reports coverage, like SW_BYPASS_BF16.
+                _decode_unrouted_evidence(B, graph=_GRAPH)
         if (_PACKED_ONLY and attn_metadata is not None
                 and getattr(self, "sliding_window", (-1, -1)) == (-1, -1)
                 and str(getattr(self, "attn_type", "decoder")) in
@@ -1048,10 +1868,12 @@ class OMMXCanonicalImpl(FlashAttentionImpl):
             _ommx_route_evidence("DECODE_ROUTE_FIRED",
                                  f"fmt={pl['k_format']}")
             return True
-        except Exception:
-            if self._ommx_cfg().strict:
-                raise
-            setattr(layer, "_ommx_dead", True)
+        except Exception as e:  # noqa: BLE001
+            # FATAL by default (law #5). B==1 is the arm the repo's own repro publishes,
+            # so a silent degrade here is the single most misleading failure available.
+            _ommx_route_failed("DECODE_ROUTE_DEAD", e,
+                               cfg=getattr(self, "_ommx_serving_cfg", None),
+                               layer=layer, step_hint="B=1 single-batch decode read")
             return False
 
     def _route_decode_graph(self, layer, query, output, st, mgr) -> bool:
@@ -1101,11 +1923,16 @@ class OMMXCanonicalImpl(FlashAttentionImpl):
             _ommx_route_evidence("GRAPH_ROUTE_FIRED",
                                  f"fmt={pl['k_format']} ctx={mgr.cur_seq}")
             return True
-        except Exception:
-            if self._ommx_cfg().strict:
-                raise
-            setattr(layer, "_ommx_dead", True)
+        except Exception as e:  # noqa: BLE001
+            # FATAL by default (law #5). A capture-time failure here is especially worth
+            # dying on: the captured graph would then hold the bf16 op for the rest of
+            # the run, and the replay bypasses python so nothing would report it again.
             mgr.dead = True
+            _ommx_route_failed("GRAPH_ROUTE_DEAD", e,
+                               cfg=getattr(self, "_ommx_serving_cfg", None),
+                               layer=layer,
+                               step_hint=("B=1 graph decode read ctx="
+                                          f"{getattr(mgr, 'cur_seq', None)}"))
             return False
 
 
@@ -1127,9 +1954,23 @@ class OMMXCanonicalBackend(FlashAttentionBackend):
     # get_kv_cache_shape / get_supported_kernel_block_sizes inherit the bf16
     # FlashAttention layout. SHADOW keeps the full bf16 head_size; PACKED-ONLY
     # (OMMX_KV_PACKED_ONLY=1, packed_only.py) shrinks the SPEC head_size so the
-    # inherited get_kv_cache_shape allocates a ~4.6x-smaller paged cache + vLLM
-    # budgets ~4.6x more KV blocks (the capacity win) — no shape-method override
-    # needed (head_size flows from the spec into get_kv_cache_shape).
+    # inherited get_kv_cache_shape allocates a SMALLER paged cache and vLLM budgets
+    # proportionally more KV blocks — no shape-method override needed (head_size
+    # flows from the spec into get_kv_cache_shape).
+    #   THE RATIO — RETRACTED AND RE-MEASURED. This comment used to say "~4.6x". The
+    #   canonical PUBLISHED recipe measures 4.375 bit/elem (K+V = 8.750 bit per K/V
+    #   element pair) = 32/8.75 = 3.66x versus bf16, obtained by summing the REAL
+    #   allocated MultiSeqKVPool tensors for Llama-3.1-8B rather than by evaluating a
+    #   formula. It is also NOT "≤3-bit": 2.938 bit/elem (5.45x) needs group_tokens=64
+    #   + group_channels=64 + OMMX_KV_OUTLIER_MAP=0 — a DIFFERENT number system from
+    #   the one the accuracy results used, so the two figures must not be quoted
+    #   together. Full table in the module docstring.
+    #   AND THE SHRUNK CACHE IS A RESERVATION: no token is ever stored in it, so vLLM's
+    #   "GPU KV cache size: <N> tokens" / "Maximum concurrency <Y>x" log lines simply
+    #   restate the byte budget this shrink reserved. They are NOT a validated OMMX
+    #   capacity result. The store that really holds the KV is the non-paged sidecar
+    #   pool, sized O(num_seqs * max_model_len) (see _resolved_max_num_seqs and the
+    #   projection in preflight.py).
 
 
 __all__ = [
@@ -1137,4 +1978,7 @@ __all__ = [
     "OMMXCanonicalImpl",
     "OMMXCanonicalMetadataBuilder",
     "OMMX_BACKEND_CLASS_PATH",
+    # the public "was this really OMMX?" probe — a bench asserts on it before it is
+    # allowed to attribute a number to OMMX (see the FAILURE POLICY docstring).
+    "ommx_route_health",
 ]

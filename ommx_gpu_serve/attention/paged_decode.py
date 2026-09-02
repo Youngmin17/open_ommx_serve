@@ -154,11 +154,81 @@ def _require_triton() -> None:
 # Host-side dispatch helpers (pure Python ints; safe before triton import).
 # ---------------------------------------------------------------------------
 
-def _env_int(name: str, default: int) -> int:
+def _env_int(name: str, default: int, *, allow_zero: bool = False) -> int:
+    """Read an integer tuning knob. Out-of-range values RAISE (no silent clamp).
+
+    CONTRACT — the same for every caller in this module, which is the point of the
+    helper being shared:
+
+      * unset / blank    -> ``default``.
+      * malformed        -> ``ValueError`` naming the variable and a fix. NOT a behaviour
+                            change: the old body ended in ``max(1, int(raw))`` and
+                            ``int("auto")`` already raised, so only the message is new.
+                            It is also the package law — ``integration/vllm/config.py``,
+                            ``packed_only.py`` and ``backend.py`` all raise on a malformed
+                            integer knob rather than substituting the default.
+      * negative         -> ``ValueError``. Used to be silently rewritten to 1
+                            (``OMMX_ATTN_BLOCK_H=-4`` -> 1).
+      * ``"0"``          -> per-knob, table below. Used to be silently rewritten to 1 for
+                            EVERY knob. That is the law-#11 trap: a knob whose 0 means
+                            something became 1, so the operator got the opposite of what
+                            was typed with nothing in the output to say so.
+
+    The old clamp is restored for NO knob, but 0 is refused only where it is genuinely
+    not a value; where 0 is meaningful it is now passed through (``allow_zero=True``)
+    instead of being rewritten, so no previously working setting starts failing:
+
+      ``OMMX_ATTN_OUTLIER_WARPS``    0 ACCEPTED. 0 is the DOCUMENTED default and means
+                                     "use the ctx/batch ladder", not "1 warp". Under the
+                                     clamp, typing the documented default pinned
+                                     ``num_warps=1`` and produced a wrong MEASUREMENT.
+      ``OMMX_OVERSPLIT_BATCH``       0 ACCEPTED. These two are THRESHOLDS, not launch
+      ``OMMX_OVERSPLIT_CTX``         geometries: 0 means "no threshold". Every real launch
+                                     has batch >= 1 and seq >= 1, so 0 and 1 select the
+                                     same set — the clamp was never WRONG here, hence
+                                     refusing 0 would only break a working config for no
+                                     correctness gain. Negative is still refused (a
+                                     negative threshold is a typo, not an intent).
+      ``OMMX_ATTN_NUM_KV_SPLITS``    0 REFUSED. Launch geometry: 0 splits is not a grid.
+      ``OMMX_V4_NUM_STAGES``         What the clamp actually did, MEASURED by executing
+      ``OMMX_V4_NUM_WARPS``          the released body (git 700ec09) in isolation:
+      ``OMMX_ATTN_BLOCK_H``          ``OMMX_ATTN_NUM_KV_SPLITS=0`` -> ``_auto_num_kv_
+      ``OMMX_MERGE_WIDE_BLOCK_DV``   splits(32768, 1) == 1``, i.e. a ONE-split launch,
+      ``OMMX_MERGE_WIDE_NUM_WARPS``  and ``=-4`` likewise 1. (An earlier draft of this
+                                     docstring said "silently became a 16-split launch",
+                                     citing ``max(16, min(128, 1)) = 16``. That is wrong
+                                     twice: the ladder's own floor on the long-ctx B<=1
+                                     branch is ``_env_kv_splits(16, maximum=128)``, whose
+                                     `minimum` is 1, and the ladder is unreachable anyway
+                                     whenever the variable is SET, because the override
+                                     in ``_auto_num_kv_splits`` returns first.) The point
+                                     stands on 1 vs 0: the operator typed one geometry
+                                     and silently got another. A crash they can read
+                                     beats a tuned point nobody asked for.
+
+    ``OMMX_ATTN_NUM_KV_SPLITS`` is read at two places — ``_env_kv_splits`` (the ladder)
+    and the explicit override in ``_auto_num_kv_splits`` — and BOTH now come through
+    here, so one spelling of one variable cannot mean two different things.
+    """
     raw = os.environ.get(name)
     if raw is None or str(raw).strip() == "":
         return int(default)
-    return max(1, int(raw))
+    txt = str(raw).strip()
+    try:
+        val = int(txt)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"{name}={raw!r} is not an integer. Fix: unset {name} or set an integer, "
+            f"e.g. {name}={default}.") from exc
+    floor = 0 if allow_zero else 1
+    if val < floor:
+        raise ValueError(
+            f"{name}={raw!r} is below the minimum {floor} for this knob"
+            + (" (0 IS meaningful for this knob; a negative value is not)."
+               if allow_zero
+               else "; it selects a launch geometry, so 0/negative is not a value.")
+            + f" Fix: unset {name} or set an integer >= {floor}.")
+    return val
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -308,7 +378,15 @@ def _auto_num_kv_splits(
     batch_size = int(batch_size)
     env_override = os.environ.get("OMMX_ATTN_NUM_KV_SPLITS")
     if env_override is not None and str(env_override).strip():
-        return max(1, int(env_override))
+        # Route through _env_int. This override reads the SAME variable the ladder reads
+        # via _env_kv_splits, but it kept its own `max(1, int(...))` copy of the clamp, so
+        # OMMX_ATTN_NUM_KV_SPLITS=0 used to raise on one path and silently become 1 on
+        # this one — and this one WINS whenever the variable is set, i.e. the strict read
+        # was unreachable for the knob's primary entry point. The default handed over is
+        # the static ladder value purely so the error message can name a sane replacement;
+        # it is never returned, because this branch runs only when the variable is set.
+        return _env_int("OMMX_ATTN_NUM_KV_SPLITS",
+                        _auto_num_kv_splits_static(seq_len, batch_size))
     static = _auto_num_kv_splits_static(seq_len, batch_size)
     if not _env_bool("OMMX_ATTN_SPLITS_OCCUPANCY", True):
         return static
@@ -328,8 +406,13 @@ def _auto_num_kv_splits(
     # ~ceil(1.5*SM/(B*H_kv)). Gated at B>=8 (was 16) / ctx>=1024 (was 16384) so the
     # B=8 4K/16K cells get the down-merge; keep the B<=1 long-ctx high-split branch
     # (the OMMX single-stream win) untouched. Env-tunable for A/B.
-    _OVER_SPLIT_MERGE_BATCH = _env_int("OMMX_OVERSPLIT_BATCH", 8)
-    _OVER_SPLIT_MERGE_CTX = _env_int("OMMX_OVERSPLIT_CTX", 1024)
+    # allow_zero: these are THRESHOLDS compared with `>=`, not launch geometries, so 0
+    # means "no threshold" and is a legitimate setting. batch/seq are >= 1 on every real
+    # launch, which makes 0 and 1 select the same set — the pre-existing max(1, ...) clamp
+    # was never wrong here, so refusing 0 would break a working A/B config for no
+    # correctness gain. Negative still raises (see _env_int).
+    _OVER_SPLIT_MERGE_BATCH = _env_int("OMMX_OVERSPLIT_BATCH", 8, allow_zero=True)
+    _OVER_SPLIT_MERGE_CTX = _env_int("OMMX_OVERSPLIT_CTX", 1024, allow_zero=True)
     if occ > static and batch_size <= 1 and seq_len >= 1024:
         return max(lo, min(hi, occ))
     if occ > static and batch_size >= 4 and seq_len >= 1024:
@@ -727,12 +810,88 @@ def _build_kernels(triton, tl):
         return sel_code, is_outlier
 
     @triton.jit
+    def _bitmap_splice_from_bytes(
+        sel_code, is_outlier, tok_local, in_block, row_mask,
+        bmp_bytes, vword,
+        OUTLIER_K: tl.constexpr, OUTLIER_FP8: tl.constexpr,
+        VL: tl.constexpr, FBB: tl.constexpr, FBB_P2: tl.constexpr,
+    ):
+        # STORED-BITMAP twin of ``_bitmap_splice_from_word``. IDENTICAL decode
+        # arithmetic — O(1) membership bit-test + masked prefix-popcount rank (law
+        # #15) — and the SAME ``k_oval`` nibble stream; the ONLY difference is where
+        # the occupancy words come from:
+        #
+        #   _bitmap_splice_from_word   DERIVES them in registers by OR-ing 1<<pos over
+        #                              the OUTLIER_K relidx7 slots. The resident plane
+        #                              is still relidx7 (7 bit/slot); the bitmap exists
+        #                              only inside the kernel, so HBM pays 7k bits.
+        #   _bitmap_splice_from_bytes  LOADS them from ``k_obmp`` — the paper's flat
+        #                              N-bit-per-group mask IS the resident plane. No
+        #                              derivation loop runs, so the index cost is FLAT
+        #                              in OUTLIER_K (ceil(VL/8) bytes/frame at any k).
+        #
+        # ``bmp_bytes`` is the [K_BYTE, FBB_P2] int32 byte tile the caller already
+        # loaded (masked to the FBB real bytes, other=0); ``vword`` the packed value
+        # stream. Bit ``p`` of the mask is byte ``p>>3``, bit ``p&7`` — LSB-first,
+        # the ``codec.pack_bitmap_rows`` layout — so occupancy word ``_w`` is simply
+        # bytes ``4*_w .. 4*_w+3`` little-endian, and NO position arithmetic is needed.
+        #
+        # UNVERIFIED ON HARDWARE: this branch has never executed on a GPU (no device
+        # was available when it was written). Its CPU-side contract — the byte layout,
+        # the popcount-rank identity, and membership equality with relidx7 — is gated in
+        # tests/test_bitmap_outlier.py; the GPU equivalence gate there is ``gpu``-marked
+        # and SKIPS without a device.
+        VL_WORDS: tl.constexpr = (VL + 31) // 32
+        offs_b = tl.arange(0, FBB_P2)
+        t_bit = (tok_local & 0x1F)                                # [BLOCK_N] bit
+        prefix_mask = (1 << t_bit) - 1                            # [BLOCK_N] within-word
+        if VL_WORDS == 1:
+            # VL<=32 fast lane: ONE occupancy word, so t_word≡0 and there is no lower
+            # word — rank collapses to a single masked prefix-popcount (the 2-popcount
+            # of law #15 fuses to 1 when the lower-word domain is empty). Mirrors the
+            # same fast lane in _bitmap_splice_from_word.
+            w_acc = tl.sum(bmp_bytes << (8 * offs_b)[None, :], axis=1)   # [K_BYTE]
+            own_word = w_acc[:, None]                                    # [K_BYTE,1]
+            rank = _popcount32(own_word & prefix_mask[None, :])
+        else:
+            t_word = (tok_local >> 5)                             # [BLOCK_N] word index
+            own_word = tl.zeros([bmp_bytes.shape[0], tok_local.shape[0]], dtype=tl.int32)
+            prefix_below = tl.zeros([bmp_bytes.shape[0], tok_local.shape[0]],
+                                    dtype=tl.int32)
+            for _w in tl.static_range(VL_WORDS):
+                # word _w = bytes [4*_w, 4*_w+4) little-endian. The shift amount is
+                # CLAMPED inside the tl.where so the out-of-window lanes never evaluate
+                # a negative shift (UB) — the mask zeroes them either way.
+                in_w = (offs_b >= 4 * _w) & (offs_b < 4 * _w + 4)
+                sh = tl.where(in_w, (offs_b - 4 * _w) * 8, 0)
+                w_acc = tl.sum(tl.where(in_w[None, :], bmp_bytes << sh[None, :], 0),
+                               axis=1)                            # [K_BYTE]
+                own_word = own_word + tl.where(t_word[None, :] == _w, w_acc[:, None], 0)
+                prefix_below = prefix_below + tl.where(
+                    _w < t_word[None, :], _popcount32(w_acc)[:, None], 0)
+            # rank = (fused lower-word full popcount) + (masked prefix-popcount in t's word)
+            rank = prefix_below + _popcount32(own_word & prefix_mask[None, :])
+        mem = (((own_word >> t_bit[None, :]) & 1) != 0)
+        match = mem & in_block[None, :] & row_mask[:, None]        # [K_BYTE, BLOCK_N]
+        # value gather: the set bit's ascending ordinal IS ``rank``, and pack.py writes
+        # k_oval in ascending-position order, so nibble/byte ``rank`` is its value.
+        if OUTLIER_FP8:
+            ov = (vword[:, None] >> (8 * rank)) & 0xFF
+        else:
+            ov = (vword[:, None] >> (4 * rank)) & 0xF
+        new_outl = match & (~is_outlier)
+        sel_code = tl.where(new_outl, ov, sel_code)
+        is_outlier = is_outlier | match
+        return sel_code, is_outlier
+
+    @triton.jit
     def _canonical_single_group_splice(
         base_level, tok_local, blk_scalar, in_block, row_mask,
-        K_oidx, K_oval, K_crank, BINOM_LUT,
+        K_oidx, K_oval, K_crank, K_obmp, BINOM_LUT,
         oidx_head_off, oidx_blk_stride, oidx_dcol,
         oval_head_off, oval_blk_stride, oval_dcol,
         crank_head_off, crank_blk_stride, crank_dcol,
+        bmp_head_off, bmp_blk_stride, bmp_dcol,
         OUTLIER_K: tl.constexpr, RELIDX_PACKED: tl.constexpr,
         FBI: tl.constexpr, FBI_P2: tl.constexpr,
         FBV: tl.constexpr, FBV_P2: tl.constexpr,
@@ -740,6 +899,7 @@ def _build_kernels(triton, tl):
         OUTLIER_FP8: tl.constexpr,
         COMBINADIC_READ: tl.constexpr,
         FBR: tl.constexpr, FBR_P2: tl.constexpr,
+        BITMAP_READ: tl.constexpr, FBB: tl.constexpr, FBB_P2: tl.constexpr,
         VL: tl.constexpr,
         OUTLIER_BITMAP: tl.constexpr = False,
     ):
@@ -754,7 +914,31 @@ def _build_kernels(triton, tl):
         zero_db = (oidx_dcol[:, None] * 0 + tok_local[None, :] * 0).to(tl.int32)
         sel_code = zero_db
         is_outlier = zero_db != 0
-        if COMBINADIC_READ:
+        if BITMAP_READ:
+            # STORED FLAT BITMASK (paper item B4): the resident outlier-position plane
+            # is ``k_obmp`` — ceil(VL/8) bytes per (group, head, channel) frame, one bit
+            # per token position — NOT the relidx7 bitstream. One wide byte-tile load
+            # per frame, then the SAME O(1) membership + prefix-popcount rank the
+            # relidx7 OUTLIER_BITMAP lane derives in registers. The ``k_oval`` VALUE
+            # read is byte-for-byte the relidx7 one (ascending-position nibbles).
+            # UNVERIFIED ON HARDWARE — see _bitmap_splice_from_bytes.
+            offs_fbb = tl.arange(0, FBB_P2)
+            bmp_bytes = tl.load(
+                K_obmp + bmp_head_off + blk_scalar * bmp_blk_stride
+                + bmp_dcol[:, None] + offs_fbb[None, :],
+                mask=row_mask[:, None] & (offs_fbb < FBB)[None, :],
+                other=0).to(tl.int32)
+            offs_fbv = tl.arange(0, FBV_P2)
+            val_bytes = tl.load(
+                K_oval + oval_head_off + blk_scalar * oval_blk_stride
+                + oval_dcol[:, None] + offs_fbv[None, :],
+                mask=row_mask[:, None] & (offs_fbv < FBV)[None, :],
+                other=0).to(tl.int32)
+            vword = tl.sum(val_bytes << (8 * offs_fbv)[None, :], axis=1)
+            sel_code, is_outlier = _bitmap_splice_from_bytes(
+                sel_code, is_outlier, tok_local, in_block, row_mask,
+                bmp_bytes, vword, OUTLIER_K, OUTLIER_FP8, VL, FBB, FBB_P2)
+        elif COMBINADIC_READ:
             # COMBINADIC-READ (storage-floor index): load the combinadic RANK plane
             # (FBR bytes/frame, the information floor ~ceil(log2 C(VL,k)) bits — k=4
             # is 16 bits vs relidx7's 4·7=28) instead of the relidx7 idx bitstream,
@@ -860,10 +1044,11 @@ def _build_kernels(triton, tl):
     @triton.jit
     def _canonical_single_group_splice_maplvl(
         base_level, tok_local, blk_scalar, in_block, row_mask,
-        K_oidx, K_oval, K_crank, BINOM_LUT,
+        K_oidx, K_oval, K_crank, K_obmp, BINOM_LUT,
         oidx_head_off, oidx_blk_stride, oidx_dcol,
         oval_head_off, oval_blk_stride, oval_dcol,
         crank_head_off, crank_blk_stride, crank_dcol,
+        bmp_head_off, bmp_blk_stride, bmp_dcol,
         OUTLIER_K: tl.constexpr, RELIDX_PACKED: tl.constexpr,
         FBI: tl.constexpr, FBI_P2: tl.constexpr,
         FBV: tl.constexpr, FBV_P2: tl.constexpr,
@@ -871,6 +1056,7 @@ def _build_kernels(triton, tl):
         OUTLIER_FP8: tl.constexpr,
         COMBINADIC_READ: tl.constexpr,
         FBR: tl.constexpr, FBR_P2: tl.constexpr,
+        BITMAP_READ: tl.constexpr, FBB: tl.constexpr, FBB_P2: tl.constexpr,
         VL: tl.constexpr,
         OUTLIER_BITMAP: tl.constexpr = False,
     ):
@@ -885,7 +1071,31 @@ def _build_kernels(triton, tl):
         zero_db = (oidx_dcol[:, None] * 0 + tok_local[None, :] * 0).to(tl.int32)
         sel_code = zero_db
         is_outlier = zero_db != 0
-        if COMBINADIC_READ:
+        if BITMAP_READ:
+            # STORED FLAT BITMASK (paper item B4): the resident outlier-position plane
+            # is ``k_obmp`` — ceil(VL/8) bytes per (group, head, channel) frame, one bit
+            # per token position — NOT the relidx7 bitstream. One wide byte-tile load
+            # per frame, then the SAME O(1) membership + prefix-popcount rank the
+            # relidx7 OUTLIER_BITMAP lane derives in registers. The ``k_oval`` VALUE
+            # read is byte-for-byte the relidx7 one (ascending-position nibbles).
+            # UNVERIFIED ON HARDWARE — see _bitmap_splice_from_bytes.
+            offs_fbb = tl.arange(0, FBB_P2)
+            bmp_bytes = tl.load(
+                K_obmp + bmp_head_off + blk_scalar * bmp_blk_stride
+                + bmp_dcol[:, None] + offs_fbb[None, :],
+                mask=row_mask[:, None] & (offs_fbb < FBB)[None, :],
+                other=0).to(tl.int32)
+            offs_fbv = tl.arange(0, FBV_P2)
+            val_bytes = tl.load(
+                K_oval + oval_head_off + blk_scalar * oval_blk_stride
+                + oval_dcol[:, None] + offs_fbv[None, :],
+                mask=row_mask[:, None] & (offs_fbv < FBV)[None, :],
+                other=0).to(tl.int32)
+            vword = tl.sum(val_bytes << (8 * offs_fbv)[None, :], axis=1)
+            sel_code, is_outlier = _bitmap_splice_from_bytes(
+                sel_code, is_outlier, tok_local, in_block, row_mask,
+                bmp_bytes, vword, OUTLIER_K, OUTLIER_FP8, VL, FBB, FBB_P2)
+        elif COMBINADIC_READ:
             offs_fbr = tl.arange(0, FBR_P2)
             rank_bytes = tl.load(
                 K_crank + crank_head_off + blk_scalar * crank_blk_stride
@@ -1016,7 +1226,7 @@ def _build_kernels(triton, tl):
     @triton.jit
     def _canonical_splitkv_stage1(
         Q,
-        K_base, K_scale, K_oidx, K_oval, K_crank, BINOM_LUT,
+        K_base, K_scale, K_oidx, K_oval, K_crank, K_obmp, BINOM_LUT,
         K_mapscale, K_mapcenter,
         V_main, V_scale, V_zp,
         QZP,
@@ -1034,6 +1244,7 @@ def _build_kernels(triton, tl):
         stride_koidx_g, stride_koidx_h, stride_koidx_d,
         stride_koval_g, stride_koval_h, stride_koval_d,
         stride_kcr_g, stride_kcr_h, stride_kcr_d,
+        stride_kbm_g, stride_kbm_h, stride_kbm_d,
         stride_kms_g, stride_kms_h, stride_kms_d,
         stride_kmc_g, stride_kmc_h, stride_kmc_d,
         stride_vm_tok, stride_vm_h,
@@ -1059,6 +1270,9 @@ def _build_kernels(triton, tl):
         COMBINADIC_READ: tl.constexpr,
         FBR: tl.constexpr,
         FBR_P2: tl.constexpr,
+        BITMAP_READ: tl.constexpr,
+        FBB: tl.constexpr,
+        FBB_P2: tl.constexpr,
         VL: tl.constexpr,
         OUTLIER_BITMAP: tl.constexpr,
         KV_OUTLIER_MAP: tl.constexpr,
@@ -1306,29 +1520,35 @@ def _build_kernels(triton, tl):
                             other=0)
                         k_even = _canonical_single_group_splice(
                             k_even, tok_local_w, g_phys_i, in_blk, mask_de,
-                            K_oidx, K_oval, K_crank, BINOM_LUT,
+                            K_oidx, K_oval, K_crank, K_obmp, BINOM_LUT,
                             cur_kv_head * stride_koidx_h, stride_koidx_g,
                             offs_de * stride_koidx_d,
                             cur_kv_head * stride_koval_h, stride_koval_g,
                             offs_de * stride_koval_d,
                             cur_kv_head * stride_kcr_h, stride_kcr_g,
                             offs_de * stride_kcr_d,
+                            cur_kv_head * stride_kbm_h, stride_kbm_g,
+                            offs_de * stride_kbm_d,
                             K_OUTLIER_K, RELIDX_PACKED,
                             FBI, FBI_P2, FBV, FBV_P2, WORD_SPLICE, OUTLIER_FP8,
-                            COMBINADIC_READ, FBR, FBR_P2, VL,
+                            COMBINADIC_READ, FBR, FBR_P2,
+                            BITMAP_READ, FBB, FBB_P2, VL,
                             OUTLIER_BITMAP)
                         k_odd = _canonical_single_group_splice(
                             k_odd, tok_local_w, g_phys_i, in_blk, mask_do,
-                            K_oidx, K_oval, K_crank, BINOM_LUT,
+                            K_oidx, K_oval, K_crank, K_obmp, BINOM_LUT,
                             cur_kv_head * stride_koidx_h, stride_koidx_g,
                             offs_do * stride_koidx_d,
                             cur_kv_head * stride_koval_h, stride_koval_g,
                             offs_do * stride_koval_d,
                             cur_kv_head * stride_kcr_h, stride_kcr_g,
                             offs_do * stride_kcr_d,
+                            cur_kv_head * stride_kbm_h, stride_kbm_g,
+                            offs_do * stride_kbm_d,
                             K_OUTLIER_K, RELIDX_PACKED,
                             FBI, FBI_P2, FBV, FBV_P2, WORD_SPLICE, OUTLIER_FP8,
-                            COMBINADIC_READ, FBR, FBR_P2, VL,
+                            COMBINADIC_READ, FBR, FBR_P2,
+                            BITMAP_READ, FBB, FBB_P2, VL,
                             OUTLIER_BITMAP)
 
                 k_even = k_even * s_e_w
@@ -1639,29 +1859,35 @@ def _build_kernels(triton, tl):
                                         mask=mask_do, other=0.0).to(tl.float32)
                         oe_mask, oe_lvl = _canonical_single_group_splice_maplvl(
                             k_even, tok_local, g_phys, token_mask, mask_de,
-                            K_oidx, K_oval, K_crank, BINOM_LUT,
+                            K_oidx, K_oval, K_crank, K_obmp, BINOM_LUT,
                             cur_kv_head * stride_koidx_h, stride_koidx_g,
                             offs_de * stride_koidx_d,
                             cur_kv_head * stride_koval_h, stride_koval_g,
                             offs_de * stride_koval_d,
                             cur_kv_head * stride_kcr_h, stride_kcr_g,
                             offs_de * stride_kcr_d,
+                            cur_kv_head * stride_kbm_h, stride_kbm_g,
+                            offs_de * stride_kbm_d,
                             K_OUTLIER_K, RELIDX_PACKED,
                             FBI, FBI_P2, FBV, FBV_P2, WORD_SPLICE, OUTLIER_FP8,
-                            COMBINADIC_READ, FBR, FBR_P2, VL,
+                            COMBINADIC_READ, FBR, FBR_P2,
+                            BITMAP_READ, FBB, FBB_P2, VL,
                             OUTLIER_BITMAP)
                         oo_mask, oo_lvl = _canonical_single_group_splice_maplvl(
                             k_odd, tok_local, g_phys, token_mask, mask_do,
-                            K_oidx, K_oval, K_crank, BINOM_LUT,
+                            K_oidx, K_oval, K_crank, K_obmp, BINOM_LUT,
                             cur_kv_head * stride_koidx_h, stride_koidx_g,
                             offs_do * stride_koidx_d,
                             cur_kv_head * stride_koval_h, stride_koval_g,
                             offs_do * stride_koval_d,
                             cur_kv_head * stride_kcr_h, stride_kcr_g,
                             offs_do * stride_kcr_d,
+                            cur_kv_head * stride_kbm_h, stride_kbm_g,
+                            offs_do * stride_kbm_d,
                             K_OUTLIER_K, RELIDX_PACKED,
                             FBI, FBI_P2, FBV, FBV_P2, WORD_SPLICE, OUTLIER_FP8,
-                            COMBINADIC_READ, FBR, FBR_P2, VL,
+                            COMBINADIC_READ, FBR, FBR_P2,
+                            BITMAP_READ, FBB, FBB_P2, VL,
                             OUTLIER_BITMAP)
                         # per-(channel, token) K-domain delta over the outlier lanes.
                         # [K_BYTE, BLOCK_N] base = code·s + zp ; mapped = lvl/ms + center.
@@ -1688,29 +1914,35 @@ def _build_kernels(triton, tl):
                         # (the per-channel zp cancels; q·zp folded once downstream).
                         oe_mask, oe_lvl = _canonical_single_group_splice_maplvl(
                             k_even, tok_local, g_phys, token_mask, mask_de,
-                            K_oidx, K_oval, K_crank, BINOM_LUT,
+                            K_oidx, K_oval, K_crank, K_obmp, BINOM_LUT,
                             cur_kv_head * stride_koidx_h, stride_koidx_g,
                             offs_de * stride_koidx_d,
                             cur_kv_head * stride_koval_h, stride_koval_g,
                             offs_de * stride_koval_d,
                             cur_kv_head * stride_kcr_h, stride_kcr_g,
                             offs_de * stride_kcr_d,
+                            cur_kv_head * stride_kbm_h, stride_kbm_g,
+                            offs_de * stride_kbm_d,
                             K_OUTLIER_K, RELIDX_PACKED,
                             FBI, FBI_P2, FBV, FBV_P2, WORD_SPLICE, OUTLIER_FP8,
-                            COMBINADIC_READ, FBR, FBR_P2, VL,
+                            COMBINADIC_READ, FBR, FBR_P2,
+                            BITMAP_READ, FBB, FBB_P2, VL,
                             OUTLIER_BITMAP)
                         oo_mask, oo_lvl = _canonical_single_group_splice_maplvl(
                             k_odd, tok_local, g_phys, token_mask, mask_do,
-                            K_oidx, K_oval, K_crank, BINOM_LUT,
+                            K_oidx, K_oval, K_crank, K_obmp, BINOM_LUT,
                             cur_kv_head * stride_koidx_h, stride_koidx_g,
                             offs_do * stride_koidx_d,
                             cur_kv_head * stride_koval_h, stride_koval_g,
                             offs_do * stride_koval_d,
                             cur_kv_head * stride_kcr_h, stride_kcr_g,
                             offs_do * stride_kcr_d,
+                            cur_kv_head * stride_kbm_h, stride_kbm_g,
+                            offs_do * stride_kbm_d,
                             K_OUTLIER_K, RELIDX_PACKED,
                             FBI, FBI_P2, FBV, FBV_P2, WORD_SPLICE, OUTLIER_FP8,
-                            COMBINADIC_READ, FBR, FBR_P2, VL,
+                            COMBINADIC_READ, FBR, FBR_P2,
+                            BITMAP_READ, FBB, FBB_P2, VL,
                             OUTLIER_BITMAP)
                         delta_e = tl.where(
                             oe_mask, (oe_lvl.to(tl.float32) - k_even) * s_e[:, None],
@@ -1728,29 +1960,35 @@ def _build_kernels(triton, tl):
                     else:
                         k_even = _canonical_single_group_splice(
                             k_even, tok_local, g_phys, token_mask, mask_de,
-                            K_oidx, K_oval, K_crank, BINOM_LUT,
+                            K_oidx, K_oval, K_crank, K_obmp, BINOM_LUT,
                             cur_kv_head * stride_koidx_h, stride_koidx_g,
                             offs_de * stride_koidx_d,
                             cur_kv_head * stride_koval_h, stride_koval_g,
                             offs_de * stride_koval_d,
                             cur_kv_head * stride_kcr_h, stride_kcr_g,
                             offs_de * stride_kcr_d,
+                            cur_kv_head * stride_kbm_h, stride_kbm_g,
+                            offs_de * stride_kbm_d,
                             K_OUTLIER_K, RELIDX_PACKED,
                             FBI, FBI_P2, FBV, FBV_P2, WORD_SPLICE, OUTLIER_FP8,
-                            COMBINADIC_READ, FBR, FBR_P2, VL,
+                            COMBINADIC_READ, FBR, FBR_P2,
+                            BITMAP_READ, FBB, FBB_P2, VL,
                             OUTLIER_BITMAP)
                         k_odd = _canonical_single_group_splice(
                             k_odd, tok_local, g_phys, token_mask, mask_do,
-                            K_oidx, K_oval, K_crank, BINOM_LUT,
+                            K_oidx, K_oval, K_crank, K_obmp, BINOM_LUT,
                             cur_kv_head * stride_koidx_h, stride_koidx_g,
                             offs_do * stride_koidx_d,
                             cur_kv_head * stride_koval_h, stride_koval_g,
                             offs_do * stride_koval_d,
                             cur_kv_head * stride_kcr_h, stride_kcr_g,
                             offs_do * stride_kcr_d,
+                            cur_kv_head * stride_kbm_h, stride_kbm_g,
+                            offs_do * stride_kbm_d,
                             K_OUTLIER_K, RELIDX_PACKED,
                             FBI, FBI_P2, FBV, FBV_P2, WORD_SPLICE, OUTLIER_FP8,
-                            COMBINADIC_READ, FBR, FBR_P2, VL,
+                            COMBINADIC_READ, FBR, FBR_P2,
+                            BITMAP_READ, FBB, FBB_P2, VL,
                             OUTLIER_BITMAP)
 
                 # ABLATION: ABL_K_NODEQUANT skips the K affine dequant — no s-fold
@@ -2425,6 +2663,7 @@ def _build_kernels(triton, tl):
     g["_combinadic_unrank_oi"] = _combinadic_unrank_oi
     g["_popcount32"] = _popcount32
     g["_bitmap_splice_from_word"] = _bitmap_splice_from_word
+    g["_bitmap_splice_from_bytes"] = _bitmap_splice_from_bytes
     g["_canonical_single_group_splice"] = _canonical_single_group_splice
     g["_canonical_single_group_splice_maplvl"] = _canonical_single_group_splice_maplvl
 
@@ -2457,6 +2696,8 @@ def ommx_paged_decode_attention_canonical(
     k_format: str = "i2f4",
     combinadic_read: bool = False,
     k_crank: Any = None,
+    bitmap_read: bool = False,
+    k_obmp: Any = None,
     k_fp4_mapscale: Any = None,
     k_fp4_mapcenter: Any = None,
     kv_outlier_map: bool = False,
@@ -2498,6 +2739,27 @@ def ommx_paged_decode_attention_canonical(
     the relidx7 default stays for that case. Gated to ``k<=4`` (rank fits a 16-bit
     word at vl=32). Pass ``k_crank`` from ``ommx_pack_kv_canonical_block(...,
     outlier_repr="combinadic")``.
+
+    ``bitmap_read`` (env ``OMMX_VLLM_KV_BITMAP_READ=1``; default OFF) swaps the OUTLIER
+    INDEX source to the FLAT BITMASK plane ``k_obmp`` — ``ceil(VL/8)`` bytes per (group,
+    head, channel) frame, one bit per token position, LSB-first — which is the storage
+    the ICCAD paper attributes to the GPU implementation ("positions are stored as a flat
+    bitmask (N bits per group)"). The kernel then does NOT rebuild an occupancy word from
+    relidx7: it loads the words the packer already wrote and runs the same O(1) membership
+    bit-test + masked prefix-popcount rank, so the index cost is FLAT in k (1.0 bit/element
+    at any VL that is a multiple of 8) instead of relidx7's 7k/VL — cheaper than relidx7
+    above the 1/7 = 14.3% density crossover, and 32 bit vs 48 bit per frame at the
+    canonical VL=32, k=6 recipe. The ``k_oval`` VALUE read is UNCHANGED. Mutually
+    exclusive with ``combinadic_read``. Gated to ``k <= 8`` (the value stream must fit one
+    int32 word). Pass ``k_obmp`` from ``ommx_pack_kv_canonical_block(...,
+    outlier_repr="bitmap")``.
+
+    UNVERIFIED ON HARDWARE: the ``bitmap_read`` branch has never executed on a GPU (no
+    device was available when it was written). relidx7 remains the DEFAULT and its code
+    path is byte-identical to before this branch existed. The CPU-side contract (byte
+    layout, popcount-rank identity, membership equality with relidx7/combinadic) is gated
+    in ``tests/test_bitmap_outlier.py``; the GPU equivalence gate there is ``gpu``-marked
+    and SKIPS — never passes — without a device.
 
     GROUP SIZES (vector_length): ``GROUP_TOKENS`` (K token-group) and
     ``GROUP_CHANNELS`` (V channel-group) are an OPTION in {16,32,64,128}, DERIVED
@@ -2603,6 +2865,16 @@ def ommx_paged_decode_attention_canonical(
     # the relidx7 default stays. GATED: kwarg OR env OMMX_VLLM_KV_COMBINADIC_READ=1.
     combinadic_read = bool(combinadic_read) or _env_bool(
         "OMMX_VLLM_KV_COMBINADIC_READ", False)
+    # BITMAP-READ (the paper's flat N-bit-per-group mask as the RESIDENT plane): read
+    # ``k_obmp`` instead of the relidx7 idx bitstream. Unlike the OMMX_ATTN_OUTLIER_BITMAP
+    # lever — which derives an occupancy word IN REGISTERS from a relidx7 plane that is
+    # still what HBM stores — this changes WHAT IS STORED, so it moves bytes, not just
+    # ALU. GATED: kwarg OR env OMMX_VLLM_KV_BITMAP_READ=1.
+    bitmap_read = bool(bitmap_read) or _env_bool("OMMX_VLLM_KV_BITMAP_READ", False)
+    if bitmap_read and combinadic_read:
+        raise ValueError(
+            "combinadic_read and bitmap_read are mutually exclusive outlier-index "
+            "sources (a pack carries exactly one of k_crank / k_obmp). Pick one.")
     batch, head_num = int(q.shape[0]), int(q.shape[1])
     Lk = int(k_base.shape[-1]) * k_codes_per_byte
     Lv = int(v_main.shape[-1]) * 4
@@ -2685,10 +2957,20 @@ def ommx_paged_decode_attention_canonical(
         raise ValueError(
             "combinadic_read in-register unrank is gated to k<=4 (the rank fits a "
             f"<=16-bit word for vl=32); got k={k_outlier_k}. Use relidx7 instead.")
-    if (not combinadic_read) and k_outlier_k > 0 and k_oidx is None:
+    if bitmap_read and k_outlier_k > 0 and k_obmp is None:
+        raise ValueError(
+            "bitmap_read=True requires the k_obmp flat-bitmask plane (pack with "
+            "ommx_pack_kv_canonical_block(..., outlier_repr='bitmap')).")
+    if bitmap_read and k_outlier_k > 8:
+        raise ValueError(
+            "bitmap_read packs the k_oval value stream into ONE int32 word, which holds "
+            f"ceil(k/2) <= 4 bytes, i.e. k <= 8; got k={k_outlier_k}. Use relidx7.")
+    if (not combinadic_read) and (not bitmap_read) and k_outlier_k > 0 \
+            and k_oidx is None:
         raise ValueError(
             "k_outliers_per_vector > 0 requires the k_oidx relidx7 sidecar plane "
-            "(or pass combinadic_read=True with a k_crank plane).")
+            "(or pass combinadic_read=True with a k_crank plane, or bitmap_read=True "
+            "with a k_obmp plane).")
 
     # combinadic binomial LUT C(c, j) for c in 0..VL, j in 1..k — the compile-time
     # table the in-register unrank indexes (flat [(VL+1)*k], LUT[c*k + (j-1)]).
@@ -2706,6 +2988,11 @@ def ommx_paged_decode_attention_canonical(
         fbr_p2 = triton.next_power_of_2(max(1, fbr))
     else:
         binom_lut = torch.zeros(1, dtype=torch.int32, device=q.device)
+    # FLAT BITMASK field width: ceil(VL/8) bytes per frame — sized by the GROUP, NOT
+    # by k (that flatness is the encoding's whole point). FBB_P2 is the next-pow2
+    # tl.arange load width the kernel tiles the frame with.
+    fbb = ((VL + 7) // 8) if (bitmap_read and k_outlier_k > 0) else 0
+    fbb_p2 = triton.next_power_of_2(max(1, fbb))
 
     if k_outlier_k > 0:
         # relidx_packed: uint8 sidecar => the 7-bit-packed bitstream; int16 =>
@@ -2716,7 +3003,8 @@ def ommx_paged_decode_attention_canonical(
             s_koidx_g, s_koidx_h, s_koidx_d = (
                 int(k_oidx.stride(0)), int(k_oidx.stride(1)), int(k_oidx.stride(2)))
         else:
-            # combinadic_read with no relidx7 plane: dummy idx pointer (unused).
+            # combinadic_read / bitmap_read with no relidx7 plane: dummy idx pointer
+            # (unused — the alternate index plane is the real source).
             relidx_packed = True
             koidx_t = torch.zeros(1, dtype=torch.uint8, device=q.device)
             s_koidx_g = s_koidx_h = s_koidx_d = 0
@@ -2731,14 +3019,24 @@ def ommx_paged_decode_attention_canonical(
         else:
             kcrank_t = torch.zeros(1, dtype=torch.uint8, device=q.device)
             s_kcr_g = s_kcr_h = s_kcr_d = 0
+        if bitmap_read:
+            kobmp_t = k_obmp
+            s_kbm_g, s_kbm_h, s_kbm_d = (
+                int(k_obmp.stride(0)), int(k_obmp.stride(1)),
+                int(k_obmp.stride(2)))
+        else:
+            kobmp_t = torch.zeros(1, dtype=torch.uint8, device=q.device)
+            s_kbm_g = s_kbm_h = s_kbm_d = 0
     else:
         relidx_packed = False
         koidx_t = torch.zeros(1, dtype=torch.int16, device=q.device)
         koval_t = torch.zeros(1, dtype=torch.uint8, device=q.device)
         kcrank_t = torch.zeros(1, dtype=torch.uint8, device=q.device)
+        kobmp_t = torch.zeros(1, dtype=torch.uint8, device=q.device)
         s_koidx_g = s_koidx_h = s_koidx_d = 0
         s_koval_g = s_koval_h = s_koval_d = 0
         s_kcr_g = s_kcr_h = s_kcr_d = 0
+        s_kbm_g = s_kbm_h = s_kbm_d = 0
 
     if num_kv_splits is None:
         num_kv_splits = _auto_num_kv_splits(
@@ -2750,8 +3048,15 @@ def ommx_paged_decode_attention_canonical(
         # and sm_80 at depth 3, while still respecting an explicit env override
         # via _auto_num_stages_decode -> _env_int("OMMX_V4_NUM_STAGES", ...).
         base_stages = _auto_num_stages_decode(max_seq, batch)
-        if os.environ.get("OMMX_V4_NUM_STAGES"):
+        if str(os.environ.get("OMMX_V4_NUM_STAGES") or "").strip():
             # Explicit env pin wins verbatim (do not silently override a tuned pin).
+            # `.strip()` (not bare truthiness) because a WHITESPACE-ONLY value has to
+            # mean the same thing on both sides of this branch: _env_int treats blank as
+            # "unset -> default", so a bare truthiness test made OMMX_V4_NUM_STAGES="  "
+            # count as an explicit pin whose pinned value was in fact the ladder default
+            # — silently dropping the per-arch cp.async depth cap below with nothing in
+            # the output to say the geometry had changed. Every non-blank value (a real
+            # pin, or a malformed one that _env_int raises on above) is unaffected.
             num_stages = base_stages
         else:
             num_stages = max(base_stages, _arch_num_stages_cap(q.device))
@@ -2765,7 +3070,9 @@ def ommx_paged_decode_attention_canonical(
         # anomaly: 1 outlier SLOWER than 3). The 8w win was measured at 64K only. Make
         # it ctx/batch-aware + env-tunable (OMMX_ATTN_OUTLIER_WARPS overrides).
         if k_outlier_k > 0:
-            _ow = _env_int("OMMX_ATTN_OUTLIER_WARPS", 0)
+            # allow_zero: 0 is the DOCUMENTED default and means "use the ladder
+            # below", not "1 warp" (see _env_int).
+            _ow = _env_int("OMMX_ATTN_OUTLIER_WARPS", 0, allow_zero=True)
             if _ow > 0:
                 num_warps = _ow
             elif max_seq >= 16384:
@@ -2913,8 +3220,12 @@ def ommx_paged_decode_attention_canonical(
     # k<=4). OMMX_ATTN_OUTLIER_BITMAP forces it ON/OFF at any VL for A/B.
     word_splice_active = ((not outlier_fp8) and k_outlier_k <= 4)
     _bitmap_default = GROUP_TOKENS <= 32        # single-word fast lane only
+    # NOT eligible under bitmap_read: that path loads the occupancy words from k_obmp
+    # instead of deriving them, so the register-derive lever has nothing to do (its
+    # branch is not even reached — BITMAP_READ takes the first arm of the splice).
     outlier_bitmap = (
-        k_outlier_k > 0 and (not combinadic_read) and word_splice_active
+        k_outlier_k > 0 and (not combinadic_read) and (not bitmap_read)
+        and word_splice_active
         and _env_bool("OMMX_ATTN_OUTLIER_BITMAP", _bitmap_default))
 
     # KV DEDICATED FP4 OUTLIER MAP (weight-space center/span — fakequant-EXACT). When
@@ -2954,7 +3265,7 @@ def ommx_paged_decode_attention_canonical(
     grid1 = (batch, n_kv_heads, num_kv_splits)
     _canonical_splitkv_stage1_kernel[grid1](
         q,
-        k_base, k_scale, koidx_t, koval_t, kcrank_t, binom_lut,
+        k_base, k_scale, koidx_t, koval_t, kcrank_t, kobmp_t, binom_lut,
         kms_t, kmc_t,
         v_main, v_scale, v_zp,
         qzp_buf,
@@ -2972,6 +3283,7 @@ def ommx_paged_decode_attention_canonical(
         s_koidx_g, s_koidx_h, s_koidx_d,
         s_koval_g, s_koval_h, s_koval_d,
         s_kcr_g, s_kcr_h, s_kcr_d,
+        s_kbm_g, s_kbm_h, s_kbm_d,
         s_kms_g, s_kms_h, s_kms_d,
         s_kmc_g, s_kmc_h, s_kmc_d,
         v_main.stride(1), v_main.stride(2),
@@ -3002,6 +3314,11 @@ def ommx_paged_decode_attention_canonical(
         COMBINADIC_READ=bool(combinadic_read and k_outlier_k > 0),
         FBR=int(fbr),
         FBR_P2=int(fbr_p2),
+        # BITMAP_READ: index source = the STORED flat bitmask plane k_obmp (paper item
+        # B4). FBB = ceil(VL/8) frame bytes, FBB_P2 its next-pow2 load width.
+        BITMAP_READ=bool(bitmap_read and k_outlier_k > 0),
+        FBB=int(fbb),
+        FBB_P2=int(fbb_p2),
         VL=VL,
         OUTLIER_BITMAP=bool(outlier_bitmap),
         KV_OUTLIER_MAP=bool(kv_outlier_map),

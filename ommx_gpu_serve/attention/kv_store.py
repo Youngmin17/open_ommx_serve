@@ -24,8 +24,20 @@ Design split (the serving contract):
 
 This module is the CPU-verifiable reference for the write-pack path: incremental
 per-group packing is BIT-EXACT to a single bulk ``ommx_pack_kv_canonical_block`` of
-the same prefix (the ``tests/test_kv_store.py`` gate). The GPU paged vLLM store
-(``integration/vllm``) reuses this logic over vLLM's block table.
+the same prefix (the ``tests/test_kv_store.py`` gate). The vLLM integration
+(``integration/vllm``) reuses this packing logic.
+
+IT DOES NOT REUSE IT "OVER vLLM's BLOCK TABLE", WHICH THIS DOCSTRING USED TO CLAIM.
+That sentence was the only text in the tree asserting the OMMX KV path is addressed
+through vLLM's paging, and it is false against the code: ``backend.do_kv_cache_update``
+forwards vLLM's ``slot_mapping`` only to ``super()`` (the bf16 shadow write) and the
+sidecar write below it never reads it; the block table is consulted for **column 0
+only**, as an opaque per-request identity key for OMMX's own slot allocator
+(``integration/vllm/metadata.py`` ``_req_keys``); and the ``req_to_token`` /
+``req_to_group`` tables the kernel consumes are identity ``arange`` reshapes over a
+STATICALLY partitioned pool in which request slot ``b`` owns the fixed contiguous
+block ``[b*P_per_seq, (b+1)*P_per_seq)``. ``preflight.py``, ``backend.py`` and the
+README all state the sidecar is not paged; this file was the lone dissenter.
 """
 from __future__ import annotations
 
@@ -33,7 +45,37 @@ from typing import Optional
 
 import torch
 
+# ── OMMX_RECIPE resolution (see recipes.resolve_env for the model + why) ─────────
+#
+# Resolution model (a): every reader of a recipe-controlled env var expands
+# ``OMMX_RECIPE`` itself, via this idempotent call, BEFORE it reads ``os.environ``.
+# Before this, ``OMMX_RECIPE`` was expanded only inside
+# ``integration/vllm/config.resolve_serving_config``; the raw ``os.environ.get``
+# reads below therefore ignored a named preset in any process where that call had
+# not already happened — silently, with a plausible shipped-recipe answer. The knobs
+# read raw in this file are recipe-controlled: both registered KV presets set
+# ``OMMX_KV_RING=1``, ``OMMX_KV_GPU_PACK=1`` and ``OMMX_KV_OUTLIER_MAP=1``, none of
+# which is the bare default (ring in particular defaults OFF = the full bf16 shadow).
+# The call is a no-op single dict lookup when OMMX_RECIPE is unset, never overwrites
+# an explicitly-set var, and raises (listing the known names) on an unknown one.
+#
+# The import is LAZY (inside the wrapper, not at module scope) for one measured reason:
+# ``ommx_gpu_serve/__init__`` imports this module, so a module-scope
+# ``from ..recipes import ...`` puts ``ommx_gpu_serve.recipes`` in sys.modules DURING
+# the package __init__, and ``python3 -m ommx_gpu_serve.recipes`` — the documented CLI,
+# and what ``run.sh --recipe`` shells out to — then emits
+# "RuntimeWarning: 'ommx_gpu_serve.recipes' found in sys.modules after import of
+# package 'ommx_gpu_serve' ... this may result in unpredictable behaviour" on every
+# invocation. Deferring the import to the first CALL keeps that command clean.
+
+
+def _resolve_recipe_env():
+    from ..recipes import resolve_env
+    return resolve_env()
+
+
 from .kv_window import CANONICAL_GROUP_TOKENS, WindowSpec
+from .pack import OUTLIER_REPRS as _OUTLIER_REPRS
 from .pack import ommx_pack_kv_canonical_block
 
 _OVAL_BYTES = {4: lambda k: (k + 1) // 2}
@@ -86,11 +128,16 @@ class CanonicalKVStore:
         self.k = int(outliers_per_vector)
         self.outlier_select = str(outlier_select).lower()
         self.outlier_repr = str(outlier_repr).lower()
+        if self.outlier_repr not in _OUTLIER_REPRS:
+            raise ValueError(
+                f"outlier_repr must be one of {_OUTLIER_REPRS}; got {outlier_repr!r}")
         self.use_pow2 = bool(use_pow2)
         # KV dedicated FP4 outlier map + int8 pow2-exp scale gating — mirror the
         # pack.py resolution (env OMMX_KV_OUTLIER_MAP / OMMX_KV_INT8_SCALE) so the
         # store's incremental pack is BIT-EXACT to a bulk ommx_pack_kv_canonical_block.
         import os as _os
+        # OMMX_RECIPE -> os.environ before the first raw read in this constructor.
+        _resolve_recipe_env()
         if kv_outlier_map is None:
             _raw = _os.environ.get("OMMX_KV_OUTLIER_MAP")
             kv_outlier_map = (_raw not in {"0", "false", "off", "no"}) if _raw else True
@@ -155,10 +202,25 @@ class CanonicalKVStore:
         else:
             self.k_fp4_mapscale = None
             self.k_fp4_mapcenter = None
+        # OUTLIER-POSITION plane: exactly ONE of the three membership-equivalent index
+        # encodings is allocated (the other two stay None), sized per (group, head,
+        # channel) frame:
+        #   relidx7 (DEFAULT)  k_oidx  ceil(7k/8) B   — 7 bit per outlier slot
+        #   combinadic         k_crank ceil(log2 C(gt,k)/8) B — the storage floor
+        #   bitmap             k_obmp  ceil(gt/8) B   — the paper's flat N-bit mask,
+        #                                               FLAT in k (1.0 bit/element)
+        self.k_obmp = None
         if self.k > 0 and self.outlier_repr == "relidx7":
             idx_fb = (7 * self.k + 7) // 8
             self.k_oidx = torch.zeros(self.G_cap, self.H, self.D, idx_fb,
                                       dtype=torch.uint8, device=dev)
+            self.k_crank = None
+        elif self.k > 0 and self.outlier_repr == "bitmap":
+            from .codec import bitmap_index_bytes
+            fb = bitmap_index_bytes(self.gt)
+            self.k_obmp = torch.zeros(self.G_cap, self.H, self.D, fb,
+                                      dtype=torch.uint8, device=dev)
+            self.k_oidx = None
             self.k_crank = None
         elif self.k > 0:  # combinadic
             from .codec import combinadic_index_bytes
@@ -187,6 +249,9 @@ class CanonicalKVStore:
         #     pos -> ring slot via `_ring_slot` (sink pinned [0:sink), recent positions
         #     sliding modulo Rrec). Capacity-shaped planes are unchanged (≤3-bit, cheap).
         import os as _os2
+        # OMMX_KV_RING is set by BOTH registered presets and defaults OFF: this is the
+        # read where an unresolved OMMX_RECIPE silently changed the allocation.
+        _resolve_recipe_env()
         _ring_raw = _os2.environ.get("OMMX_KV_RING")
         self.kv_ring = bool(_ring_raw) and _ring_raw not in {"0", "false", "off", "no"}
         self.kv_cap = self.max_seq_len
@@ -473,11 +538,13 @@ class CanonicalKVStore:
         """
         # GPU-PACKER (OMMX_KV_GPU_PACK): pack on-device, NO D2H/H2D round-trip (the host
         # CPU pack was the p99-spike / slow-TTFT source). relidx7/i2f4 is device-invariant;
+        # so is the flat BITMAP (pure vectorized bit-twiddling, _pack_bitmap_frames);
         # combinadic still needs CPU (pack.py rank_bytes.cpu) so it falls back. Bit-exact.
         import os as _os
         # default ON for relidx7/i2f4 (bit-exact, device-invariant) — the on-device pack
         # removes the boundary-step CPU pack D2H/H2D round-trip = the p99 spike. Explicit
         # OMMX_KV_GPU_PACK=0 escapes; combinadic always falls back to CPU.
+        _resolve_recipe_env()          # OMMX_RECIPE -> os.environ, before the read
         gpu_pack = (_os.environ.get("OMMX_KV_GPU_PACK", "1") not in {"0", "false", "off", "no"}
                     and self.outlier_repr != "combinadic")
         pdev = self.device if gpu_pack else "cpu"
@@ -510,6 +577,8 @@ class CanonicalKVStore:
             self.k_oval[g0:g1] = planes["k_oval"].to(dev)
             if self.outlier_repr == "relidx7":
                 self.k_oidx[g0:g1] = planes["k_oidx"].to(dev)
+            elif self.outlier_repr == "bitmap":
+                self.k_obmp[g0:g1] = planes["k_obmp"].to(dev)
             else:
                 self.k_crank[g0:g1] = planes["k_crank"].to(dev)
             if self.kv_outlier_map:
@@ -529,6 +598,7 @@ class CanonicalKVStore:
             "k_oidx": self.k_oidx[:G] if self.k_oidx is not None else None,
             "k_oval": self.k_oval[:G] if self.k_oval is not None else None,
             "k_crank": self.k_crank[:G] if self.k_crank is not None else None,
+            "k_obmp": self.k_obmp[:G] if self.k_obmp is not None else None,
             "k_fp4_mapscale": (self.k_fp4_mapscale[:G]
                                if self.k_fp4_mapscale is not None else None),
             "k_fp4_mapcenter": (self.k_fp4_mapcenter[:G]
@@ -567,6 +637,8 @@ class CanonicalKVStore:
         return {
             "k_base": self.k_base, "k_scale": self.k_scale, "k_zp": self.k_zp,
             "k_oidx": self.k_oidx, "k_oval": self.k_oval, "k_crank": self.k_crank,
+            "k_obmp": self.k_obmp,
+            "outlier_repr": self.outlier_repr,
             "k_fp4_mapscale": self.k_fp4_mapscale,
             "k_fp4_mapcenter": self.k_fp4_mapcenter,
             "v_main": self.v_main, "v_scale": self.v_scale, "v_zp": self.v_zp,

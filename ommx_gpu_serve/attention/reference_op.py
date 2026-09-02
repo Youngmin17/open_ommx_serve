@@ -57,6 +57,7 @@ def paged_decode(
     k_oidx: Optional[torch.Tensor],
     k_oval: Optional[torch.Tensor],
     k_crank: Optional[torch.Tensor],
+    k_obmp: Optional[torch.Tensor],
     k_fp4_mapscale: Optional[torch.Tensor],
     k_fp4_mapcenter: Optional[torch.Tensor],
     v_main: torch.Tensor,
@@ -75,6 +76,7 @@ def paged_decode(
     k_outliers_per_vector: int,
     k_format: str,
     combinadic_read: bool,
+    bitmap_read: bool,
     kv_outlier_map: bool,
     kv_int8_scale: bool,
     max_seq_len: int,
@@ -103,6 +105,8 @@ def paged_decode(
         k_format=str(k_format),
         combinadic_read=bool(combinadic_read),
         k_crank=k_crank,
+        bitmap_read=bool(bitmap_read),
+        k_obmp=k_obmp,
         k_fp4_mapscale=k_fp4_mapscale,
         k_fp4_mapcenter=k_fp4_mapcenter,
         kv_outlier_map=bool(kv_outlier_map),
@@ -115,12 +119,12 @@ def paged_decode(
 
 @paged_decode.register_fake
 def _paged_decode_fake(
-    q, k_base, k_scale, k_zp, k_oidx, k_oval, k_crank,
+    q, k_base, k_scale, k_zp, k_oidx, k_oval, k_crank, k_obmp,
     k_fp4_mapscale, k_fp4_mapcenter,
     v_main, v_scale, v_zp, k_tail, v_tail, b_tail_len,
     o, lse, req_to_token, req_to_group, b_seq_len,
     sm_scale, page_size, k_outliers_per_vector, k_format,
-    combinadic_read, kv_outlier_map, kv_int8_scale,
+    combinadic_read, bitmap_read, kv_outlier_map, kv_int8_scale,
     max_seq_len, max_tail_len, packed_start_offset,
 ) -> None:
     # Shape contract only (outputs are in-place; nothing is allocated/returned).
@@ -155,6 +159,7 @@ def paged_decode_segment(
     k_oidx: Optional[torch.Tensor],
     k_oval: Optional[torch.Tensor],
     k_crank: Optional[torch.Tensor],
+    k_obmp: Optional[torch.Tensor],
     k_fp4_mapscale: Optional[torch.Tensor],
     k_fp4_mapcenter: Optional[torch.Tensor],
     v_main: torch.Tensor,
@@ -170,6 +175,7 @@ def paged_decode_segment(
     k_outliers_per_vector: int,
     k_format: str,
     combinadic_read: bool,
+    bitmap_read: bool,
     kv_outlier_map: bool,
     kv_int8_scale: bool,
     max_seg_len: int,
@@ -208,6 +214,8 @@ def paged_decode_segment(
         k_format=str(k_format),
         combinadic_read=bool(combinadic_read),
         k_crank=k_crank,
+        bitmap_read=bool(bitmap_read),
+        k_obmp=k_obmp,
         k_fp4_mapscale=k_fp4_mapscale,
         k_fp4_mapcenter=k_fp4_mapcenter,
         kv_outlier_map=bool(kv_outlier_map),
@@ -221,12 +229,12 @@ def paged_decode_segment(
 
 @paged_decode_segment.register_fake
 def _paged_decode_segment_fake(
-    q, k_base, k_scale, k_zp, k_oidx, k_oval, k_crank,
+    q, k_base, k_scale, k_zp, k_oidx, k_oval, k_crank, k_obmp,
     k_fp4_mapscale, k_fp4_mapcenter,
     v_main, v_scale, v_zp,
     o, lse, req_to_token, req_to_group, b_seg_len,
     sm_scale, page_size, k_outliers_per_vector, k_format,
-    combinadic_read, kv_outlier_map, kv_int8_scale,
+    combinadic_read, bitmap_read, kv_outlier_map, kv_int8_scale,
     max_seg_len, seg_group_base, packed_start_offset,
 ) -> None:
     # Shape contract only (outputs are in-place; nothing allocated/returned).
@@ -284,6 +292,34 @@ def _merge_states_fake(o_parts, lse_parts, valid_lens):
 # python ergonomics — preallocate outputs + accept the pack dict directly
 # ════════════════════════════════════════════════════════════════════════════
 
+
+def _resolve_bitmap_read(planes: dict, override: Optional[bool]) -> bool:
+    """Should the kernel read the STORED flat bitmask (``k_obmp``) as its index source?
+
+    DEFAULT = follow the pack: a plane dict written with ``outlier_repr="bitmap"``
+    carries ``k_obmp`` and NO ``k_oidx``, so reading the bitmap is the only correct
+    decode for it — inferring it here is what makes the repr end-to-end selectable
+    rather than a knob the caller must remember twice. Every other pack (relidx7, the
+    DEFAULT, and combinadic) infers False and takes the byte-identical path it always
+    took. An explicit ``bitmap_read=`` overrides the inference.
+
+    LOUD, NOT SILENT: asking for the bitmap read without a ``k_obmp`` plane raises here
+    with the fix named, rather than letting the kernel fall through to a relidx7 plane
+    that this pack does not have.
+    """
+    want = (str(planes.get("outlier_repr", "relidx7")).lower() == "bitmap") \
+        if override is None else bool(override)
+    if want and int(planes.get("outliers_per_vector", 0)) > 0 \
+            and planes.get("k_obmp") is None:
+        raise ValueError(
+            "bitmap_read requires the k_obmp flat-bitmask plane, which this pack does "
+            "not carry (outlier_repr="
+            f"{str(planes.get('outlier_repr', 'relidx7'))!r}). Fix: pack with "
+            "ommx_pack_kv_canonical_block(..., outlier_repr='bitmap') or pass "
+            "bitmap_read=False.")
+    return want
+
+
 def ommx_paged_decode(
     q: torch.Tensor,
     planes: dict,
@@ -298,6 +334,7 @@ def ommx_paged_decode(
     max_seq_len: Optional[int] = None,
     max_tail_len: Optional[int] = None,
     combinadic_read: bool = False,
+    bitmap_read: Optional[bool] = None,
     packed_start_offset: int = 0,
     req_to_token: Optional[torch.Tensor] = None,
     req_to_group: Optional[torch.Tensor] = None,
@@ -312,6 +349,10 @@ def ommx_paged_decode(
     (single-request block); serving callers pass their real page/group tables.
     ``max_seq_len`` / ``max_tail_len`` default to ``b_seq_len.max()`` /
     ``b_tail_len.max()`` — pass explicit ints for CUDA-graph capture.
+
+    ``bitmap_read`` defaults to ``None`` = infer from the pack's ``outlier_repr``
+    (``"bitmap"`` -> read the stored ``k_obmp`` flat bitmask; anything else -> the
+    unchanged relidx7/combinadic path). See :func:`_resolve_bitmap_read`.
     """
     b, hq, dv = int(q.shape[0]), int(q.shape[1]), int(q.shape[-1])
     if out is None:
@@ -331,6 +372,7 @@ def ommx_paged_decode(
         q,
         planes["k_base"], planes["k_scale"], planes["k_zp"],
         planes.get("k_oidx"), planes.get("k_oval"), planes.get("k_crank"),
+        planes.get("k_obmp"),
         planes.get("k_fp4_mapscale"), planes.get("k_fp4_mapcenter"),
         planes["v_main"], planes["v_scale"], planes["v_zp"],
         k_tail, v_tail, b_tail_len,
@@ -339,6 +381,7 @@ def ommx_paged_decode(
         float(sm_scale), int(planes["page_size"]),
         int(planes["outliers_per_vector"]), str(planes["k_format"]),
         bool(combinadic_read),
+        _resolve_bitmap_read(planes, bitmap_read),
         bool(planes.get("kv_outlier_map", False)),
         bool(planes.get("kv_int8_scale", False)),
         int(max_seq_len), int(max_tail_len),
@@ -358,6 +401,7 @@ def ommx_paged_decode_segment(
     lse_out: Optional[torch.Tensor] = None,
     max_seg_len: Optional[int] = None,
     combinadic_read: bool = False,
+    bitmap_read: Optional[bool] = None,
     packed_start_offset: int = 0,
     req_to_token: Optional[torch.Tensor] = None,
     req_to_group: Optional[torch.Tensor] = None,
@@ -369,6 +413,7 @@ def ommx_paged_decode_segment(
     the segment's UN-MERGED ``(o [B,Hq,Dv], lse [B,Hq])``. Stack each segment's pair
     and combine with ``merge_attention_states`` (see integration.common.cascade).
     ``b_seg_len`` is the segment's packed token count (group-aligned at the base).
+    ``bitmap_read`` defaults to ``None`` = infer from the pack's ``outlier_repr``.
     """
     b, hq, dv = int(q.shape[0]), int(q.shape[1]), int(q.shape[-1])
     if out is None:
@@ -386,6 +431,7 @@ def ommx_paged_decode_segment(
         q,
         planes["k_base"], planes["k_scale"], planes["k_zp"],
         planes.get("k_oidx"), planes.get("k_oval"), planes.get("k_crank"),
+        planes.get("k_obmp"),
         planes.get("k_fp4_mapscale"), planes.get("k_fp4_mapcenter"),
         planes["v_main"], planes["v_scale"], planes["v_zp"],
         out, lse_out,
@@ -393,6 +439,7 @@ def ommx_paged_decode_segment(
         float(sm_scale), int(planes["page_size"]),
         int(planes["outliers_per_vector"]), str(planes["k_format"]),
         bool(combinadic_read),
+        _resolve_bitmap_read(planes, bitmap_read),
         bool(planes.get("kv_outlier_map", False)),
         bool(planes.get("kv_int8_scale", False)),
         int(max_seg_len), int(seg_group_base),

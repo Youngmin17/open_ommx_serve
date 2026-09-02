@@ -17,10 +17,26 @@ QUANTIZATION (the canonical ABI v1):
   * V — per-TOKEN axis, vector = (token t, 32-channel group): plain affine RTN over
     ALL lanes, no outliers (the spec-compliant ≤3-bit i2 capacity path).
 
+OUTLIER-POSITION STORAGE — three membership-EQUIVALENT encodings of one logical
+format (the paper's platform-invariant format claim, item B3). Selected by
+``outlier_repr``; all three share the SAME ``k_oval`` FP4 nibble stream in ascending
+position order, so they dequantize to bit-identical values:
+
+  * ``relidx7`` (DEFAULT, unchanged) — 7-bit LSB-first local token index per outlier
+    slot, ``ceil(7k/8)`` bytes/frame in ``k_oidx``.
+  * ``combinadic`` — the information-theoretic floor, one ``ceil(log2 C(vl,k))``-bit
+    rank per frame in ``k_crank``.
+  * ``bitmap`` — the FLAT BITMASK the ICCAD paper describes for the GPU
+    implementation ("positions are stored as a flat bitmask, N bits per group"):
+    ``ceil(vl/8)`` bytes/frame in ``k_obmp``, one bit per token position, LSB-first.
+    Cost is FLAT in k (1.0 bit/element at any vl that is a multiple of 8) instead of
+    relidx7's 7k/vl, so it is CHEAPER than relidx7 above the 1/7 = 14.3% density
+    crossover — at the canonical recipe (vl=32, k=6) it is 32 bits/frame vs relidx7's
+    48. Decode is a single bit-test for membership plus a prefix-popcount for the
+    nibble ordinal (law #15), which is why the kernel wants it.
+
 DROPPED vs the source adapter (refuted/experimental): hmask2 / hmask2_tile128
-two-level byte-mask, standalone bitmap word plane, int8 pow2 scale + int8 zp,
-use_pow2 magnitude path. Only relidx7 (default) and combinadic outlier storage
-remain — they are membership-equivalent and decode bit-identically.
+two-level byte-mask, int8 pow2 scale + int8 zp, use_pow2 magnitude path.
 """
 from __future__ import annotations
 
@@ -28,14 +44,48 @@ from typing import Any
 
 import torch
 
+# ── OMMX_RECIPE resolution (see recipes.resolve_env for the model + why) ─────────
+#
+# Resolution model (a): every reader of a recipe-controlled env var expands
+# ``OMMX_RECIPE`` itself, via this idempotent call, BEFORE it reads ``os.environ``.
+# Before this, ``OMMX_RECIPE`` was expanded only inside
+# ``integration/vllm/config.resolve_serving_config``; the raw ``os.environ.get``
+# reads below therefore ignored a named preset in any process where that call had
+# not already happened — silently, with a plausible shipped-recipe answer. The knobs
+# read raw in this file are recipe-controlled: both registered KV presets set
+# ``OMMX_KV_RING=1``, ``OMMX_KV_GPU_PACK=1`` and ``OMMX_KV_OUTLIER_MAP=1``, none of
+# which is the bare default (ring in particular defaults OFF = the full bf16 shadow).
+# The call is a no-op single dict lookup when OMMX_RECIPE is unset, never overwrites
+# an explicitly-set var, and raises (listing the known names) on an unknown one.
+#
+# The import is LAZY (inside the wrapper, not at module scope) for one measured reason:
+# ``ommx_gpu_serve/__init__`` imports this module, so a module-scope
+# ``from ..recipes import ...`` puts ``ommx_gpu_serve.recipes`` in sys.modules DURING
+# the package __init__, and ``python3 -m ommx_gpu_serve.recipes`` — the documented CLI,
+# and what ``run.sh --recipe`` shells out to — then emits
+# "RuntimeWarning: 'ommx_gpu_serve.recipes' found in sys.modules after import of
+# package 'ommx_gpu_serve' ... this may result in unpredictable behaviour" on every
+# invocation. Deferring the import to the first CALL keeps that command clean.
+
+
+def _resolve_recipe_env():
+    from ..recipes import resolve_env
+    return resolve_env()
+
+
 from .codec import (
+    bitmap_index_bytes,
     combinadic_decode,
     combinadic_encode,
     combinadic_index_bytes,
     decode_fp4_e2m1f,
     encode_fp4_e2m1f,
+    pack_bitmap_rows,
     pack_relidx7,
+    unpack_bitmap_rows,
 )
+
+OUTLIER_REPRS = ("relidx7", "combinadic", "bitmap")
 
 CANONICAL_GROUP_TOKENS = 32     # K token-group (one scale per channel per 32 tokens)
 CANONICAL_GROUP_CHANNELS = 32   # V channel-group (one scale per token per 32 channels)
@@ -169,6 +219,59 @@ def _unpack_combinadic_frames(rank_bytes, k: int, vl: int = CANONICAL_GROUP_TOKE
     return out
 
 
+# ── bitmap outlier sidecar (the paper's flat N-bit-per-group mask) ───────────
+
+def _pack_bitmap_frames(oidx, oval, vl: int = CANONICAL_GROUP_TOKENS,
+                        oval_bits: int = 4):
+    """(int16 idx, uint8 val) [D, nblk, K] -> flat-bitmask sidecar.
+
+    Returns ``(bmp_bytes, val_packed, field_bytes)``: one ``ceil(vl/8)``-byte FLAT
+    BITMASK per (channel, group) frame — bit ``p`` set iff token position ``p`` of that
+    frame is an outlier, LSB-first within each byte — plus the SAME outlier-value stream
+    relidx7 and combinadic use (ascending-position order, FP4 nibble for
+    ``oval_bits=4``). This is the representation the ICCAD paper attributes to the GPU
+    implementation ("positions are stored as a flat bitmask (N bits per group)").
+
+    Why the value stream needs no reordering: ``pack_bitmap_rows`` writes bit ``p`` for
+    the p-th outlier column, and the ascending scan of set bits is exactly the ascending
+    column order the caller already sorted ``oidx`` into — so slot ``s`` of ``k_oval``
+    belongs to the s-th set bit, whose ordinal the kernel recovers as the popcount of
+    all lower set bits. That is the whole decode; there is no index arithmetic.
+
+    DEVICE-CLEAN (unlike ``_pack_combinadic_frames``, which is a python big-int loop):
+    the pack is pure vectorized bit-twiddling, so it runs on GPU when fed GPU tensors
+    and is BIT-IDENTICAL to the CPU pack — the on-device regroup path keeps working.
+
+    An empty slot (``idx < 0``) RAISES: relidx7 pads an empty slot with a duplicate of a
+    real one (value-neutral under its first-match-wins splice), but a duplicate in a
+    bitmap collapses to one bit while ``k_oval`` still carries k nibbles, which would
+    shift every popcount-rank after it. The canonical top-k always fills every frame.
+    """
+    D, nblk, K = (int(s) for s in oidx.shape)
+    field_bytes = bitmap_index_bytes(vl)
+    idx = oidx.to(torch.int64)
+    if K > 0 and bool((idx < 0).any()):
+        raise ValueError(
+            "outlier_repr='bitmap' cannot encode an empty outlier slot (a flat bitmask "
+            "has no sentinel and a duplicated position would desynchronize the k_oval "
+            "popcount-rank). The canonical top-k select always fills every frame.")
+    bmp = pack_bitmap_rows(idx, vl) if K > 0 else torch.zeros(
+        D, nblk, field_bytes, dtype=torch.uint8, device=idx.device)
+    val_packed = _pack_oval_stream(oval.to(torch.int64), K, oval_bits)
+    return bmp.contiguous(), val_packed.contiguous(), field_bytes
+
+
+def _unpack_bitmap_frames(bmp_bytes, k: int, vl: int = CANONICAL_GROUP_TOKENS):
+    """Inverse of :func:`_pack_bitmap_frames`'s index half -> int64 [D, nblk, k].
+
+    The ascending set positions of each frame; position ``out[..., s]`` owns nibble
+    ``s`` of ``k_oval`` (the popcount-rank identity the kernel decode mirrors).
+    """
+    if k <= 0:
+        return torch.zeros(*bmp_bytes.shape[:-1], 0, dtype=torch.int64)
+    return unpack_bitmap_rows(bmp_bytes, vl, k)
+
+
 # ════════════════════════════════════════════════════════════════════════════
 # canonical KV pack
 # ════════════════════════════════════════════════════════════════════════════
@@ -203,20 +306,42 @@ def ommx_pack_kv_canonical_block(
       * ``"i2f4"`` / ``"itf4"`` (default) — INT2 base (2-bit, ``D//4`` bytes) + FP4
         e2m1f outlier (4-bit nibble). The spec-compliant ≤3-bit path.
 
-    ``outlier_repr`` ∈ {"relidx7" (default), "combinadic"} chooses the outlier index
-    storage; both decode bit-identically (membership-equivalent). ``outlier_select``
+    ``outlier_repr`` ∈ {"relidx7" (default), "combinadic", "bitmap"} chooses the outlier
+    INDEX storage plane — ``k_oidx`` (7k bits/frame), ``k_crank`` (the combinadic floor)
+    or ``k_obmp`` (the paper's flat ceil(vl/8)-byte bitmask, 1.0 bit/element flat in k).
+    All three are membership-equivalent and decode bit-identically; only the index plane
+    and its size change, never the values. ``outlier_select``
     ∈ {"abs" (top-|W|), "signed" (top + bottom tail)} chooses the saliency mask.
     Returns the plane dict of the kernel ABI plus identity ``req_to_token`` /
     ``req_to_group`` tables for a single-request block.
 
-    THE ≤3-bit KV lever (``group_tokens=64`` + ``kv_outlier_map=False``):
-      * VL=64 amortizes the bf16 zp (16b) over 64 tokens (0.25b -> 0.0625b/weight) and the
-        bf16/int8 scale likewise, so the base-plane overhead per K weight collapses.
+    THE LOW-BIT KV LEVER (``group_tokens=64`` + ``group_channels=64`` + ``kv_outlier_map=False``,
+    with ``use_pow2=True`` so the scale is an int8 pow2 exponent). It is a DIFFERENT recipe
+    from the canonical published one (gt=gc=32, map ON) and has no accuracy number here:
+      * gt=64 halves the per-K-weight cost of both per-group params against gt=32:
+        int8 scale 8/64 = 0.125 b/wt, bf16 zp 16/64 = 0.25 b/wt.
       * ``kv_outlier_map=False`` (env ``OMMX_KV_OUTLIER_MAP=0``) takes the BASE-SHARED outlier
         path (``norm=(w-zp)/scale``; the FP4 code rides the base scale/zp at dequant, NO
-        per-group mapscale/mapcenter), dropping the dedicated map's two bf16 params.
-      * Net (relidx7 npv≈ a few of 64): K = base2 + scale + zp/64 + relidx7 idx + FP4 0.375
-        ≈ 2.9 bit/weight ≤ 3; V (no outliers) ≈ base2 + scale + zp/VL ≈ 2.4 bit/weight.
+        per-group mapscale/mapcenter), dropping the dedicated map's two bf16 planes
+        (2 x 16/64 = 0.5 b/wt off K).
+      * Net at the canonical ``outliers_per_vector=6``, relidx7 — the exact per-plane terms
+        ``integration.vllm.packed_only.kv_bits_breakdown`` returns for this recipe, which is
+        the authority for every bit figure in this repo (head_dim cancels)::
+
+            K = 2 (k_base) + 0.125 (k_scale) + 0.25 (k_zp)
+                + 0.75 (k_oidx, relidx7 6 B/group) + 0.375 (k_oval, FP4 3 B/group)
+              = 3.500 bit/weight
+            V = 2 (v_main) + 0.125 (v_scale) + 0.25 (v_zp)   = 2.375 bit/weight
+            K+V = 5.875 bit per (K,V) PAIR -> 2.938 AVERAGE, 5.45x vs bf16's 32
+
+        ONLY THE PAIR AVERAGE IS UNDER 3. K alone is 3.5 bit/weight on this lever and is
+        never 2.9 at any outlier count (k=0 -> 2.375, 1 -> 2.625, 2 -> 2.750, 3 -> 3.000,
+        6 -> 3.500), so a "≤3 bit/weight" claim about K is wrong — quote the pair average
+        or the per-plane table. Conflating the two is what produced the retracted
+        "≤3-bit" headline; ``kv_bits_breakdown`` reports both figures for that reason.
+      * ``group_channels=64`` is load-bearing for the V term (V amortizes its scale/zp over
+        the CHANNEL group). At the canonical gc=32 with the same gt=64: V = 2.750 and
+        K+V = 6.250 bit/pair.
       The base-shared dequant is reproduced bit-exactly by :func:`dequant_kv_canonical`
       (``kv_outlier_map=False`` branch: ``dq_o = fp4·scale + zp``) -> the recipe is its OWN
       fakequant oracle (NOT the dedicated-map recipe; the two are different number systems).
@@ -225,14 +350,20 @@ def ommx_pack_kv_canonical_block(
         device = "cpu"
     if scale_dtype is None:
         scale_dtype = torch.bfloat16
-    if str(outlier_repr).lower() not in ("relidx7", "combinadic"):
-        raise ValueError(f"outlier_repr must be relidx7|combinadic; got {outlier_repr!r}")
+    if str(outlier_repr).lower() not in OUTLIER_REPRS:
+        raise ValueError(
+            f"outlier_repr must be one of {OUTLIER_REPRS}; got {outlier_repr!r}")
     kfmt = str(k_format).lower()
     if kfmt not in ("i2f4", "itf4"):
         raise ValueError(f"k_format must be i2f4|itf4; got {k_format!r}")
     # KV dedicated FP4 outlier map (weight-space center/span, fakequant-EXACT):
     # gated by ``kv_outlier_map`` (kwarg) or env OMMX_KV_OUTLIER_MAP. Default ON for
     # the FP4 outlier formats (i2f4/itf4).
+    # OMMX_RECIPE -> os.environ before either raw read below. Both presets name
+    # OMMX_KV_OUTLIER_MAP explicitly (the registry refuses to let a published recipe
+    # ride on a default holding still), so a preset that reached config.py but not
+    # this packer could pack planes the accounting did not price.
+    _resolve_recipe_env()
     if kv_outlier_map is None:
         import os as _os
         _raw = _os.environ.get("OMMX_KV_OUTLIER_MAP")
@@ -319,12 +450,14 @@ def ommx_pack_kv_canonical_block(
     zp = min_v.to(scale_dtype).to(torch.float32)
     code = torch.round((gw - zp) / scale).clamp(0, k_code_max).to(torch.int32)  # [H,D,G,32]
 
-    k_oidx = k_oval = k_crank = None
+    k_oidx = k_oval = k_crank = k_obmp = None
     k_field_bytes = 0
     k_fp4_mapscale = k_fp4_mapcenter = None
     if use_outlier_map and k > 0:
         # KV DEDICATED FP4 OUTLIER MAP (weight-space center/span) — BIT-IDENTICAL to
-        # fakequant quant_function.py:357-375 (outlier_method="fp4"). The base affine
+        # fakequant ``quant_function._apply_group_quantization_vectorized``, its
+        # ``outlier_method == "fp4"`` branch (cited by symbol: the old line range
+        # 357-375 pointed at the base-affine scale block, not at this math). The base affine
         # scale/zp protect the NON-outlier lanes (3 levels at i2); the FP4 outlier is
         # mapped over a DEDICATED [-6, 6] window centered on the OUTLIER subset's own
         # min/max so the e2m1f code's 6.0 ceiling spans the real outlier magnitude
@@ -360,11 +493,22 @@ def ommx_pack_kv_canonical_block(
         # slot-major frames [G, H, D, k] (group slot = leading axis, like pages)
         oidx = oidx.permute(2, 0, 1, 3).contiguous().to(torch.int16)
         oval = oval.permute(2, 0, 1, 3).contiguous().to(torch.uint8)
-        if str(outlier_repr).lower() == "combinadic":
+        repr_l = str(outlier_repr).lower()
+        if repr_l == "combinadic":
             cr, pv, fb = _pack_combinadic_frames(
                 oidx.reshape(G, H * D, k), oval.reshape(G, H * D, k), vl=gt,
                 oval_bits=oval_bits)
             k_crank = cr.reshape(G, H, D, -1).contiguous()
+            k_oval = pv.reshape(G, H, D, -1).contiguous()
+            k_field_bytes = fb
+        elif repr_l == "bitmap":
+            # FLAT BITMASK (paper item B4 / Fig 6 "Outlier Bitmask"): ceil(gt/8) bytes
+            # per (group, head, channel) frame, one bit per token position. Sized by the
+            # GROUP (gt), NOT by k — that flatness is the whole point of the encoding.
+            bm, pv, fb = _pack_bitmap_frames(
+                oidx.reshape(G, H * D, k), oval.reshape(G, H * D, k), vl=gt,
+                oval_bits=oval_bits)
+            k_obmp = bm.reshape(G, H, D, -1).contiguous()
             k_oval = pv.reshape(G, H, D, -1).contiguous()
             k_field_bytes = fb
         else:
@@ -428,6 +572,7 @@ def ommx_pack_kv_canonical_block(
         "k_scale": _to(k_scale), "k_zp": _to(k_zp),
         "k_oidx": _to(k_oidx), "k_oval": _to(k_oval),
         "k_crank": _to(k_crank),
+        "k_obmp": _to(k_obmp),
         "k_fp4_mapscale": _to(k_fp4_mapscale),
         "k_fp4_mapcenter": _to(k_fp4_mapcenter),
         "k_field_bytes": int(k_field_bytes),
@@ -499,9 +644,11 @@ def dequant_kv_canonical(planes):
     """Decode canonical planes -> fp32 ``(K_dq, V_dq)`` [T, H, D] — the test oracle.
 
     Reconstructs exactly what the kernel computes per element (base
-    ``code·scale+zp``; outlier ``fp4_level·scale+zp`` spliced via the relidx7 OR
-    combinadic sidecar), decoding the REAL packed planes (2-bit base + sidecar) so
-    the full storage codec is in the loop.
+    ``code·scale+zp``; outlier ``fp4_level·scale+zp`` spliced via the relidx7,
+    combinadic OR flat-bitmap sidecar), decoding the REAL packed planes (2-bit base +
+    sidecar) so the full storage codec is in the loop. All three index reprs land on the
+    same ``(position, fp4 level)`` pairs, so the returned tensors are bit-identical
+    across them — the membership-equivalence gate in tests/test_bitmap_outlier.py.
     """
     T = int(planes["num_tokens"]); H = int(planes["n_kv_heads"])
     D = int(planes["head_dim"]); G = int(planes["n_groups"])
@@ -527,11 +674,18 @@ def dequant_kv_canonical(planes):
         oval_p = planes["k_oval"].cpu().to(torch.int64)
         ov = torch.stack(
             [(oval_p[..., s // 2] >> (4 * (s % 2))) & 0xF for s in range(k)], dim=-1)  # [G,H,D,k]
-        if str(planes.get("outlier_repr", "relidx7")) == "combinadic":
+        repr_l = str(planes.get("outlier_repr", "relidx7"))
+        if repr_l == "combinadic":
             crank = planes["k_crank"].cpu()
             fb = int(crank.shape[-1])
             oidx = _unpack_combinadic_frames(
                 crank.reshape(G * H * D, 1, fb), k, vl=gt).reshape(G, H, D, k)
+        elif repr_l == "bitmap":
+            # FLAT BITMASK decode: ascending set-bit positions. The s-th ascending
+            # position owns nibble s of k_oval — the SAME (position, value) pairing the
+            # other two reprs produce, which is why all three dequant bit-identically.
+            oidx = _unpack_bitmap_frames(
+                planes["k_obmp"].cpu(), k, vl=gt)                   # [G, H, D, k]
         else:
             oidx = _unpack_relidx7_streams(planes["k_oidx"].cpu(), k)  # [G, H, D, k]
         lvl = decode_fp4_e2m1f(ov.to(torch.uint8))                 # [G, H, D, k] fp32
@@ -570,6 +724,6 @@ def dequant_kv_canonical(planes):
 
 
 __all__ = [
-    "CANONICAL_GROUP_TOKENS", "CANONICAL_GROUP_CHANNELS",
+    "CANONICAL_GROUP_TOKENS", "CANONICAL_GROUP_CHANNELS", "OUTLIER_REPRS",
     "ommx_pack_kv_canonical_block", "dequant_kv_canonical",
 ]

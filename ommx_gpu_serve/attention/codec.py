@@ -319,6 +319,83 @@ def bitmap_rows_to_positions(bitmap_u8, n_positions: int):
     return bits.reshape(R, fb * 8)[:, : int(n_positions)].to(torch.bool)   # [R, n]
 
 
+def pack_bitmap_rows(columns, n_positions: int):
+    """Vectorized batch pack: positions ``[..., k]`` int -> uint8 bitmap ``[..., ceil(n/8)]``.
+
+    The tensor twin of :func:`pack_bitmap_row` — the form the KV packer needs, where one
+    "row" is one (group, head, channel) frame and there are G*H*D of them. Position ``p``
+    lands in byte ``p>>3`` at bit ``p&7`` (LSB-first, IDENTICAL byte layout to
+    ``pack_bitmap_row``; that equality is a shipped gate in tests/test_bitmap_outlier.py).
+
+    DEVICE-CLEAN: every arange/constant is built on the INPUT tensor's device and the whole
+    body is integer bit-twiddling, so a CUDA-resident pack is BIT-IDENTICAL to the CPU one
+    (the same property ``pack.py::_pack_relidx7_frames`` relies on for the device-side
+    regroup). NO python per-position loop (law #15: one wide op, not a per-slot scan).
+
+    LOUD, NEVER SILENT: the bitmap has no way to express "this slot is empty" and no way
+    to express "this position appears twice" — a duplicate would collapse to ONE set bit
+    while the shared ``k_oval`` nibble stream still carries k entries, silently shifting
+    every popcount-rank after it. So an out-of-range, negative, or duplicated position
+    RAISES here rather than producing a frame that decodes to the wrong values. (relidx7
+    tolerates a duplicate because its splice is first-match-wins per slot; the bitmap's
+    rank decode does not, which is exactly why this check exists.)
+    """
+    cols = columns.to(torch.int64)
+    n = int(n_positions)
+    fb = bitmap_index_bytes(n)
+    dev = cols.device
+    k = int(cols.shape[-1])
+    if k == 0:
+        return torch.zeros(*cols.shape[:-1], fb, dtype=torch.uint8, device=dev)
+    if bool((cols < 0).any()) or bool((cols >= n).any()):
+        raise ValueError(
+            f"bitmap positions must lie in [0,{n}); got min={int(cols.min())} "
+            f"max={int(cols.max())}. A negative entry is the packer's empty-slot "
+            "sentinel, which the flat bitmask cannot represent.")
+    # occupancy over the FULL byte-padded universe, then fold 8 bits per byte.
+    occ = torch.zeros(*cols.shape[:-1], fb * 8, dtype=torch.int64, device=dev)
+    occ.scatter_(-1, cols, 1)                       # duplicates collapse (idempotent)
+    if bool((occ.sum(-1) != k).any()):
+        raise ValueError(
+            "bitmap frame lost a position: the k outlier columns of a frame must be "
+            "DISTINCT (a duplicate sets one bit but leaves k nibbles in k_oval, which "
+            "would shift every popcount-rank after it).")
+    byte_w = (1 << torch.arange(8, dtype=torch.int64, device=dev))
+    return (occ.reshape(*cols.shape[:-1], fb, 8) * byte_w).sum(-1).to(torch.uint8)
+
+
+def unpack_bitmap_rows(bitmap_u8, n_positions: int, k: int):
+    """Inverse of :func:`pack_bitmap_rows`: uint8 ``[..., ceil(n/8)]`` -> int64 ``[..., k]``.
+
+    Returns the ASCENDING set positions of each row — i.e. exactly the order the shared
+    ``k_oval`` FP4 nibble stream is written in, so slot ``s`` of the value stream belongs
+    to position ``out[..., s]``. That identity IS the rank rule the kernel exploits
+    (a set bit's nibble ordinal == the popcount of all lower set bits).
+
+    A row with fewer than ``k`` set bits RAISES: it means the stored bitmap and the stored
+    value stream disagree about how many outliers this frame has, and decoding it would
+    quietly read a neighbouring outlier's nibble.
+    """
+    n = int(n_positions)
+    k = int(k)
+    bm = bitmap_u8.to(torch.int64)
+    fb = int(bm.shape[-1])
+    dev = bm.device
+    if k == 0:
+        return torch.zeros(*bm.shape[:-1], 0, dtype=torch.int64, device=dev)
+    bits = (bm.unsqueeze(-1) >> torch.arange(8, dtype=torch.int64, device=dev)) & 1
+    occ = bits.reshape(*bm.shape[:-1], fb * 8)[..., :n].to(torch.bool)   # [..., n]
+    idx = torch.arange(n, dtype=torch.int64, device=dev).expand_as(occ)
+    # ascending set positions first, unset lanes pushed to the sentinel n (same
+    # "sort a masked column index" idiom pack.py uses for the signed outlier select).
+    key = torch.where(occ, idx, torch.full_like(idx, n)).sort(-1)[0][..., :k]
+    if bool((key >= n).any()):
+        raise ValueError(
+            f"bitmap frame has fewer than k={k} set bits (popcount mismatch): the "
+            "stored bitmap and the k_oval nibble stream disagree on the outlier count.")
+    return key
+
+
 # ════════════════════════════════════════════════════════════════════════════
 # sparse-correction CSR delta  (from ommx.quant.sparse_correction)
 # ════════════════════════════════════════════════════════════════════════════
@@ -362,7 +439,7 @@ __all__ = [
     "combinadic_to_bitmap", "bitmap_to_positions",
     # bitmap outlier index (per-row 1-bit-per-position, popcount-rank)
     "BITMAP_BITS", "bitmap_index_bytes", "pack_bitmap_row", "unpack_bitmap_row",
-    "bitmap_rows_to_positions",
+    "bitmap_rows_to_positions", "pack_bitmap_rows", "unpack_bitmap_rows",
     # sparse correction
     "csr_to_correction_bitmap",
 ]
