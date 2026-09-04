@@ -1,0 +1,330 @@
+{
+  "gpu": "H200 NVL",
+  "ctxs": [
+    1024,
+    4096,
+    8192,
+    16384,
+    32768,
+    65536
+  ],
+  "methods": {
+    "ommx_vllm": {
+      "tpot": [
+        7.0994,
+        8.6049,
+        11.3395,
+        18.2065,
+        30.1967,
+        51.4164
+      ],
+      "peak": [
+        null,
+        null,
+        null,
+        null,
+        null,
+        null
+      ],
+      "provenance": {
+        "source_file": "ommx_vllm.json",
+        "dtype": "bf16",
+        "arm_label": null,
+        "payload_method": "ommx_vllm",
+        "arm": "abl_attn",
+        "attention_backend": "CUSTOM"
+      },
+      "breakdown": {
+        "base": [
+          5.8791,
+          7.1535,
+          8.1928,
+          8.1368,
+          8.2385,
+          8.124
+        ],
+        "outlier": [
+          0.0,
+          0.0,
+          1.0218,
+          6.2187,
+          15.8369,
+          32.3094
+        ],
+        "unpack": [
+          0.051,
+          0.1212,
+          0.2852,
+          0.8641,
+          1.6626,
+          3.4612
+        ],
+        "scale": [
+          0.7618,
+          1.0042,
+          1.4495,
+          2.5506,
+          4.09,
+          7.0583
+        ],
+        "pack": [
+          0.4076,
+          0.326,
+          0.3901,
+          0.4362,
+          0.3687,
+          0.4635
+        ]
+      },
+      "breakdown_raw": {
+        "base": [
+          8.048464,
+          8.198912,
+          8.1928,
+          8.136832,
+          8.238513,
+          8.124014
+        ],
+        "outlier": [
+          -2.619648,
+          -1.257551,
+          1.021792,
+          6.218737,
+          15.836896,
+          32.309391
+        ],
+        "unpack": [
+          0.069776,
+          0.138912,
+          0.285216,
+          0.864096,
+          1.66264,
+          3.461218
+        ],
+        "scale": [
+          1.04288,
+          1.15096,
+          1.449504,
+          2.55056,
+          4.089952,
+          7.058273
+        ],
+        "pack": [
+          0.557968,
+          0.373648,
+          0.390144,
+          0.43624,
+          0.368735,
+          0.463537
+        ]
+      },
+      "breakdown_meta": {
+        "method": "differential-ablation",
+        "clamped_negative": true,
+        "renormalized_to_total": true,
+        "residual_bucket": "outlier",
+        "segments": [
+          "base",
+          "outlier",
+          "unpack",
+          "scale",
+          "pack"
+        ],
+        "full_arm": "abl_attn",
+        "base_arm": "abl_attn_no_all",
+        "diff_arms": {
+          "unpack": "abl_attn_no_unpack",
+          "scale": "abl_attn_no_dequant",
+          "pack": "abl_attn_skipwrite"
+        },
+        "note": "breakdown = plotted segments (missing arm -> 0.0, negative -> 0.0, then x renorm_factor so the five sum to tpot_ms). breakdown_raw = the same differentials RAW: unclamped, unnormalized, null when the arm is missing. base/outlier in `breakdown` are derived from the CLAMPED diffs (historical recipe, kept so the plot is unchanged); in `breakdown_raw` they are derived from the RAW diffs, so the two can disagree whenever a diff was clamped.",
+        "renorm_factor": {
+          "1024": 0.730464,
+          "4096": 0.872491,
+          "8192": 1.0,
+          "16384": 1.0,
+          "32768": 1.0,
+          "65536": 1.0
+        },
+        "clamped_sum_ms": {
+          "1024": 9.719088,
+          "4096": 9.862431,
+          "8192": 11.339456,
+          "16384": 18.206464,
+          "32768": 30.196735,
+          "65536": 51.416433
+        },
+        "clamped_segments": {
+          "1024": [
+            "outlier"
+          ],
+          "4096": [
+            "outlier"
+          ],
+          "8192": [],
+          "16384": [],
+          "32768": [],
+          "65536": []
+        },
+        "missing_arms": {},
+        "arm_tpot_ms": {
+          "1024": {
+            "abl_attn": 7.09944,
+            "abl_attn_no_all": 8.606432,
+            "abl_attn_no_unpack": 7.029664,
+            "abl_attn_no_dequant": 6.05656,
+            "abl_attn_skipwrite": 6.541472
+          },
+          "4096": {
+            "abl_attn": 8.60488,
+            "abl_attn_no_all": 8.57256,
+            "abl_attn_no_unpack": 8.465968,
+            "abl_attn_no_dequant": 7.45392,
+            "abl_attn_skipwrite": 8.231232
+          },
+          "8192": {
+            "abl_attn": 11.339456,
+            "abl_attn_no_all": 8.582944,
+            "abl_attn_no_unpack": 11.05424,
+            "abl_attn_no_dequant": 9.889952,
+            "abl_attn_skipwrite": 10.949312
+          },
+          "16384": {
+            "abl_attn": 18.206464,
+            "abl_attn_no_all": 8.573072,
+            "abl_attn_no_unpack": 17.342368,
+            "abl_attn_no_dequant": 15.655904,
+            "abl_attn_skipwrite": 17.770224
+          },
+          "32768": {
+            "abl_attn": 30.196735,
+            "abl_attn_no_all": 8.607248,
+            "abl_attn_no_unpack": 28.534096,
+            "abl_attn_no_dequant": 26.106784,
+            "abl_attn_skipwrite": 29.828
+          },
+          "65536": {
+            "abl_attn": 51.416433,
+            "abl_attn_no_all": 8.587552,
+            "abl_attn_no_unpack": 47.955215,
+            "abl_attn_no_dequant": 44.35816,
+            "abl_attn_skipwrite": 50.952896
+          }
+        },
+        "source_arm": {
+          "1024": "abl_attn",
+          "4096": "abl_attn",
+          "8192": "abl_attn",
+          "16384": "abl_attn",
+          "32768": "abl_attn",
+          "65536": "abl_attn"
+        },
+        "no_breakdown": {}
+      }
+    },
+    "vllm_bf16": {
+      "tpot": [
+        3.5171,
+        3.9931,
+        4.7672,
+        6.1238,
+        8.7879,
+        14.214
+      ],
+      "peak": [
+        null,
+        null,
+        null,
+        null,
+        null,
+        null
+      ],
+      "provenance": {
+        "source_file": "vllm_bf16.json",
+        "dtype": "bf16",
+        "arm_label": null,
+        "payload_method": "vllm_triton",
+        "arm": "TRITON",
+        "attention_backend": "TRITON_ATTN"
+      }
+    },
+    "vllm_flash_attn": {
+      "tpot": [
+        3.5859,
+        3.6476,
+        3.8312,
+        4.0869,
+        4.6019,
+        5.7238
+      ],
+      "peak": [
+        null,
+        null,
+        null,
+        null,
+        null,
+        null
+      ],
+      "provenance": {
+        "source_file": "vllm_flash_attn.json",
+        "dtype": "bf16",
+        "arm_label": null,
+        "payload_method": "vllm_flash_attn",
+        "arm": "FA",
+        "attention_backend": "FLASH_ATTN"
+      }
+    },
+    "kivi_hf": {
+      "tpot": [
+        27.4316,
+        27.1667,
+        33.266,
+        53.042,
+        89.9392,
+        163.8256
+      ],
+      "peak": [
+        15.7613,
+        18.0557,
+        21.1172,
+        27.2384,
+        39.4809,
+        63.9658
+      ],
+      "provenance": {
+        "source_file": "kivi_hf.json",
+        "dtype": "fp16",
+        "arm_label": "kivi (fp16)",
+        "payload_method": "kivi",
+        "arm": null,
+        "attention_backend": null
+      }
+    },
+    "lmdeploy": {
+      "tpot": [
+        3.5558,
+        3.7851,
+        3.8863,
+        4.0456,
+        4.3742,
+        5.0621
+      ],
+      "peak": [
+        null,
+        null,
+        null,
+        null,
+        null,
+        null
+      ],
+      "provenance": {
+        "source_file": "lmdeploy.json",
+        "dtype": "fp16",
+        "arm_label": "lmdeploy W4A16KV4 (AWQ-INT4 weights + 4-bit KV)",
+        "payload_method": "lmdeploy",
+        "arm": null,
+        "attention_backend": null
+      }
+    }
+  }
+}

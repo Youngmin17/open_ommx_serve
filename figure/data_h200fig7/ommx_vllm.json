@@ -1,0 +1,225 @@
+{
+  "method": "ommx_vllm",
+  "arm": "abl_attn",
+  "attention_backend": "CUSTOM",
+  "weights": "bf16",
+  "ctxs": {
+    "1024": {
+      "tpot_ms": 7.0994,
+      "ttft_ms": 71.99379159603268,
+      "peak_gb": null
+    },
+    "4096": {
+      "tpot_ms": 8.6049,
+      "ttft_ms": 157.170146971941,
+      "peak_gb": null
+    },
+    "8192": {
+      "tpot_ms": 11.3395,
+      "ttft_ms": 296.31406819913536,
+      "peak_gb": null
+    },
+    "16384": {
+      "tpot_ms": 18.2065,
+      "ttft_ms": 620.0469048470259,
+      "peak_gb": null
+    },
+    "32768": {
+      "tpot_ms": 30.1967,
+      "ttft_ms": 1450.3947145547718,
+      "peak_gb": null
+    },
+    "65536": {
+      "tpot_ms": 51.4164,
+      "ttft_ms": 3838.158403812209,
+      "peak_gb": null
+    }
+  },
+  "breakdown": {
+    "base": {
+      "1024": 5.8791,
+      "4096": 7.1535,
+      "8192": 8.1928,
+      "16384": 8.1368,
+      "32768": 8.2385,
+      "65536": 8.124
+    },
+    "outlier": {
+      "1024": 0.0,
+      "4096": 0.0,
+      "8192": 1.0218,
+      "16384": 6.2187,
+      "32768": 15.8369,
+      "65536": 32.3094
+    },
+    "unpack": {
+      "1024": 0.051,
+      "4096": 0.1212,
+      "8192": 0.2852,
+      "16384": 0.8641,
+      "32768": 1.6626,
+      "65536": 3.4612
+    },
+    "scale": {
+      "1024": 0.7618,
+      "4096": 1.0042,
+      "8192": 1.4495,
+      "16384": 2.5506,
+      "32768": 4.09,
+      "65536": 7.0583
+    },
+    "pack": {
+      "1024": 0.4076,
+      "4096": 0.326,
+      "8192": 0.3901,
+      "16384": 0.4362,
+      "32768": 0.3687,
+      "65536": 0.4635
+    }
+  },
+  "breakdown_raw": {
+    "base": {
+      "1024": 8.048464,
+      "4096": 8.198912,
+      "8192": 8.1928,
+      "16384": 8.136832,
+      "32768": 8.238513,
+      "65536": 8.124014
+    },
+    "outlier": {
+      "1024": -2.619648,
+      "4096": -1.257551,
+      "8192": 1.021792,
+      "16384": 6.218737,
+      "32768": 15.836896,
+      "65536": 32.309391
+    },
+    "unpack": {
+      "1024": 0.069776,
+      "4096": 0.138912,
+      "8192": 0.285216,
+      "16384": 0.864096,
+      "32768": 1.66264,
+      "65536": 3.461218
+    },
+    "scale": {
+      "1024": 1.04288,
+      "4096": 1.15096,
+      "8192": 1.449504,
+      "16384": 2.55056,
+      "32768": 4.089952,
+      "65536": 7.058273
+    },
+    "pack": {
+      "1024": 0.557968,
+      "4096": 0.373648,
+      "8192": 0.390144,
+      "16384": 0.43624,
+      "32768": 0.368735,
+      "65536": 0.463537
+    }
+  },
+  "breakdown_meta": {
+    "method": "differential-ablation",
+    "clamped_negative": true,
+    "renormalized_to_total": true,
+    "residual_bucket": "outlier",
+    "segments": [
+      "base",
+      "outlier",
+      "unpack",
+      "scale",
+      "pack"
+    ],
+    "full_arm": "abl_attn",
+    "base_arm": "abl_attn_no_all",
+    "diff_arms": {
+      "unpack": "abl_attn_no_unpack",
+      "scale": "abl_attn_no_dequant",
+      "pack": "abl_attn_skipwrite"
+    },
+    "note": "breakdown = plotted segments (missing arm -> 0.0, negative -> 0.0, then x renorm_factor so the five sum to tpot_ms). breakdown_raw = the same differentials RAW: unclamped, unnormalized, null when the arm is missing. base/outlier in `breakdown` are derived from the CLAMPED diffs (historical recipe, kept so the plot is unchanged); in `breakdown_raw` they are derived from the RAW diffs, so the two can disagree whenever a diff was clamped.",
+    "renorm_factor": {
+      "1024": 0.730464,
+      "4096": 0.872491,
+      "8192": 1.0,
+      "16384": 1.0,
+      "32768": 1.0,
+      "65536": 1.0
+    },
+    "clamped_sum_ms": {
+      "1024": 9.719088,
+      "4096": 9.862431,
+      "8192": 11.339456,
+      "16384": 18.206464,
+      "32768": 30.196735,
+      "65536": 51.416433
+    },
+    "clamped_segments": {
+      "1024": [
+        "outlier"
+      ],
+      "4096": [
+        "outlier"
+      ],
+      "8192": [],
+      "16384": [],
+      "32768": [],
+      "65536": []
+    },
+    "missing_arms": {},
+    "arm_tpot_ms": {
+      "1024": {
+        "abl_attn": 7.09944,
+        "abl_attn_no_all": 8.606432,
+        "abl_attn_no_unpack": 7.029664,
+        "abl_attn_no_dequant": 6.05656,
+        "abl_attn_skipwrite": 6.541472
+      },
+      "4096": {
+        "abl_attn": 8.60488,
+        "abl_attn_no_all": 8.57256,
+        "abl_attn_no_unpack": 8.465968,
+        "abl_attn_no_dequant": 7.45392,
+        "abl_attn_skipwrite": 8.231232
+      },
+      "8192": {
+        "abl_attn": 11.339456,
+        "abl_attn_no_all": 8.582944,
+        "abl_attn_no_unpack": 11.05424,
+        "abl_attn_no_dequant": 9.889952,
+        "abl_attn_skipwrite": 10.949312
+      },
+      "16384": {
+        "abl_attn": 18.206464,
+        "abl_attn_no_all": 8.573072,
+        "abl_attn_no_unpack": 17.342368,
+        "abl_attn_no_dequant": 15.655904,
+        "abl_attn_skipwrite": 17.770224
+      },
+      "32768": {
+        "abl_attn": 30.196735,
+        "abl_attn_no_all": 8.607248,
+        "abl_attn_no_unpack": 28.534096,
+        "abl_attn_no_dequant": 26.106784,
+        "abl_attn_skipwrite": 29.828
+      },
+      "65536": {
+        "abl_attn": 51.416433,
+        "abl_attn_no_all": 8.587552,
+        "abl_attn_no_unpack": 47.955215,
+        "abl_attn_no_dequant": 44.35816,
+        "abl_attn_skipwrite": 50.952896
+      }
+    },
+    "source_arm": {
+      "1024": "abl_attn",
+      "4096": "abl_attn",
+      "8192": "abl_attn",
+      "16384": "abl_attn",
+      "32768": "abl_attn",
+      "65536": "abl_attn"
+    },
+    "no_breakdown": {}
+  }
+}

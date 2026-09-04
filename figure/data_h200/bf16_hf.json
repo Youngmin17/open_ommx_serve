@@ -1,0 +1,50 @@
+{
+  "SUPERSEDED": {
+    "by": "figure/data_h200_final/bf16_hf.json",
+    "why": "fp16-era measurement (2026-08-11..25); the H200 panel is figure/data_h200_final -> figure/data/h200_20260905.json",
+    "do_not": "collect, plot or cite; kept as evidence"
+  },
+  "method": "bf16",
+  "model": "meta-llama/Llama-3.1-8B-Instruct",
+  "ctxs": {
+    "1024": {
+      "ttft_ms": 168.2839,
+      "tpot_ms": 31.4192,
+      "p99_ms": 32.4762,
+      "peak_gb": 15.3662
+    },
+    "4096": {
+      "ttft_ms": 159.3182,
+      "tpot_ms": 31.8216,
+      "p99_ms": 33.2119,
+      "peak_gb": 16.4986
+    },
+    "16384": {
+      "ttft_ms": 666.7053,
+      "tpot_ms": 32.6571,
+      "p99_ms": 34.2304,
+      "peak_gb": 21.028
+    },
+    "32768": {
+      "ttft_ms": 1707.6764,
+      "tpot_ms": 34.256,
+      "p99_ms": 34.9564,
+      "peak_gb": 27.0671
+    },
+    "65536": {
+      "ttft_ms": 4197.8682,
+      "tpot_ms": 37.4029,
+      "p99_ms": 37.6484,
+      "peak_gb": 39.1455
+    }
+  },
+  "quality": {
+    "prompt": "Question: What is the capital of France, and why is it historically important?\nAnswer:",
+    "output": " The capital of France is Paris. Paris is historically important for several reasons:\n1. **Birthplace of the French Revolution**: Paris was the epicenter of the French Revolution in 1789, which overthrew the monarchy and established the First French Republic. The city's iconic landmarks, such as the Bastille, symbolize the revolution's spirit of liberty, equality, and fraternity.\n2. **Seat of the French Monarchy**: Paris was the capital of the Kingdom of"
+  },
+  "meta": {
+    "warmup": 8,
+    "measure": 40,
+    "dtype": "float16"
+  }
+}

@@ -1,0 +1,4 @@
+arch,group,arm,label,backend,quant,batch,ctx,ttft_p50,ttft_p99,tpot_p50,tpot_p99,n_steps,mode,ok,oom,err
+h200,abl,abl_attn,bf16-w+OMMXattn(noshadow),CUSTOM,,1,1024,82.27782,82.35599,8.63979,46.75194,800,graph,True,False,
+h200,abl,abl_attn,bf16-w+OMMXattn(noshadow),CUSTOM,,1,4096,190.54291,191.35268,7.54034,52.66264,800,graph,True,False,
+h200,abl,abl_attn,bf16-w+OMMXattn(noshadow),CUSTOM,,1,16384,738.18001,739.84659,13.82413,58.22471,800,graph,True,False,

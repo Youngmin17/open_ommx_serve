@@ -1,0 +1,491 @@
+{
+  "gpu": "A100",
+  "ctxs": [
+    1024,
+    4096,
+    16384,
+    32768,
+    65536
+  ],
+  "methods": {
+    "ommx_vllm": {
+      "tpot": [
+        11.2007,
+        12.5058,
+        17.2709,
+        24.8924,
+        38.2763
+      ],
+      "peak": [
+        null,
+        null,
+        null,
+        null,
+        null
+      ],
+      "provenance": {
+        "source_file": "ommx_vllm.json",
+        "dtype": "bf16",
+        "arm_label": null,
+        "payload_method": "ommx_vllm",
+        "arm": "abl_attn",
+        "attention_backend": "CUSTOM",
+        "block_size": "engine-default",
+        "page_grid": "PAGE_GRID rank=0 pid=1039523 vllm_block_size=16 ommx_group_tokens=32 pages_per_group=2",
+        "recipe_resolved": {
+          "k_format": "i2f4",
+          "outliers_per_vector": 6,
+          "use_pow2": true,
+          "group_tokens": 32,
+          "group_channels": 32,
+          "sink_tokens": 8,
+          "recent_window": 32,
+          "outlier_select": "signed",
+          "outlier_repr": "bitmap",
+          "kv_outlier_map": true,
+          "page_size": 16,
+          "ommx_env": {
+            "OMMX_ATTN_CUDA_DECODE": "0",
+            "OMMX_ATTN_GRAPH": "1",
+            "OMMX_ATTN_K_FORMAT": "i2f4",
+            "OMMX_ATTN_OUTLIERS": "6",
+            "OMMX_ATTN_OUTLIER_SELECT": "signed",
+            "OMMX_ATTN_POW2": "1",
+            "OMMX_KV_GPU_PACK": "1",
+            "OMMX_KV_GROUP_CHANNELS": "32",
+            "OMMX_KV_GROUP_TOKENS": "32",
+            "OMMX_KV_OUTLIER_MAP": "1",
+            "OMMX_KV_RECENT": "32",
+            "OMMX_KV_RING": "1",
+            "OMMX_KV_SINK": "8"
+          }
+        }
+      },
+      "breakdown": {
+        "base": [
+          10.1067,
+          10.2638,
+          10.4213,
+          10.6126,
+          10.8441
+        ],
+        "outlier": [
+          0.0,
+          0.4099,
+          2.5139,
+          6.4943,
+          13.0304
+        ],
+        "unpack": [
+          0.1401,
+          0.5614,
+          2.1497,
+          4.405,
+          8.3449
+        ],
+        "scale": [
+          0.5688,
+          0.8397,
+          1.7568,
+          2.9576,
+          5.5933
+        ],
+        "pack": [
+          0.3851,
+          0.4309,
+          0.4291,
+          0.4228,
+          0.4635
+        ]
+      },
+      "breakdown_raw": {
+        "base": [
+          10.236896,
+          10.263824,
+          10.42128,
+          10.612592,
+          10.844127
+        ],
+        "outlier": [
+          -0.144336,
+          0.409919,
+          2.513936,
+          6.494319,
+          13.030431
+        ],
+        "unpack": [
+          0.141856,
+          0.561376,
+          2.149728,
+          4.405025,
+          8.344864
+        ],
+        "scale": [
+          0.57616,
+          0.839745,
+          1.756848,
+          2.957601,
+          5.593346
+        ],
+        "pack": [
+          0.390096,
+          0.430896,
+          0.42912,
+          0.422816,
+          0.46349
+        ]
+      },
+      "breakdown_meta": {
+        "method": "differential-ablation",
+        "clamped_negative": true,
+        "renormalized_to_total": true,
+        "residual_bucket": "outlier",
+        "segments": [
+          "base",
+          "outlier",
+          "unpack",
+          "scale",
+          "pack"
+        ],
+        "full_arm": "abl_attn",
+        "base_arm": "abl_attn_no_all",
+        "diff_arms": {
+          "unpack": "abl_attn_no_unpack",
+          "scale": "abl_attn_no_dequant",
+          "pack": "abl_attn_skipwrite"
+        },
+        "note": "breakdown = plotted segments (missing arm -> 0.0, negative -> 0.0, then x renorm_factor so the five sum to tpot_ms). breakdown_raw = the same differentials RAW: unclamped, unnormalized, null when the arm is missing. base/outlier in `breakdown` are derived from the CLAMPED diffs (historical recipe, kept so the plot is unchanged); in `breakdown_raw` they are derived from the RAW diffs, so the two can disagree whenever a diff was clamped.",
+        "renorm_factor": {
+          "1024": 0.987278,
+          "4096": 1.0,
+          "16384": 1.0,
+          "32768": 1.0,
+          "65536": 1.0
+        },
+        "clamped_sum_ms": {
+          "1024": 11.345008,
+          "4096": 12.50576,
+          "16384": 17.270912,
+          "32768": 24.892352,
+          "65536": 38.276257
+        },
+        "clamped_segments": {
+          "1024": [
+            "outlier"
+          ],
+          "4096": [],
+          "16384": [],
+          "32768": [],
+          "65536": []
+        },
+        "missing_arms": {},
+        "arm_tpot_ms": {
+          "1024": {
+            "abl_attn": 11.200672,
+            "abl_attn_no_all": 10.626992,
+            "abl_attn_no_unpack": 11.058816,
+            "abl_attn_no_dequant": 10.624512,
+            "abl_attn_skipwrite": 10.810576
+          },
+          "4096": {
+            "abl_attn": 12.50576,
+            "abl_attn_no_all": 10.69472,
+            "abl_attn_no_unpack": 11.944384,
+            "abl_attn_no_dequant": 11.666016,
+            "abl_attn_skipwrite": 12.074864
+          },
+          "16384": {
+            "abl_attn": 17.270912,
+            "abl_attn_no_all": 10.8504,
+            "abl_attn_no_unpack": 15.121184,
+            "abl_attn_no_dequant": 15.514064,
+            "abl_attn_skipwrite": 16.841792
+          },
+          "32768": {
+            "abl_attn": 24.892352,
+            "abl_attn_no_all": 11.035408,
+            "abl_attn_no_unpack": 20.487328,
+            "abl_attn_no_dequant": 21.934752,
+            "abl_attn_skipwrite": 24.469536
+          },
+          "65536": {
+            "abl_attn": 38.276257,
+            "abl_attn_no_all": 11.307616,
+            "abl_attn_no_unpack": 29.931393,
+            "abl_attn_no_dequant": 32.682911,
+            "abl_attn_skipwrite": 37.812767
+          }
+        },
+        "source_arm": {
+          "1024": "abl_attn",
+          "4096": "abl_attn",
+          "16384": "abl_attn",
+          "32768": "abl_attn",
+          "65536": "abl_attn"
+        },
+        "no_breakdown": {}
+      }
+    },
+    "ommx_hf": {
+      "tpot": [
+        46.5158,
+        45.1575,
+        45.6812,
+        45.4384,
+        55.9712
+      ],
+      "peak": [
+        15.2757,
+        16.1482,
+        19.5795,
+        24.1485,
+        33.2296
+      ],
+      "provenance": {
+        "source_file": "ommx_hf.json",
+        "dtype": "bf16",
+        "arm_label": "ommx (bf16)",
+        "payload_method": "ommx",
+        "arm": null,
+        "attention_backend": null,
+        "outlier_repr": "bitmap"
+      },
+      "breakdown": {
+        "base": [
+          35.3252,
+          32.8609,
+          32.8063,
+          32.8175,
+          37.6236
+        ],
+        "outlier": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          1.6705
+        ],
+        "unpack": [
+          4.9335,
+          5.363,
+          5.6043,
+          5.5678,
+          7.9386
+        ],
+        "scale": [
+          6.2571,
+          6.9336,
+          7.2707,
+          7.0531,
+          8.7385
+        ],
+        "pack": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "breakdown_raw": {
+        "base": [
+          55.2784,
+          45.5282,
+          44.7126,
+          44.7895,
+          44.7069
+        ],
+        "outlier": [
+          -1.0531,
+          -1.2599,
+          -1.0137,
+          -1.3756,
+          1.985
+        ],
+        "unpack": [
+          7.7201,
+          7.4304,
+          7.6382,
+          7.5989,
+          9.4332
+        ],
+        "scale": [
+          9.7914,
+          9.6064,
+          9.9094,
+          9.6261,
+          10.3837
+        ],
+        "pack": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "breakdown_meta": {
+        "method": "differential-ablation",
+        "clamped_negative": true,
+        "renormalized_to_total": true,
+        "segments": [
+          "base",
+          "outlier",
+          "unpack",
+          "scale",
+          "pack"
+        ],
+        "full_arm": "full",
+        "base_arm": "no_all",
+        "diff_arms": {
+          "outlier": "no_outlier",
+          "unpack": "no_unpack",
+          "scale": "no_dequant"
+        },
+        "pack_segment": "absent on this path -- there is no HF equivalent of the vLLM skipwrite arm, so pack is 0 and its cost sits inside base",
+        "p99_over_median": {
+          "1024": 3.22,
+          "4096": 3.47,
+          "16384": 3.27,
+          "32768": 3.38,
+          "65536": 3.05
+        },
+        "normalized_to": "the target file's own tpot_ms, so the segments sum to the drawn bar",
+        "ablation_full_tpot": {
+          "1024": 54.3304,
+          "4096": 54.2458,
+          "16384": 54.438,
+          "32768": 54.0441,
+          "65536": 57.1952
+        },
+        "caveat": "segments are differences of separately-timed runs; they do not sum to the total before renormalization. Short contexts are dominated by per-step Python overhead the flags do not remove -- see p99_over_median."
+      }
+    },
+    "bf16_hf": {
+      "tpot": [
+        37.2447,
+        37.1609,
+        60.0589,
+        103.7066,
+        202.0346
+      ],
+      "peak": [
+        15.3553,
+        16.4877,
+        21.0165,
+        27.0558,
+        39.1344
+      ],
+      "provenance": {
+        "source_file": "bf16_hf.json",
+        "dtype": "bf16",
+        "arm_label": "bf16",
+        "payload_method": "bf16",
+        "arm": null,
+        "attention_backend": null
+      }
+    },
+    "vllm_bf16": {
+      "tpot": [
+        9.4796,
+        10.1911,
+        13.0739,
+        16.775,
+        24.5903
+      ],
+      "peak": [
+        null,
+        null,
+        null,
+        null,
+        null
+      ],
+      "provenance": {
+        "source_file": "vllm_bf16.json",
+        "dtype": "bf16",
+        "arm_label": null,
+        "payload_method": "vllm_triton",
+        "arm": "TRITON",
+        "attention_backend": "TRITON_ATTN",
+        "block_size": "engine-default",
+        "page_grid": null,
+        "recipe_resolved": null
+      }
+    },
+    "kivi_hf": {
+      "tpot": [
+        67.0965,
+        66.9769,
+        87.4641,
+        151.7867,
+        295.1498
+      ],
+      "peak": [
+        15.7379,
+        18.0324,
+        27.215,
+        39.4578,
+        63.9425
+      ],
+      "provenance": {
+        "source_file": "kivi_hf.json",
+        "dtype": "fp16",
+        "arm_label": "kivi (fp16)",
+        "payload_method": "kivi",
+        "arm": null,
+        "attention_backend": null
+      }
+    },
+    "kitty_hf": {
+      "tpot": [
+        33.5001,
+        33.6139,
+        51.4861,
+        85.6606,
+        154.7633
+      ],
+      "peak": [
+        15.2675,
+        16.0936,
+        19.351,
+        23.7373,
+        32.4179
+      ],
+      "provenance": {
+        "source_file": "kitty_hf.json",
+        "dtype": "fp16",
+        "arm_label": "kitty (fp16)",
+        "payload_method": "kitty",
+        "arm": null,
+        "attention_backend": null
+      }
+    },
+    "turboquant_vllm": {
+      "tpot": [
+        10.9731,
+        12.6889,
+        20.125,
+        30.1417,
+        50.2159
+      ],
+      "peak": [
+        null,
+        null,
+        null,
+        null,
+        null
+      ],
+      "provenance": {
+        "source_file": "turboquant_vllm.json",
+        "dtype": null,
+        "arm_label": null,
+        "payload_method": "turboquant_vllm",
+        "arm": "TURBOQUANT",
+        "attention_backend": null,
+        "block_size": "engine-default",
+        "page_grid": null,
+        "recipe_resolved": null
+      }
+    }
+  }
+}

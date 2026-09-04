@@ -1,0 +1,34 @@
+# venvs (per-method)
+.venv*/
+venv/
+# python caches / build
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+build/
+dist/
+# measured data (figure/data_<gpu>/*.json) + normalized figure/data/*.json ARE committed
+# result figures (figure/*.png) + demo (assets/*.gif) ARE committed
+runs/
+figure/data/_e2e.*
+# model / hf caches
+.cache/
+*.safetensors
+*.bin
+*.pickle
+# editor / os
+.DS_Store
+*.swp
+# agent worktrees
+.claude/
+figure/data_*/_e2e*
+figure/data_repro_bm/
+
+# --- site-local, never committed ---
+.release-hygiene.local
+.site.local
+
+# demo recordings (demo/run_all.sh default OUT)
+demo/out/

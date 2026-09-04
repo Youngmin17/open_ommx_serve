@@ -1,0 +1,35 @@
+{
+  "SUPERSEDED": {
+    "by": "figure/data_h200_final/turboquant_vllm.json",
+    "why": "fp16-era measurement (2026-08-11..25); the H200 panel is figure/data_h200_final -> figure/data/h200_20260905.json",
+    "do_not": "collect, plot or cite; kept as evidence"
+  },
+  "method": "turboquant_vllm",
+  "ctxs": {
+    "1024": {
+      "tpot_ms": 6.4176,
+      "ttft_ms": 27.96134395431727,
+      "peak_gb": null
+    },
+    "4096": {
+      "tpot_ms": 7.8046,
+      "ttft_ms": 103.67708542291075,
+      "peak_gb": null
+    },
+    "16384": {
+      "tpot_ms": 13.5516,
+      "ttft_ms": 556.4122265316546,
+      "peak_gb": null
+    },
+    "32768": {
+      "tpot_ms": 21.2372,
+      "ttft_ms": 1500.6141325701028,
+      "peak_gb": null
+    },
+    "65536": {
+      "tpot_ms": 36.6309,
+      "ttft_ms": 4588.300324656069,
+      "peak_gb": null
+    }
+  }
+}

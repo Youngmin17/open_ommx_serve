@@ -1,0 +1,3626 @@
+# Copyright (c) 2024-2026, OMMX Contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Self-contained CANONICAL paged-decode attention (Triton). This file is a
+# surgical EXTRACTION of the canonical-KV decode path from
+# ``ommx/triton/paged_decode.py``: the canonical split-KV stage-1 kernel, its
+# q·zp preamble, the bf16 residual tail, and the wide LSE merge — plus the
+# host launcher ``ommx_paged_decode_attention_canonical``. The kernel BODIES
+# are copied VERBATIM (Triton bf16 rounding / divergent barriers are fragile —
+# bit-exactness matters); only the clearly-separable non-canonical paths were
+# stripped at the boundaries:
+#
+#   * The hmask2 two-level byte-mask outlier path is REMOVED throughout (the
+#     ``HMASK2*`` constexprs, the ``K_hhdr``/``K_hfine`` planes + strides, and
+#     the splice's ``if HMASK2:`` block). This file is relidx7-only production.
+#   * The legacy ``_fused_kernel`` / ``_splitkv_stage1`` / ``_lse_merge[_wide]``
+#     kernels, the WIDE_PV de-interleave helpers, the dense-bitmap select
+#     helpers, the generic ``_relidx7_outlier_splice`` 2-block wrapper, and the
+#     fork / fused-tail-merge routes are DROPPED.
+#
+# CANON_WIDE_N DECISION: the experimental Stage-B wider-N tile (CANON_WIDE_N)
+# is RETAINED in the kernel as a dead, constexpr-FALSE branch (the launcher
+# always passes ``CANON_WIDE_N=False`` / ``canon_wide_n=False``). Cutting it
+# out of the stage-1 body is entangled with the K-fold / outlier-splice call
+# sites; per the extraction spec we prefer correctness over aggressive
+# stripping, so the constexpr DCE removes it at compile time instead. The
+# production path is the Stage-A 32-token loop (the ``else`` of every
+# ``if CANON_WIDE_N:``). ``CANON_V_HOIST`` / ``CANON_SPLIT_PV`` stay default-ON
+# (validated, parity-neutral); ``SKIP_QZP`` stays False.
+#
+# CPU-importability: ``triton`` / ``triton.language`` are imported lazily inside
+# ``_require_triton``; the ``@triton.jit`` kernels are defined behind that guard
+# (in ``_build_kernels``) so this module imports on a host with neither Triton
+# nor a GPU.
+"""i2f4 CANONICAL paged decode attention (Triton) — relidx7-only production.
+
+KV STORAGE ABI: see ``ommx_paged_decode_attention_canonical`` for the full
+CANONICAL-KV ABI contract (per-channel K affine scale/zp + relidx7 FP4 outlier
+sidecar; per-token V affine scale/zp). All quantization is AFFINE
+(``dequant = code·scale + zp``); there is no symmetric mode in this format.
+"""
+
+from __future__ import annotations
+
+import math
+import os
+from typing import Any, Optional
+
+# ---------------------------------------------------------------------------
+# A100 (sm_80) decode tuning constants (the canonical decode-sweep winners).
+# ---------------------------------------------------------------------------
+A100_SHORT_DECODE_BLOCK_N = 32
+A100_SHORT_DECODE_NUM_WARPS = 4
+A100_SHORT_DECODE_NUM_STAGES = 3
+A100_SHORT_DECODE_NUM_KV_SPLITS = 1
+A100_SHORT_DECODE_SPLIT_BLOCK_N = 64
+A100_SHORT_DECODE_SPLIT_NUM_WARPS = 2
+A100_SHORT_DECODE_SPLIT_NUM_STAGES = 3
+
+# SM counts used ONLY to size the split grid (never on a tl.* path -> Dynamo-safe).
+_A100_SM_COUNT = 108
+_H100_SM_COUNT = 132
+_SPLIT_TILE_WIDTH_ESTIMATE = 64
+
+# Per-architecture decode pipeline depth cap (cp.async KV-tile double-buffering).
+# Raising num_stages on the stage-1 loop lets ``cp.async`` prefetch the next KV
+# tile while the current tile's QK / online-softmax / PV runs. sm_90 (H100/H200)
+# has the deeper async-copy pipeline (cp.async.bulk + more smem) and tolerates
+# 4 stages; sm_80 (A100) caps at 3 (less smem, shallower async copy). Anything
+# older / unknown stays at the conservative 2 the sweep baseline used. This is a
+# pure HOST-side launch parameter (never on a tl.* path) keyed on the device
+# capability, so it is Dynamo-safe and changes scheduling ONLY (the kernel body,
+# the i2f4 dequant math, and the LSE merge are all untouched -> parity-neutral).
+_SM90_NUM_STAGES_CAP = 4
+_SM80_NUM_STAGES_CAP = 3
+_DEFAULT_NUM_STAGES_CAP = 2
+
+
+def _device_capability(device: Any) -> "tuple[int, int]":
+    """(major, minor) compute capability; (0, 0) when non-CUDA / unknown.
+
+    Pure host Python (mirrors ``_sm_count_for_device``'s guards) so it is safe
+    to call before any triton import and never touches a tl.* path.
+    """
+    import torch
+
+    if not (isinstance(device, torch.device) and device.type == "cuda"
+            and torch.cuda.is_available()):
+        return (0, 0)
+    try:
+        idx = device.index if device.index is not None else torch.cuda.current_device()
+        cap = torch.cuda.get_device_capability(idx)
+        return (int(cap[0]), int(cap[1]))
+    except Exception:
+        return (0, 0)
+
+
+def _arch_num_stages_cap(device: Any) -> int:
+    """Per-arch ceiling for the stage-1 num_stages (cp.async tile depth).
+
+    sm_90 -> 4, sm_80 -> 3, else 2. The auto/env-selected num_stages is clamped
+    UP to this cap (never below the sweep baseline) so H100/H200 get the deeper
+    KV double-buffer while A100 stays at the depth its smem budget supports.
+    """
+    major, _ = _device_capability(device)
+    if major >= 9:
+        return _SM90_NUM_STAGES_CAP
+    if major == 8:
+        return _SM80_NUM_STAGES_CAP
+    return _DEFAULT_NUM_STAGES_CAP
+
+# Lazily-bound triton handles (populated by _require_triton on first launch).
+_triton: Any = None
+_tl: Any = None
+_KERNELS_BUILT = False
+
+
+def is_available() -> bool:
+    """True iff ``triton`` can be imported in this process (no GPU probe)."""
+    try:
+        import triton  # noqa: F401
+
+        return True
+    except Exception:
+        return False
+
+
+def _require_triton() -> None:
+    """Import triton lazily and JIT-compile the kernels once.
+
+    Raises ``RuntimeError`` (never a silent fallback) when triton is missing —
+    a missing decode kernel must be loud, not a bf16 bypass.
+    """
+    global _triton, _tl, _KERNELS_BUILT
+    if _KERNELS_BUILT:
+        return
+    try:
+        import triton
+        import triton.language as tl
+    except Exception as exc:  # pragma: no cover - exercised only Triton-less
+        raise RuntimeError(
+            "ommx_gpu_serve.attention.paged_decode requires the `triton` "
+            "package; it is not importable in this process. Install triton or "
+            "route attention through the CUDA backend."
+        ) from exc
+    _triton = triton
+    _tl = tl
+    _build_kernels(triton, tl)
+    _KERNELS_BUILT = True
+
+
+# ---------------------------------------------------------------------------
+# Host-side dispatch helpers (pure Python ints; safe before triton import).
+# ---------------------------------------------------------------------------
+
+def _env_int(name: str, default: int, *, allow_zero: bool = False) -> int:
+    """Read an integer tuning knob. Out-of-range values RAISE (no silent clamp).
+
+    CONTRACT — the same for every caller in this module, which is the point of the
+    helper being shared:
+
+      * unset / blank    -> ``default``.
+      * malformed        -> ``ValueError`` naming the variable and a fix. NOT a behaviour
+                            change: the old body ended in ``max(1, int(raw))`` and
+                            ``int("auto")`` already raised, so only the message is new.
+                            It is also the package law — ``integration/vllm/config.py``,
+                            ``packed_only.py`` and ``backend.py`` all raise on a malformed
+                            integer knob rather than substituting the default.
+      * negative         -> ``ValueError``. Used to be silently rewritten to 1
+                            (``OMMX_ATTN_BLOCK_H=-4`` -> 1).
+      * ``"0"``          -> per-knob, table below. Used to be silently rewritten to 1 for
+                            EVERY knob. That is the law-#11 trap: a knob whose 0 means
+                            something became 1, so the operator got the opposite of what
+                            was typed with nothing in the output to say so.
+
+    The old clamp is restored for NO knob, but 0 is refused only where it is genuinely
+    not a value; where 0 is meaningful it is now passed through (``allow_zero=True``)
+    instead of being rewritten, so no previously working setting starts failing:
+
+      ``OMMX_ATTN_OUTLIER_WARPS``    0 ACCEPTED. 0 is the DOCUMENTED default and means
+                                     "use the ctx/batch ladder", not "1 warp". Under the
+                                     clamp, typing the documented default pinned
+                                     ``num_warps=1`` and produced a wrong MEASUREMENT.
+      ``OMMX_OVERSPLIT_BATCH``       0 ACCEPTED. These two are THRESHOLDS, not launch
+      ``OMMX_OVERSPLIT_CTX``         geometries: 0 means "no threshold". Every real launch
+                                     has batch >= 1 and seq >= 1, so 0 and 1 select the
+                                     same set — the clamp was never WRONG here, hence
+                                     refusing 0 would only break a working config for no
+                                     correctness gain. Negative is still refused (a
+                                     negative threshold is a typo, not an intent).
+      ``OMMX_ATTN_NUM_KV_SPLITS``    0 REFUSED. Launch geometry: 0 splits is not a grid.
+      ``OMMX_V4_NUM_STAGES``         What the clamp actually did, MEASURED by executing
+      ``OMMX_V4_NUM_WARPS``          the released body (git 700ec09) in isolation:
+      ``OMMX_ATTN_BLOCK_H``          ``OMMX_ATTN_NUM_KV_SPLITS=0`` -> ``_auto_num_kv_
+      ``OMMX_MERGE_WIDE_BLOCK_DV``   splits(32768, 1) == 1``, i.e. a ONE-split launch,
+      ``OMMX_MERGE_WIDE_NUM_WARPS``  and ``=-4`` likewise 1. (An earlier draft of this
+                                     docstring said "silently became a 16-split launch",
+                                     citing ``max(16, min(128, 1)) = 16``. That is wrong
+                                     twice: the ladder's own floor on the long-ctx B<=1
+                                     branch is ``_env_kv_splits(16, maximum=128)``, whose
+                                     `minimum` is 1, and the ladder is unreachable anyway
+                                     whenever the variable is SET, because the override
+                                     in ``_auto_num_kv_splits`` returns first.) The point
+                                     stands on 1 vs 0: the operator typed one geometry
+                                     and silently got another. A crash they can read
+                                     beats a tuned point nobody asked for.
+
+    ``OMMX_ATTN_NUM_KV_SPLITS`` is read at two places — ``_env_kv_splits`` (the ladder)
+    and the explicit override in ``_auto_num_kv_splits`` — and BOTH now come through
+    here, so one spelling of one variable cannot mean two different things.
+    """
+    raw = os.environ.get(name)
+    if raw is None or str(raw).strip() == "":
+        return int(default)
+    txt = str(raw).strip()
+    try:
+        val = int(txt)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"{name}={raw!r} is not an integer. Fix: unset {name} or set an integer, "
+            f"e.g. {name}={default}.") from exc
+    floor = 0 if allow_zero else 1
+    if val < floor:
+        raise ValueError(
+            f"{name}={raw!r} is below the minimum {floor} for this knob"
+            + (" (0 IS meaningful for this knob; a negative value is not)."
+               if allow_zero
+               else "; it selects a launch geometry, so 0/negative is not a value.")
+            + f" Fix: unset {name} or set an integer >= {floor}.")
+    return val
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None or str(raw).strip() == "":
+        return bool(default)
+    return str(raw).strip().lower() not in {"0", "false", "off", "no"}
+
+
+def _env_kv_splits(default: int, *, minimum: int = 1, maximum: int = 128) -> int:
+    return max(
+        int(minimum),
+        min(int(maximum), _env_int("OMMX_ATTN_NUM_KV_SPLITS", int(default))),
+    )
+
+
+def _make_attn_logits(batch, head_num, num_kv_splits, head_dim, device):
+    import torch
+
+    return torch.empty(
+        (batch, head_num, num_kv_splits, head_dim + 1),
+        dtype=torch.float32, device=device,
+    )
+
+
+def _sm_count_for_device(device: Any) -> int:
+    """Best-effort SM count for split sizing; 0 when unknown / non-CUDA."""
+    import torch
+
+    if not (isinstance(device, torch.device) and device.type == "cuda"
+            and torch.cuda.is_available()):
+        return 0
+    try:
+        idx = device.index if device.index is not None else torch.cuda.current_device()
+        cap = torch.cuda.get_device_capability(idx)
+        if cap == (8, 0):
+            return _A100_SM_COUNT
+        if cap[0] == 9:
+            return _H100_SM_COUNT
+        return int(getattr(torch.cuda.get_device_properties(idx),
+                           "multi_processor_count", 0))
+    except Exception:
+        return 0
+
+
+def _occupancy_num_kv_splits(
+    seq_len: int,
+    batch_size: int,
+    *,
+    sm_count: int,
+    kv_heads: int = 8,
+    tile_width: int = _SPLIT_TILE_WIDTH_ESTIMATE,
+    sm_waves: float = 1.5,
+) -> int:
+    seq_len = int(seq_len)
+    batch_size = max(1, int(batch_size))
+    kv_heads = max(1, int(kv_heads))
+    if sm_count <= 0:
+        return 0
+    base_ctas = batch_size * kv_heads
+    target_ctas = max(base_ctas, int(math.ceil(sm_count * float(sm_waves))))
+    splits = max(1, int(math.ceil(target_ctas / base_ctas)))
+    max_tiles = max(1, int(math.ceil(seq_len / max(1, int(tile_width)))))
+    splits = min(splits, max_tiles)
+    if seq_len <= 512:
+        splits = min(splits, 2)
+    return max(1, splits)
+
+
+def _sm_major(device) -> int:
+    """Compute-capability major of ``device`` (9 for H100/H200, 8 for A100); 9 when unknown
+    so a non-CUDA caller keeps the H200 ladder rather than raising."""
+    try:
+        return int(_device_capability(device)[0])
+    except Exception:  # noqa: BLE001 -- CPU / interpreter / mocked device
+        return 9
+
+
+def _auto_num_warps_outlier(max_seq: int, batch: int, sm_major: int = 9) -> int:
+    """Warps per CTA for the outlier (i2f4) stage 1, from the measured ladder.
+
+    Measured p50 on Llama-3.1-8B shapes (``bench_decode_kernel.py``, CUDA graph, 3 seeds
+    within 1 %), 2 / 4 / 8 warps at 1K..64K for batch 1 and 8:
+
+      * H200 (sm_90): batch 1 prefers 2 warps up to 4K (1K 0.470 vs 0.521 ms, 4K 0.149 vs
+        0.191), 4 warps at 8K-16K (8K 0.105 vs 0.139, 16K 0.162 vs 0.166), and 2 warps
+        again from 24K (32K/64K: 2w 22.6 ms TPOT vs 4w 26.1). Batch >= 8 prefers 4 warps
+        below 24K (1K 0.080 vs 0.110, 16K 1.12 vs 1.17) and 2 warps beyond (64K 4.43 vs
+        4.64).
+      * A100 (sm_80): 4 warps everywhere (batch 1: 1K 0.704 vs 0.769, 8K 0.151 vs 0.235,
+        64K 38.3 ms TPOT vs 2w 51.8; batch 8: 4K 0.475 vs 0.626, 16K 1.86 vs 2.52).
+      * 8 warps never wins on either GPU.
+
+    ``max_seq`` is what the caller can promise: vLLM passes ``max_model_len`` (the graph is
+    captured once per batch bucket), the eager and microbench paths the packed length.
+    ``OMMX_ATTN_OUTLIER_WARPS`` overrides for A/B.
+    """
+    ow = _env_int("OMMX_ATTN_OUTLIER_WARPS", 0, allow_zero=True)
+    if ow > 0:
+        return ow
+    if int(sm_major) < 9:
+        return 4
+    if int(max_seq) >= 24576:
+        return 2
+    if int(batch) >= 8:
+        return 4
+    return 2 if int(max_seq) <= 4096 else 4
+
+
+def _auto_num_kv_splits_static(seq_len: int, batch_size: int) -> int:
+    """SM-blind (seq, batch) split ladder (sweep-tuned bucket bounds)."""
+    seq_len = int(seq_len)
+    batch_size = int(batch_size)
+    if batch_size <= 1:
+        if seq_len <= 2048:
+            return _env_kv_splits(1, maximum=16)
+        if seq_len <= 8192:
+            return _env_kv_splits(4, maximum=16)
+        return _env_kv_splits(16, maximum=128)
+    if batch_size <= 3:
+        if seq_len <= 1024:
+            return _env_kv_splits(2, maximum=16)
+        if seq_len <= 8192:
+            return _env_kv_splits(8, maximum=16)
+        return _env_kv_splits(16, maximum=128)
+    if seq_len <= 512 or (seq_len <= 1024 and 4 <= batch_size <= 8):
+        return max(1, min(4, _env_int("OMMX_ATTN_NUM_KV_SPLITS", 4)))
+    if seq_len <= 1024 and 16 <= batch_size < 32:
+        return max(8, min(16, _env_int("OMMX_ATTN_NUM_KV_SPLITS", 16)))
+    if seq_len <= 4096:
+        if batch_size >= 32:
+            return max(4, min(16, _env_int("OMMX_ATTN_NUM_KV_SPLITS", 8)))
+        if batch_size >= 16:
+            return max(16, min(32, _env_int("OMMX_ATTN_NUM_KV_SPLITS", 32)))
+        if batch_size >= 8:
+            return max(8, min(32, _env_int("OMMX_ATTN_NUM_KV_SPLITS", 16)))
+        return max(4, min(16, _env_int("OMMX_ATTN_NUM_KV_SPLITS", 8)))
+    if seq_len <= 32768:
+        if batch_size >= 4:
+            return max(8, min(32, _env_int("OMMX_ATTN_NUM_KV_SPLITS", 16)))
+        return max(16, min(128, _env_int("OMMX_ATTN_NUM_KV_SPLITS", 64)))
+    return max(16, min(128, _env_int("OMMX_ATTN_NUM_KV_SPLITS", 32)))
+
+
+def _static_split_window(seq_len: int, batch_size: int) -> "tuple[int, int]":
+    seq_len = int(seq_len)
+    batch_size = int(batch_size)
+    if batch_size <= 1:
+        if seq_len <= 2048:
+            return (1, 16)
+        if seq_len <= 8192:
+            return (4, 48)
+        return (8, 128)
+    if batch_size <= 3:
+        if seq_len <= 1024:
+            return (2, 8)
+        if seq_len <= 8192:
+            return (4, 16)
+        return (8, 16)
+    if seq_len <= 512 or (seq_len <= 1024 and 4 <= batch_size <= 8):
+        return (1, 8)
+    if seq_len <= 1024 and 16 <= batch_size < 32:
+        return (4, 16)
+    if seq_len <= 4096:
+        if batch_size >= 32:
+            return (4, 16)
+        if batch_size >= 16:
+            return (4, 16)
+        if batch_size >= 8:
+            return (8, 32)
+        return (4, 16)
+    if seq_len <= 32768:
+        if batch_size >= 4:
+            return (8, 32)
+        return (16, 128)
+    return (16, 128)
+
+
+def _auto_num_kv_splits(
+    seq_len: int,
+    batch_size: int,
+    device: Any = None,
+    kv_heads: int = 8,
+) -> int:
+    """Occupancy-corrected KV-split count, anchored on the static ladder."""
+    seq_len = int(seq_len)
+    batch_size = int(batch_size)
+    env_override = os.environ.get("OMMX_ATTN_NUM_KV_SPLITS")
+    if env_override is not None and str(env_override).strip():
+        # Route through _env_int. This override reads the SAME variable the ladder reads
+        # via _env_kv_splits, but it kept its own `max(1, int(...))` copy of the clamp, so
+        # OMMX_ATTN_NUM_KV_SPLITS=0 used to raise on one path and silently become 1 on
+        # this one — and this one WINS whenever the variable is set, i.e. the strict read
+        # was unreachable for the knob's primary entry point. The default handed over is
+        # the static ladder value purely so the error message can name a sane replacement;
+        # it is never returned, because this branch runs only when the variable is set.
+        return _env_int("OMMX_ATTN_NUM_KV_SPLITS",
+                        _auto_num_kv_splits_static(seq_len, batch_size))
+    static = _auto_num_kv_splits_static(seq_len, batch_size)
+    if not _env_bool("OMMX_ATTN_SPLITS_OCCUPANCY", True):
+        return static
+    sm_count = _sm_count_for_device(device)
+    sm_waves = 1.5
+    if batch_size <= 1 and seq_len >= 8192:
+        sm_waves = 1.5 * min(6.0, max(1.0, 2.0 * seq_len / 8192.0))
+    occ = _occupancy_num_kv_splits(
+        seq_len, batch_size, sm_count=sm_count, kv_heads=kv_heads, sm_waves=sm_waves)
+    if occ <= 0:
+        return static
+    lo, hi = _static_split_window(seq_len, batch_size)
+    # Batch decode is over-split by the static ladder: at B>=8 the static count
+    # (up to 16) decomposes the KV into ~1024 CTAs (8x waves) so every split
+    # re-reads K/V scales and the lse-merge reduces mostly-empty slots. base_ctas
+    # = B*H_kv already fills the SMs, so let occupancy LOWER the split count toward
+    # ~ceil(1.5*SM/(B*H_kv)). Gated at B>=8 (was 16) / ctx>=1024 (was 16384) so the
+    # B=8 4K/16K cells get the down-merge; keep the B<=1 long-ctx high-split branch
+    # (the OMMX single-stream win) untouched. Env-tunable for A/B.
+    # allow_zero: these are THRESHOLDS compared with `>=`, not launch geometries, so 0
+    # means "no threshold" and is a legitimate setting. batch/seq are >= 1 on every real
+    # launch, which makes 0 and 1 select the same set — the pre-existing max(1, ...) clamp
+    # was never wrong here, so refusing 0 would break a working A/B config for no
+    # correctness gain. Negative still raises (see _env_int).
+    _OVER_SPLIT_MERGE_BATCH = _env_int("OMMX_OVERSPLIT_BATCH", 8, allow_zero=True)
+    _OVER_SPLIT_MERGE_CTX = _env_int("OMMX_OVERSPLIT_CTX", 1024, allow_zero=True)
+    if occ > static and batch_size <= 1 and seq_len >= 1024:
+        return max(lo, min(hi, occ))
+    if occ > static and batch_size >= 4 and seq_len >= 1024:
+        return max(lo, min(hi, occ))
+    if occ < static and batch_size >= _OVER_SPLIT_MERGE_BATCH and seq_len >= _OVER_SPLIT_MERGE_CTX:
+        return max(lo, min(static, occ))
+    return static
+
+
+def _auto_num_stages(seq_len: int, batch_size: int) -> int:
+    seq_len = int(seq_len)
+    batch_size = int(batch_size)
+    if seq_len >= 4096:
+        return _env_int("OMMX_V4_NUM_STAGES", 2)
+    if seq_len <= 1024 and batch_size == 4:
+        return _env_int("OMMX_V4_NUM_STAGES", 4)
+    if seq_len <= 1024 and batch_size >= 32:
+        return _env_int("OMMX_V4_NUM_STAGES", 2)
+    if batch_size <= 4:
+        return _env_int("OMMX_V4_NUM_STAGES", 2)
+    return _env_int("OMMX_V4_NUM_STAGES", 3)
+
+
+def _auto_num_stages_decode(max_seq: int, batch: int) -> int:
+    """num_stages ladder (s=2 plateau at seq>=4096)."""
+    if max_seq >= 4096:
+        return _env_int("OMMX_V4_NUM_STAGES", 2)
+    return _auto_num_stages(max_seq, batch)
+
+
+def _auto_num_warps_decode(max_seq: int, batch: int) -> int:
+    """num_warps ladder (4-warp latency-hiding winner)."""
+    if max_seq <= 512 and batch <= 2:
+        return _env_int("OMMX_V4_NUM_WARPS", 8)
+    return _env_int("OMMX_V4_NUM_WARPS", 4)
+
+
+# ===========================================================================
+# Triton kernels — built lazily inside _build_kernels (behind the import guard).
+# ===========================================================================
+
+_canonical_splitkv_stage1_kernel: Any = None
+_canonical_qzp_preamble_kernel: Any = None
+_canonical_bf16_tail_kernel: Any = None
+_canonical_lse_merge_kernel: Any = None
+_canonical_lse_merge_wide_kernel: Any = None
+_merge_attention_states_kernel_h: Any = None
+
+
+def _build_kernels(triton, tl):
+    """Compile-define the @triton.jit decode kernels and bind module names.
+
+    ``triton.jit`` resolves every ``tl.*`` reference (and every *called* jit
+    helper) through the kernel's ``__globals__`` — which is this **module's**
+    globals dict, never the enclosing ``_build_kernels`` frame. So bind
+    ``triton`` / ``tl`` into the module globals *before* the ``@triton.jit``
+    functions are defined, and publish the shared jit helpers into the module
+    globals *after* defining them so the cross-kernel calls resolve through
+    ``__globals__`` too.
+    """
+    global _canonical_splitkv_stage1_kernel, _canonical_bf16_tail_kernel
+    global _canonical_lse_merge_kernel, _canonical_qzp_preamble_kernel
+
+    g = globals()
+    g["triton"] = triton
+    g["tl"] = tl
+
+    # --- shared jit helpers ------------------------------------------------
+    @triton.jit
+    def _grouped_qk_accumulate(q, k_final, BLOCK_H: tl.constexpr):
+        if BLOCK_H >= 16:
+            return tl.dot(q, k_final)
+        return tl.sum(
+            q.to(tl.float32)[:, :, None] * k_final.to(tl.float32)[None, :, :],
+            axis=1,
+        )
+
+    @triton.jit
+    def _grouped_pv_accumulate(p, v_final, BLOCK_H: tl.constexpr):
+        if BLOCK_H >= 16:
+            return tl.dot(p.to(v_final.dtype), v_final)
+        return tl.sum(
+            p.to(tl.float32)[:, :, None] * v_final.to(tl.float32)[None, :, :],
+            axis=1,
+        )
+
+    @triton.jit
+    def _grouped_qk_accumulate_fp8(q, k_final, BLOCK_H: tl.constexpr):
+        """FP8 e4m3 tensor-core QK^T (measure-first decode path, sm_90 wgmma).
+
+        Mirrors ``_grouped_qk_accumulate`` but runs the m16 tensor-core ``tl.dot``
+        on native FP8 (``float8e4nv``) operands. ``q`` (sm_scale-folded bf16) and
+        ``k_final`` (per-channel-scaled bf16 K) span an arbitrary activation range,
+        so each is rescaled by its per-tile amax into the e4m3 [-448, 448] window,
+        dotted in FP8 with an fp32 accumulator, then descaled post-accumulate. Below
+        the m16 tile it is the SAME fp32 CUDA-core reduction as the bf16 helper
+        (bit-identical), so the FP8 path only ever changes the BLOCK_H>=16 branch —
+        the M<=16 latency-decode regime (CUDA law #1) never pays the FP8 cast.
+        PARITY NOTE: per-tile SCALAR amax is the crude/fast scaling; a wide
+        per-channel K-scale spread crushes small channels in e4m3 and costs cos —
+        refine to per-row scaling only once a latency win is proven (law #2/#4).
+        """
+        if BLOCK_H >= 16:
+            aq = tl.max(tl.abs(q)) + 1e-20
+            ak = tl.max(tl.abs(k_final)) + 1e-20
+            qf = (q.to(tl.float32) * (448.0 / aq)).to(tl.float8e4nv)
+            kf = (k_final.to(tl.float32) * (448.0 / ak)).to(tl.float8e4nv)
+            return tl.dot(qf, kf).to(tl.float32) * ((aq * ak) / (448.0 * 448.0))
+        return tl.sum(
+            q.to(tl.float32)[:, :, None] * k_final.to(tl.float32)[None, :, :],
+            axis=1,
+        )
+
+    # --- LEVER 1: V INT2 dequant fast-paths (VLUT / VLOP3) -----------------
+    # The per-element V dequant (`(v_packed>>sh)&3 -> bf16`, then per-(token,
+    # channel-group) `v*vs + vz`) is the dominant decode V cost (V-dequant ALU,
+    # measured). These two parity-by-construction helpers replace it with either
+    # a 4-level register LUT (VLUT) or a single lop3.b32 splice (VLOP3). Both are
+    # default-OFF and reconcile with CANON_SPLIT_PV in the kernel (see V-dequant
+    # blocks): when a fast-path produces the FULL dequanted V (code*vs + vz),
+    # the +vz term is ALREADY folded, so the kernel takes the NON-split PV branch
+    # to avoid double-counting the bias.
+
+    @triton.jit
+    def _vlut_select(vcode, L0, L1, L2, L3):
+        """Pick L{vcode} per element from 4 precomputed COMPACT levels.
+
+        ``vcode`` is a [GT, VBC] int tile of 2-bit codes (0..3); L0..L3 are the
+        COMPACT per-(token, channel-group) levels broadcast to [GT, VBC] by the
+        CALLER. Selection is a branch-free nested ``tl.where`` (compiles to SEL
+        / 3 predicated moves — no [GT, NGV]->[GT, VBC] register blow-up beyond
+        the level tiles themselves). PARITY: L_i are built as i*vs+vz in bf16 by
+        the caller, so _vlut_select(code) == code*vs+vz BIT-EXACTLY (same bf16
+        products, same accumulation; CUDA law #10 — no .to(bf16).to(f32) round).
+        """
+        return tl.where(vcode == 0, L0,
+                        tl.where(vcode == 1, L1,
+                                 tl.where(vcode == 2, L2, L3)))
+
+    @triton.jit
+    def _int2_to_bf16_lop3(vcode):
+        """INT2 code (0..3) -> (float)code as bf16 via ONE lop3.b32 splice.
+
+        Mirrors the CUDA ``ommx_int2_splice_bf16x2`` (numeric_core.cuh:692): the
+        2-bit code is OR-ed into a bf16 whose exponent field is preset to 0x43
+        (=2^(0x86-127)=2^7=128 with mantissa 0 -> the bf16 value 128.0). With the
+        low 2 mantissa bits = code, the bf16 bit pattern 0x4300|code decodes to
+        (128.0 + code*2^(7-7)) = 128.0 + code  (the bf16 ulp at exp 0x43 is
+        2^(7-7)=1.0, so each mantissa lsb adds exactly 1.0). Subtracting the
+        128.0 bias yields (float)code EXACTLY for code in {0,1,2,3}.
+
+        bf16 layout (16b): [sign:1][exp:8][mant:7]; 0x4300 = 0_10000110_0000000
+          exp=0x86=134 -> 2^(134-127)=2^7=128; mant=0 -> value 128.0.
+          0x4300|code sets mant bits[1:0]=code -> value 128 + code (ulp=1.0).
+        PTX: pack the low-2-bit code into the LOW bf16 half of a b32 (hi half
+        kept 0 -> decodes to a harmless 128.0), splice via
+        ``lop3.b32 d, 0x4300, 0, code, 0xFA`` (immLut 0xFA = a|c) so the low half
+        holds (128+code) as bf16, subtract a packed bf16x2 bias {128.0,128.0}
+        via ``sub.rn.bf16x2`` (well-defined sm_80+; .rn rounding), then extract
+        the LOW bf16 half via ``mov.b32 {lo,hi}, d`` and return ``lo``. Both
+        halves carry the same 128.0 bias so the high lane resolves to 0.0 and is
+        discarded. Identical numerics to the x2 CUDA twin (just one useful lane
+        per invocation). PARITY: exact integer->bf16 for 0..3 (no rounding);
+        the subtract is exact (128+code and 128 are both representable, diff is
+        an integer 0..3); CUDA law #10 — no .to(bf16).to(f32) const-fold.
+        """
+        # tl.inline_asm_elementwise: emit the lop3 splice + bf16x2 bias subtract,
+        # then extract the low bf16. Input is the masked 2-bit code (int32, only
+        # bits[1:0] meaningful). Output is bf16. ``pack=1`` => one element/lane.
+        # 0x43004300 = packed bf16x2 {128.0, 128.0} (== OMMX_INT2_BF16_MAGIC32).
+        # PTX block (comments are PTX `//` inside the string; bias 0x43004300 =
+        # packed bf16x2 {128,128}; lop3 0xFA = a|c; sub.rn.bf16x2 exact for 0..3).
+        spliced = tl.inline_asm_elementwise(
+            asm=(
+                "{\n"
+                " .reg .b32 t, bias;\n"
+                " .reg .b16 lo, hi;\n"
+                " mov.b32 bias, 0x43004300;\n"
+                " and.b32 t, $1, 0x3;\n"
+                " lop3.b32 t, bias, 0, t, 0xFA;\n"
+                " sub.rn.bf16x2 t, t, bias;\n"
+                " mov.b32 {lo, hi}, t;\n"
+                " mov.b16 $0, lo;\n"
+                "}"
+            ),
+            constraints="=h,r",
+            args=[vcode],
+            dtype=tl.bfloat16,
+            is_pure=True,
+            pack=1,
+        )
+        return spliced
+
+    @triton.jit
+    def _relidx7_splice_block(
+        sel_code, is_outlier, tok_local, blk_scalar, in_block,
+        K_oidx, K_oval,
+        oidx_head_off, oidx_blk_stride, oidx_dcol,
+        oval_head_off, oval_blk_stride, oval_dcol,
+        row_mask,
+        OUTLIER_K: tl.constexpr,
+        RELIDX_PACKED: tl.constexpr,
+        OUTLIER_FP8: tl.constexpr,
+    ):
+        # Splice the outliers carried by ONE 128-token block's relidx7 frame. Each of
+        # the OUTLIER_K slots is loaded as a [K_BYTE] vector keyed by the SCALAR
+        # ``blk_scalar`` (register-cache: one small frame read per block, NOT broadcast
+        # over BLOCK_N — the CUDA-twin ``oc_idx[e][sI]`` register cache) then broadcast-
+        # compared against the per-token ``tok_local`` [BLOCK_N]. ``in_block`` gates the
+        # tokens this block owns (the straddle case). Carries the running
+        # ``sel_code``/``is_outlier`` [K_BYTE, BLOCK_N] so a 2-block tile chains two
+        # calls (first-match-wins across both via ``& ~is_outlier``). ``row_mask`` is
+        # the 1-D [K_BYTE] K-row validity (caller already clamped ``blk_scalar`` into
+        # range so the frame load is never OOB even when ``in_block`` is all-false).
+        #
+        # RELIDX_PACKED (the 11-bit direct-read format): ``K_oidx`` is the LSB-first
+        # 7-bit-packed index bitstream (the packer's ``pack_relidx7`` layout,
+        # ceil(7K/8) bytes/frame) and ``K_oval`` the 4-bit nibble stream (even slot =
+        # low nibble, ceil(K/2) bytes/frame) — 11 bits/outlier resident vs the
+        # unpacked 24 (int16 idx + uint8 val). Slot ``s`` is a tl.static_range
+        # constexpr, so its byte offset ``(7s)//8`` / shift ``(7s)%8`` fold at compile
+        # time; a field spans 2 bytes only when the shift leaves <7 bits in the first
+        # byte (the double-load+splice), and the last slot's tail byte is always
+        # inside the frame (7K-1 bits end in byte ceil(7K/8)-1). The packed stream
+        # has NO -1 sentinel (7 bits have no spare code: 127 is a real column) — the
+        # adapter pads empty slots with a DUPLICATE of a real slot, value-neutral
+        # under the first-match-wins chain; invalid rows are masked here via
+        # ``row_mask`` (an ``other=0`` load could fake-match token 0).
+        addr_d = oidx_head_off + oidx_dcol + blk_scalar * oidx_blk_stride   # [K_BYTE] idx frame base
+        addr_v = oval_head_off + oval_dcol + blk_scalar * oval_blk_stride   # [K_BYTE] val frame base
+        for s in tl.static_range(OUTLIER_K):
+            if RELIDX_PACKED:
+                lo = tl.load(K_oidx + addr_d + (7 * s) // 8,
+                             mask=row_mask, other=0).to(tl.int32)           # [K_BYTE]
+                if (7 * s) % 8 + 7 > 8:
+                    hi = tl.load(K_oidx + addr_d + (7 * s) // 8 + 1,
+                                 mask=row_mask, other=0).to(tl.int32)
+                    word = lo | (hi << 8)
+                else:
+                    word = lo
+                oi_s = (word >> ((7 * s) % 8)) & 0x7F                       # [K_BYTE]
+                if OUTLIER_FP8:
+                    # dead branch (i4f8 removed 2026-07-02; OUTLIER_FP8 always False):
+                    # one FP8 e4m3fn byte per outlier slot (val stride = s).
+                    vb = tl.load(K_oval + addr_v + s,
+                                 mask=row_mask, other=0).to(tl.int32)
+                    ov_s = vb & 0xFF                                        # [K_BYTE]
+                else:
+                    vb = tl.load(K_oval + addr_v + s // 2,
+                                 mask=row_mask, other=0).to(tl.int32)
+                    ov_s = (vb >> (4 * (s % 2))) & 0xF                      # [K_BYTE]
+                match = ((oi_s[:, None] == tok_local[None, :])
+                         & in_block[None, :] & row_mask[:, None])           # [K_BYTE, BLOCK_N]
+            else:
+                oi_s = tl.load(K_oidx + addr_d + s, mask=row_mask, other=-1).to(tl.int32)  # [K_BYTE]
+                ov_s = tl.load(K_oval + addr_v + s, mask=row_mask, other=0).to(tl.int32)   # [K_BYTE]
+                match = (oi_s[:, None] == tok_local[None, :]) & in_block[None, :]          # [K_BYTE, BLOCK_N]
+            new_outl = match & (~is_outlier)
+            sel_code = tl.where(new_outl, ov_s[:, None], sel_code)
+            is_outlier = is_outlier | match
+        return sel_code, is_outlier
+
+    @triton.jit
+    def _combinadic_unrank_oi(rank, slot: tl.constexpr,
+                              BINOM_LUT,
+                              OUTLIER_K: tl.constexpr, VL: tl.constexpr):
+        # In-REGISTER greedy combinadic unrank of ``rank`` [K_BYTE] -> the ASCENDING
+        # outlier position of one ``slot`` (constexpr 0..OUTLIER_K-1). Mirror of the
+        # pure-python ``codec.combinadic_decode``:
+        #     for j in k..1: c = largest with C(c, j) <= rem; rem -= C(c, j); emit c
+        # which yields positions DESCENDING (j=k first => largest c), then sorts
+        # ascending. The k_oval value stream is stored in ASCENDING position order,
+        # so slot s consumes ascending position s. We therefore run the greedy
+        # j-loop from j=K down to 1 (descending c's), and the ascending slot s is
+        # the (K-1-s)-th descending emission. ``BINOM_LUT`` is the compile-time
+        # C(c, j) table flat [(VL+1)*OUTLIER_K], indexed LUT[c*OUTLIER_K + (j-1)];
+        # entries with C(c, j)==0 (c < j) never satisfy the <= test for rem >= 0
+        # at the valid columns, so the descending scan stops at the true c.
+        rem = rank
+        oi = rank * 0                       # [K_BYTE], the ascending position for slot
+        # descending emission index d = 0 (largest c) .. OUTLIER_K-1 (smallest c).
+        # j runs K, K-1, ..., 1 as d increases. ascending slot for emission d is
+        # (OUTLIER_K-1-d); we capture it when it equals the requested ``slot``.
+        for d in tl.static_range(OUTLIER_K):
+            j = OUTLIER_K - d               # constexpr j in [K .. 1]
+            # find the largest column c in [0, VL) with C(c, j) <= rem.
+            best = rank * 0                 # [K_BYTE] accumulates the chosen c
+            for c in tl.static_range(VL):
+                cj = tl.load(BINOM_LUT + c * OUTLIER_K + (j - 1)).to(tl.int32)
+                # C(c, j) is monotonically nondecreasing in c; the largest c with
+                # C(c, j) <= rem is recovered by taking the max qualifying c.
+                take = (cj <= rem) & (c >= (j - 1))
+                best = tl.where(take, c, best)
+            cj_best = tl.load(BINOM_LUT + best * OUTLIER_K + (j - 1)).to(tl.int32)
+            rem = rem - cj_best
+            if (OUTLIER_K - 1 - d) == slot:
+                oi = best
+        return oi
+
+    @triton.jit
+    def _popcount32(x):
+        # Hardware ``popc.b32`` (ONE instruction) inlined via tl.inline_asm_elementwise
+        # — replaces the SWAR ~12-ALU fallback that was the per-element rank cost in the
+        # bitmap splice. popc is sm_20+ universal and BIT-EXACT (pure speedup, parity-
+        # neutral). ``x`` int32 = the masked occupancy word; only the low 32 bits weigh.
+        # (matches the VLOP3 lop3 inline-asm pattern already in this file.)
+        return tl.inline_asm_elementwise(
+            "popc.b32 $0, $1;", "=r,r", [x],
+            dtype=tl.int32, is_pure=True, pack=1)
+
+    @triton.jit
+    def _popcount32_swar(x):
+        # SWAR fallback (kept for reference / non-PTX backends). ~12 ALU ops.
+        x = x - ((x >> 1) & 0x55555555)
+        x = (x & 0x33333333) + ((x >> 2) & 0x33333333)
+        x = (x + (x >> 4)) & 0x0F0F0F0F
+        return (x * 0x01010101) >> 24
+
+    @triton.jit
+    def _bitmap_splice_from_word(
+        sel_code, is_outlier, tok_local, in_block, row_mask,
+        word, vword,
+        OUTLIER_K: tl.constexpr, OUTLIER_FP8: tl.constexpr,
+        VL: tl.constexpr = 32,
+    ):
+        # LAW #15 O(1)-per-token outlier splice, WIDENED to VL in {16,32,64,128}.
+        # Inputs: ``word`` [K_BYTE] = the packed relidx7 index stream (7 bits/slot,
+        # ascending token order; positions are 0..VL-1 and empty slots are a DUPLICATE
+        # of a real slot — idempotent under OR / first-match-wins); ``vword`` [K_BYTE]
+        # = the FP4/FP8 value stream (nibble/byte ``s`` = the s-th ASCENDING outlier
+        # value). Replaces the per-slot ``oi_s==tok_local`` membership scan
+        # (O(OUTLIER_K*BLOCK_N)) with a per-row occupancy BITMAP + ONE membership
+        # bit-test + ONE masked prefix-popcount (rank). The 32-token group used ONE
+        # int32 occupancy word; VL>32 needs ceil(VL/32) words, so the bitmap is a
+        # [K_BYTE, VL_WORDS] register tensor (word axis = position // 32). Membership
+        # selects token t's word (t>>5) and bit (t&31); rank = (full popcount of every
+        # LOWER word) + (masked-prefix-popcount of t's OWN word) — multi-word masked
+        # prefix-popcount, law #15. pack.py sorts outliers ascending, so the popcount
+        # rank == ascending slot index exactly for every real position.
+        # Cooperative-load-safe: pure register ALU, no early return (law #9 N/A here).
+        # The 32-token group used ONE int32 occupancy word. VL>32 needs ceil(VL/32)
+        # words. Triton can't dynamically index a 2D register tensor by a constexpr
+        # column, so we hold the words as a PYTHON LIST of [K_BYTE] tensors (the loop
+        # bounds are constexpr, so this folds at trace time) and combine per-word with
+        # constexpr ``tl.where`` masks.
+        VL_WORDS: tl.constexpr = (VL + 31) // 32
+        # (0) membership + rank in ONE pass over the VL_WORDS occupancy words, each BUILT
+        # INLINE as a [K_BYTE] register — NO 2D-tensor, NO tl.sum masked-reduction (the old
+        # cost). Triton JIT rejects list comprehensions, so word _w is rebuilt per outer iter
+        # (cheap: OUTLIER_K<=4 slot-ORs x VL_WORDS<=4). Fused per-token: own-word + Σ
+        # lower-word FULL popcount = true 2-popcount O(1) at any VL (law #15). pack.py sorts
+        # outliers ascending, so popcount-rank == ascending slot (parity-neutral).
+        t_bit = (tok_local & 0x1F)                                    # [BLOCK_N] bit
+        prefix_mask = (1 << t_bit) - 1                               # [BLOCK_N] within-word
+        if VL_WORDS == 1:
+            # VL<=32 fast lane: a single occupancy word => t_word≡0 and prefix_below≡0
+            # (no lower word exists). Drop the [K_BYTE,BLOCK_N] prefix_below array + the
+            # per-word own_word accumulate/select — a register cut that lets the outlier
+            # tile run at fewer warps (occupancy). rank collapses to ONE masked-prefix-
+            # popcount (law #15: the 2-popcount fuses to 1 when the lower-word domain is
+            # empty). Bit-identical: for VL=32 the general loop already yields
+            # own_word=w_acc, prefix_below=0, so mem/rank are the same integers.
+            w_acc = tl.zeros([word.shape[0]], dtype=tl.int32)         # occupancy word [K_BYTE]
+            for s in tl.static_range(OUTLIER_K):
+                oi_s = (word >> (7 * s)) & 0x7F                        # [K_BYTE]
+                w_acc = w_acc | tl.where(oi_s < VL, (1 << (oi_s & 0x1F)), 0)
+            own_word = w_acc[:, None]                                 # [K_BYTE,1]
+            rank = _popcount32(own_word & prefix_mask[None, :])
+        else:
+            t_word = (tok_local >> 5)                                 # [BLOCK_N] word index
+            own_word = tl.zeros([word.shape[0], tok_local.shape[0]], dtype=tl.int32)
+            prefix_below = tl.zeros([word.shape[0], tok_local.shape[0]], dtype=tl.int32)
+            for _w in tl.static_range(VL_WORDS):
+                w_acc = tl.zeros([word.shape[0]], dtype=tl.int32)     # occupancy word _w [K_BYTE]
+                for s in tl.static_range(OUTLIER_K):
+                    oi_s = (word >> (7 * s)) & 0x7F                    # [K_BYTE]
+                    set_bit = tl.where((oi_s >> 5) == _w, (1 << (oi_s & 0x1F)), 0)
+                    w_acc = w_acc | tl.where(oi_s < VL, set_bit, 0)    # guard >=VL stray
+                bw = w_acc[:, None]                                   # [K_BYTE,1] direct register
+                own_word = own_word + tl.where(t_word[None, :] == _w, bw, 0)
+                prefix_below = prefix_below + tl.where(
+                    _w < t_word[None, :], _popcount32(w_acc)[:, None], 0)
+            # rank = (fused lower-word full popcount) + (masked-prefix-popcount in t's word).
+            rank = prefix_below + _popcount32(own_word & prefix_mask[None, :])
+        mem = (((own_word >> t_bit[None, :]) & 1) != 0)
+        match = mem & in_block[None, :] & row_mask[:, None]           # [K_BYTE, BLOCK_N]
+        # (3) value gather: nibble/byte ``rank`` of vword.
+        if OUTLIER_FP8:
+            ov = (vword[:, None] >> (8 * rank)) & 0xFF
+        else:
+            ov = (vword[:, None] >> (4 * rank)) & 0xF
+        new_outl = match & (~is_outlier)
+        sel_code = tl.where(new_outl, ov, sel_code)
+        is_outlier = is_outlier | match
+        return sel_code, is_outlier
+
+    @triton.jit
+    def _bitmap_splice_from_bytes(
+        sel_code, is_outlier, tok_local, in_block, row_mask,
+        bmp_bytes, vword,
+        OUTLIER_K: tl.constexpr, OUTLIER_FP8: tl.constexpr,
+        VL: tl.constexpr, FBB: tl.constexpr, FBB_P2: tl.constexpr,
+    ):
+        # STORED-BITMAP twin of ``_bitmap_splice_from_word``. IDENTICAL decode
+        # arithmetic — O(1) membership bit-test + masked prefix-popcount rank (law
+        # #15) — and the SAME ``k_oval`` nibble stream; the ONLY difference is where
+        # the occupancy words come from:
+        #
+        #   _bitmap_splice_from_word   DERIVES them in registers by OR-ing 1<<pos over
+        #                              the OUTLIER_K relidx7 slots. The resident plane
+        #                              is still relidx7 (7 bit/slot); the bitmap exists
+        #                              only inside the kernel, so HBM pays 7k bits.
+        #   _bitmap_splice_from_bytes  LOADS them from ``k_obmp`` — the paper's flat
+        #                              N-bit-per-group mask IS the resident plane. No
+        #                              derivation loop runs, so the index cost is FLAT
+        #                              in OUTLIER_K (ceil(VL/8) bytes/frame at any k).
+        #
+        # ``bmp_bytes`` is the [K_BYTE, FBB_P2] int32 byte tile the caller already
+        # loaded (masked to the FBB real bytes, other=0); ``vword`` the packed value
+        # stream. Bit ``p`` of the mask is byte ``p>>3``, bit ``p&7`` — LSB-first,
+        # the ``codec.pack_bitmap_rows`` layout — so occupancy word ``_w`` is simply
+        # bytes ``4*_w .. 4*_w+3`` little-endian, and NO position arithmetic is needed.
+        #
+        # VERIFIED ON HARDWARE (H200 NVL, 2026-09-04): tests/test_decode_kernel_parity.py 17/17, whose eight ``bitmap`` parametrisations (GT 32 and 64) reach THIS branch (BITMAP_READ=True is refused without a k_obmp plane) and match an independent PyTorch attention oracle at cos>=0.999.
+        # The CPU-side contract — byte layout, the popcount-rank identity, and membership
+        # equality with relidx7 — is separately gated in tests/test_bitmap_outlier.py.
+        VL_WORDS: tl.constexpr = (VL + 31) // 32
+        offs_b = tl.arange(0, FBB_P2)
+        t_bit = (tok_local & 0x1F)                                # [BLOCK_N] bit
+        prefix_mask = (1 << t_bit) - 1                            # [BLOCK_N] within-word
+        if VL_WORDS == 1:
+            # VL<=32 fast lane: ONE occupancy word, so t_word≡0 and there is no lower
+            # word — rank collapses to a single masked prefix-popcount (the 2-popcount
+            # of law #15 fuses to 1 when the lower-word domain is empty). Mirrors the
+            # same fast lane in _bitmap_splice_from_word.
+            w_acc = tl.sum(bmp_bytes << (8 * offs_b)[None, :], axis=1)   # [K_BYTE]
+            own_word = w_acc[:, None]                                    # [K_BYTE,1]
+            rank = _popcount32(own_word & prefix_mask[None, :])
+        else:
+            t_word = (tok_local >> 5)                             # [BLOCK_N] word index
+            own_word = tl.zeros([bmp_bytes.shape[0], tok_local.shape[0]], dtype=tl.int32)
+            prefix_below = tl.zeros([bmp_bytes.shape[0], tok_local.shape[0]],
+                                    dtype=tl.int32)
+            for _w in tl.static_range(VL_WORDS):
+                # word _w = bytes [4*_w, 4*_w+4) little-endian. The shift amount is
+                # CLAMPED inside the tl.where so the out-of-window lanes never evaluate
+                # a negative shift (UB) — the mask zeroes them either way.
+                in_w = (offs_b >= 4 * _w) & (offs_b < 4 * _w + 4)
+                sh = tl.where(in_w, (offs_b - 4 * _w) * 8, 0)
+                w_acc = tl.sum(tl.where(in_w[None, :], bmp_bytes << sh[None, :], 0),
+                               axis=1)                            # [K_BYTE]
+                own_word = own_word + tl.where(t_word[None, :] == _w, w_acc[:, None], 0)
+                prefix_below = prefix_below + tl.where(
+                    _w < t_word[None, :], _popcount32(w_acc)[:, None], 0)
+            # rank = (fused lower-word full popcount) + (masked prefix-popcount in t's word)
+            rank = prefix_below + _popcount32(own_word & prefix_mask[None, :])
+        mem = (((own_word >> t_bit[None, :]) & 1) != 0)
+        match = mem & in_block[None, :] & row_mask[:, None]        # [K_BYTE, BLOCK_N]
+        # value gather: the set bit's ascending ordinal IS ``rank``, and pack.py writes
+        # k_oval in ascending-position order, so nibble/byte ``rank`` is its value.
+        if OUTLIER_FP8:
+            ov = (vword[:, None] >> (8 * rank)) & 0xFF
+        else:
+            ov = (vword[:, None] >> (4 * rank)) & 0xF
+        new_outl = match & (~is_outlier)
+        sel_code = tl.where(new_outl, ov, sel_code)
+        is_outlier = is_outlier | match
+        return sel_code, is_outlier
+
+    @triton.jit
+    def _canonical_single_group_splice(
+        base_level, tok_local, blk_scalar, in_block, row_mask,
+        K_oidx, K_oval, K_crank, K_obmp, BINOM_LUT,
+        oidx_head_off, oidx_blk_stride, oidx_dcol,
+        oval_head_off, oval_blk_stride, oval_dcol,
+        crank_head_off, crank_blk_stride, crank_dcol,
+        bmp_head_off, bmp_blk_stride, bmp_dcol,
+        OUTLIER_K: tl.constexpr, RELIDX_PACKED: tl.constexpr,
+        FBI: tl.constexpr, FBI_P2: tl.constexpr,
+        FBV: tl.constexpr, FBV_P2: tl.constexpr,
+        WORD_SPLICE: tl.constexpr,
+        OUTLIER_FP8: tl.constexpr,
+        COMBINADIC_READ: tl.constexpr,
+        FBR: tl.constexpr, FBR_P2: tl.constexpr,
+        BITMAP_READ: tl.constexpr, FBB: tl.constexpr, FBB_P2: tl.constexpr,
+        VL: tl.constexpr,
+        OUTLIER_BITMAP: tl.constexpr = False,
+    ):
+        # CANONICAL-KV specialization: a canonical tile is GROUP-ALIGNED (BLOCK_N ==
+        # GROUP_TOKENS, splits rounded to group boundaries) so every token of the
+        # tile shares ONE frame id (``blk_scalar`` = the physical group slot, already
+        # loaded by the caller). The per-slot byte loads collapse into ONE
+        # [K_BYTE, FBI_P2] 2D load per plane — the whole 7-bit bitstream lands in a
+        # register WORD and every slot is a compile-time shift; the FP4 e2m1f level
+        # is decoded with int shifts (no DENSE_LUT global gather, no SFU exp2).
+        # Affine map only (the canonical format has no symmetric/fp8 mode).
+        zero_db = (oidx_dcol[:, None] * 0 + tok_local[None, :] * 0).to(tl.int32)
+        sel_code = zero_db
+        is_outlier = zero_db != 0
+        if BITMAP_READ:
+            # STORED FLAT BITMASK (paper item B4): the resident outlier-position plane
+            # is ``k_obmp`` — ceil(VL/8) bytes per (group, head, channel) frame, one bit
+            # per token position — NOT the relidx7 bitstream. One wide byte-tile load
+            # per frame, then the SAME O(1) membership + prefix-popcount rank the
+            # relidx7 OUTLIER_BITMAP lane derives in registers. The ``k_oval`` VALUE
+            # read is byte-for-byte the relidx7 one (ascending-position nibbles).
+            # Hardware-verified — see _bitmap_splice_from_bytes.
+            offs_fbb = tl.arange(0, FBB_P2)
+            bmp_bytes = tl.load(
+                K_obmp + bmp_head_off + blk_scalar * bmp_blk_stride
+                + bmp_dcol[:, None] + offs_fbb[None, :],
+                mask=row_mask[:, None] & (offs_fbb < FBB)[None, :],
+                other=0).to(tl.int32)
+            offs_fbv = tl.arange(0, FBV_P2)
+            val_bytes = tl.load(
+                K_oval + oval_head_off + blk_scalar * oval_blk_stride
+                + oval_dcol[:, None] + offs_fbv[None, :],
+                mask=row_mask[:, None] & (offs_fbv < FBV)[None, :],
+                other=0).to(tl.int32)
+            vword = tl.sum(val_bytes << (8 * offs_fbv)[None, :], axis=1)
+            sel_code, is_outlier = _bitmap_splice_from_bytes(
+                sel_code, is_outlier, tok_local, in_block, row_mask,
+                bmp_bytes, vword, OUTLIER_K, OUTLIER_FP8, VL, FBB, FBB_P2)
+        elif COMBINADIC_READ:
+            # COMBINADIC-READ (storage-floor index): load the combinadic RANK plane
+            # (FBR bytes/frame, the information floor ~ceil(log2 C(VL,k)) bits — k=4
+            # is 16 bits vs relidx7's 4·7=28) instead of the relidx7 idx bitstream,
+            # and EXPAND it to the k ascending outlier positions IN-REGISTER via the
+            # greedy unrank (``_combinadic_unrank_oi``). Trades HBM read bytes for
+            # in-register unrank ALU; on a compute-bound decode this may be parity /
+            # a slight regression — the GPU A/B decides. The k_oval VALUE stream is
+            # UNCHANGED (same ascending-position FP4/FP8 codes the relidx7 path reads).
+            offs_fbr = tl.arange(0, FBR_P2)
+            rank_bytes = tl.load(
+                K_crank + crank_head_off + blk_scalar * crank_blk_stride
+                + crank_dcol[:, None] + offs_fbr[None, :],
+                mask=row_mask[:, None] & (offs_fbr < FBR)[None, :],
+                other=0).to(tl.int32)
+            # little-endian rank word [K_BYTE]; FBR <= 4 (k <= 4 => <= 16 bits).
+            rank = tl.sum(rank_bytes << (8 * offs_fbr)[None, :], axis=1)
+            offs_fbv = tl.arange(0, FBV_P2)
+            val_bytes = tl.load(
+                K_oval + oval_head_off + blk_scalar * oval_blk_stride
+                + oval_dcol[:, None] + offs_fbv[None, :],
+                mask=row_mask[:, None] & (offs_fbv < FBV)[None, :],
+                other=0).to(tl.int32)
+            vword = tl.sum(val_bytes << (8 * offs_fbv)[None, :], axis=1)
+            for s in tl.static_range(OUTLIER_K):
+                oi_s = _combinadic_unrank_oi(rank, s, BINOM_LUT, OUTLIER_K, VL)
+                if OUTLIER_FP8:
+                    ov_s = (vword >> (8 * s)) & 0xFF
+                else:
+                    ov_s = (vword >> (4 * s)) & 0xF
+                match = ((oi_s[:, None] == tok_local[None, :])
+                         & in_block[None, :] & row_mask[:, None])
+                sel_code = tl.where(match & (~is_outlier), ov_s[:, None],
+                                    sel_code)
+                is_outlier = is_outlier | match
+        elif RELIDX_PACKED and WORD_SPLICE:
+            # int32 word => the whole index stream must fit 31 bits: the
+            # launcher gates WORD_SPLICE to OUTLIER_K <= 4 (7k <= 28). An
+            # int64 word also works for k <= 8 but its shift/cmp tax loses to
+            # the per-slot path on H100 (measured 1428us vs 987us, o8 64K).
+            offs_fbi = tl.arange(0, FBI_P2)
+            idx_bytes = tl.load(
+                K_oidx + oidx_head_off + blk_scalar * oidx_blk_stride
+                + oidx_dcol[:, None] + offs_fbi[None, :],
+                mask=row_mask[:, None] & (offs_fbi < FBI)[None, :],
+                other=0).to(tl.int32)
+            word = tl.sum(idx_bytes << (8 * offs_fbi)[None, :], axis=1)
+            offs_fbv = tl.arange(0, FBV_P2)
+            val_bytes = tl.load(
+                K_oval + oval_head_off + blk_scalar * oval_blk_stride
+                + oval_dcol[:, None] + offs_fbv[None, :],
+                mask=row_mask[:, None] & (offs_fbv < FBV)[None, :],
+                other=0).to(tl.int32)
+            vword = tl.sum(val_bytes << (8 * offs_fbv)[None, :], axis=1)
+            if OUTLIER_BITMAP:
+                # LAW #15: O(1)-per-token bitmap + masked prefix-popcount (the
+                # production default) instead of the per-slot membership scan.
+                sel_code, is_outlier = _bitmap_splice_from_word(
+                    sel_code, is_outlier, tok_local, in_block,
+                    row_mask, word, vword, OUTLIER_K, OUTLIER_FP8, VL)
+            else:
+                for s in tl.static_range(OUTLIER_K):
+                    oi_s = (word >> (7 * s)) & 0x7F                 # [K_BYTE]
+                    if OUTLIER_FP8:
+                        ov_s = (vword >> (8 * s)) & 0xFF
+                    else:
+                        ov_s = (vword >> (4 * s)) & 0xF
+                    match = ((oi_s[:, None] == tok_local[None, :])
+                             & in_block[None, :] & row_mask[:, None])
+                    sel_code = tl.where(match & (~is_outlier), ov_s[:, None],
+                                        sel_code)
+                    is_outlier = is_outlier | match
+        else:
+            sel_code, is_outlier = _relidx7_splice_block(
+                sel_code, is_outlier, tok_local, blk_scalar, in_block,
+                K_oidx, K_oval, oidx_head_off, oidx_blk_stride, oidx_dcol,
+                oval_head_off, oval_blk_stride, oval_dcol, row_mask,
+                OUTLIER_K, RELIDX_PACKED, OUTLIER_FP8)
+        if OUTLIER_FP8:
+            # dead branch (i4f8 removed 2026-07-02; OUTLIER_FP8 always False).
+            # FP8 e4m3fn in ALU: exp=(c>>3)&0xF, mant=c&7,
+            # |v| = mant·2^-9 (exp==0 subnormal) else (1 + mant/8)·2^(exp-7);
+            # bit7 = sign. Int shifts only (no SFU exp2 — the exponent is small).
+            ce = (sel_code >> 3) & 0xF
+            cm = (sel_code & 0x7).to(tl.float32)
+            sub = cm * 0.001953125                              # 2^-9
+            # 2^(exp-7): exp in [1,15] -> shift the implicit 1.m by (exp-7).
+            shift = ce - 7
+            pow_up = (((zero_db + 1) << tl.where(shift > 0, shift, 0))).to(tl.float32)
+            pow_dn = (((zero_db + 1) << tl.where(shift < 0, -shift, 0))).to(tl.float32)
+            norm = (1.0 + cm * 0.125) * (pow_up / pow_dn)
+            mag = tl.where(ce == 0, sub, norm)
+            lvl = tl.where((sel_code & 0x80) != 0, -mag, mag).to(base_level.dtype)
+        else:
+            # FP4 e2m1f in ALU: e=(c>>1)&3, m=c&1, |v| = 0.5*m for e==0 else
+            # (2+m)*2^(e-2) = (2+m)*0.25*(1<<e); bit3 = sign. Int shifts only.
+            e = (sel_code >> 1) & 0x3
+            m = (sel_code & 0x1).to(tl.float32)
+            mag = tl.where(e == 0, 0.5 * m,
+                           (2.0 + m) * 0.25 * ((zero_db + 1) << e).to(tl.float32))
+            lvl = tl.where((sel_code & 0x8) != 0, -mag, mag).to(base_level.dtype)
+        return tl.where(is_outlier, lvl, base_level)
+
+    @triton.jit
+    def _canonical_single_group_splice_maplvl(
+        base_level, tok_local, blk_scalar, in_block, row_mask,
+        K_oidx, K_oval, K_crank, K_obmp, BINOM_LUT,
+        oidx_head_off, oidx_blk_stride, oidx_dcol,
+        oval_head_off, oval_blk_stride, oval_dcol,
+        crank_head_off, crank_blk_stride, crank_dcol,
+        bmp_head_off, bmp_blk_stride, bmp_dcol,
+        OUTLIER_K: tl.constexpr, RELIDX_PACKED: tl.constexpr,
+        FBI: tl.constexpr, FBI_P2: tl.constexpr,
+        FBV: tl.constexpr, FBV_P2: tl.constexpr,
+        WORD_SPLICE: tl.constexpr,
+        OUTLIER_FP8: tl.constexpr,
+        COMBINADIC_READ: tl.constexpr,
+        FBR: tl.constexpr, FBR_P2: tl.constexpr,
+        BITMAP_READ: tl.constexpr, FBB: tl.constexpr, FBB_P2: tl.constexpr,
+        VL: tl.constexpr,
+        OUTLIER_BITMAP: tl.constexpr = False,
+    ):
+        # DEDICATED-MAP twin of _canonical_single_group_splice: identical membership
+        # logic (same WORD/bitmap/combinadic paths, BIT-EXACT outlier selection) but
+        # returns ``(is_outlier, lvl)`` — the raw FP4 e2m1f LEVEL + the membership
+        # mask — instead of folding the level into base_level. The caller maps the
+        # level with the per-channel weight-space window (lvl/map_scale + o_center)
+        # and ADDS the delta over the base affine (the DECOUPLE; the level is NOT
+        # base-affine so it must not enter the s-fold). A separate jit function (not a
+        # RETURN_MAP branch) because Triton forbids two return arities in one kernel.
+        zero_db = (oidx_dcol[:, None] * 0 + tok_local[None, :] * 0).to(tl.int32)
+        sel_code = zero_db
+        is_outlier = zero_db != 0
+        if BITMAP_READ:
+            # STORED FLAT BITMASK (paper item B4): the resident outlier-position plane
+            # is ``k_obmp`` — ceil(VL/8) bytes per (group, head, channel) frame, one bit
+            # per token position — NOT the relidx7 bitstream. One wide byte-tile load
+            # per frame, then the SAME O(1) membership + prefix-popcount rank the
+            # relidx7 OUTLIER_BITMAP lane derives in registers. The ``k_oval`` VALUE
+            # read is byte-for-byte the relidx7 one (ascending-position nibbles).
+            # Hardware-verified — see _bitmap_splice_from_bytes.
+            offs_fbb = tl.arange(0, FBB_P2)
+            bmp_bytes = tl.load(
+                K_obmp + bmp_head_off + blk_scalar * bmp_blk_stride
+                + bmp_dcol[:, None] + offs_fbb[None, :],
+                mask=row_mask[:, None] & (offs_fbb < FBB)[None, :],
+                other=0).to(tl.int32)
+            offs_fbv = tl.arange(0, FBV_P2)
+            val_bytes = tl.load(
+                K_oval + oval_head_off + blk_scalar * oval_blk_stride
+                + oval_dcol[:, None] + offs_fbv[None, :],
+                mask=row_mask[:, None] & (offs_fbv < FBV)[None, :],
+                other=0).to(tl.int32)
+            vword = tl.sum(val_bytes << (8 * offs_fbv)[None, :], axis=1)
+            sel_code, is_outlier = _bitmap_splice_from_bytes(
+                sel_code, is_outlier, tok_local, in_block, row_mask,
+                bmp_bytes, vword, OUTLIER_K, OUTLIER_FP8, VL, FBB, FBB_P2)
+        elif COMBINADIC_READ:
+            offs_fbr = tl.arange(0, FBR_P2)
+            rank_bytes = tl.load(
+                K_crank + crank_head_off + blk_scalar * crank_blk_stride
+                + crank_dcol[:, None] + offs_fbr[None, :],
+                mask=row_mask[:, None] & (offs_fbr < FBR)[None, :],
+                other=0).to(tl.int32)
+            rank = tl.sum(rank_bytes << (8 * offs_fbr)[None, :], axis=1)
+            offs_fbv = tl.arange(0, FBV_P2)
+            val_bytes = tl.load(
+                K_oval + oval_head_off + blk_scalar * oval_blk_stride
+                + oval_dcol[:, None] + offs_fbv[None, :],
+                mask=row_mask[:, None] & (offs_fbv < FBV)[None, :],
+                other=0).to(tl.int32)
+            vword = tl.sum(val_bytes << (8 * offs_fbv)[None, :], axis=1)
+            for s in tl.static_range(OUTLIER_K):
+                oi_s = _combinadic_unrank_oi(rank, s, BINOM_LUT, OUTLIER_K, VL)
+                if OUTLIER_FP8:
+                    ov_s = (vword >> (8 * s)) & 0xFF
+                else:
+                    ov_s = (vword >> (4 * s)) & 0xF
+                match = ((oi_s[:, None] == tok_local[None, :])
+                         & in_block[None, :] & row_mask[:, None])
+                sel_code = tl.where(match & (~is_outlier), ov_s[:, None], sel_code)
+                is_outlier = is_outlier | match
+        elif RELIDX_PACKED and WORD_SPLICE:
+            offs_fbi = tl.arange(0, FBI_P2)
+            idx_bytes = tl.load(
+                K_oidx + oidx_head_off + blk_scalar * oidx_blk_stride
+                + oidx_dcol[:, None] + offs_fbi[None, :],
+                mask=row_mask[:, None] & (offs_fbi < FBI)[None, :],
+                other=0).to(tl.int32)
+            word = tl.sum(idx_bytes << (8 * offs_fbi)[None, :], axis=1)
+            offs_fbv = tl.arange(0, FBV_P2)
+            val_bytes = tl.load(
+                K_oval + oval_head_off + blk_scalar * oval_blk_stride
+                + oval_dcol[:, None] + offs_fbv[None, :],
+                mask=row_mask[:, None] & (offs_fbv < FBV)[None, :],
+                other=0).to(tl.int32)
+            vword = tl.sum(val_bytes << (8 * offs_fbv)[None, :], axis=1)
+            if OUTLIER_BITMAP:
+                sel_code, is_outlier = _bitmap_splice_from_word(
+                    sel_code, is_outlier, tok_local, in_block,
+                    row_mask, word, vword, OUTLIER_K, OUTLIER_FP8, VL)
+            else:
+                for s in tl.static_range(OUTLIER_K):
+                    oi_s = (word >> (7 * s)) & 0x7F
+                    if OUTLIER_FP8:
+                        ov_s = (vword >> (8 * s)) & 0xFF
+                    else:
+                        ov_s = (vword >> (4 * s)) & 0xF
+                    match = ((oi_s[:, None] == tok_local[None, :])
+                             & in_block[None, :] & row_mask[:, None])
+                    sel_code = tl.where(match & (~is_outlier), ov_s[:, None], sel_code)
+                    is_outlier = is_outlier | match
+        else:
+            sel_code, is_outlier = _relidx7_splice_block(
+                sel_code, is_outlier, tok_local, blk_scalar, in_block,
+                K_oidx, K_oval, oidx_head_off, oidx_blk_stride, oidx_dcol,
+                oval_head_off, oval_blk_stride, oval_dcol, row_mask,
+                OUTLIER_K, RELIDX_PACKED, OUTLIER_FP8)
+        if OUTLIER_FP8:
+            ce = (sel_code >> 3) & 0xF
+            cm = (sel_code & 0x7).to(tl.float32)
+            sub = cm * 0.001953125
+            shift = ce - 7
+            pow_up = (((zero_db + 1) << tl.where(shift > 0, shift, 0))).to(tl.float32)
+            pow_dn = (((zero_db + 1) << tl.where(shift < 0, -shift, 0))).to(tl.float32)
+            norm = (1.0 + cm * 0.125) * (pow_up / pow_dn)
+            mag = tl.where(ce == 0, sub, norm)
+            lvl = tl.where((sel_code & 0x80) != 0, -mag, mag).to(base_level.dtype)
+        else:
+            e = (sel_code >> 1) & 0x3
+            m = (sel_code & 0x1).to(tl.float32)
+            mag = tl.where(e == 0, 0.5 * m,
+                           (2.0 + m) * 0.25 * ((zero_db + 1) << e).to(tl.float32))
+            lvl = tl.where((sel_code & 0x8) != 0, -mag, mag).to(base_level.dtype)
+        return is_outlier, lvl
+
+    # --- CANONICAL-KV q·zp preamble ---------------------------------------
+    @triton.jit
+    def _canonical_qzp_preamble(
+        Q, K_zp, Req_to_groups, B_Seqlen, QZP,
+        sm_scale,
+        stride_req_grp_b,
+        stride_qbs, stride_qh,
+        stride_kz_g, stride_kz_h, stride_kz_d,
+        stride_qzp_b, stride_qzp_h, stride_qzp_g,
+        q_head_num: tl.constexpr,
+        BLOCK_DMODEL: tl.constexpr,
+        Lk: tl.constexpr,
+        GROUP_TOKENS: tl.constexpr,
+        GROUP_SIZE: tl.constexpr,
+        BLOCK_H: tl.constexpr,
+        BLOCK_G: tl.constexpr,
+    ):
+        # ONE tiny launch per decode step: QZP[b, h, g] = sm_scale * q[b,h,:] ·
+        # zp[req_to_group[b,g], kv(h), :] for every logical 32-token group g of
+        # every request. Removes the per-(tile × split) q·zp_g reduction (and
+        # the K_zp re-reads) from the stage-1 hot loop — stage-1 then loads one
+        # scalar per (head, group). [BLOCK_H, D] x [D, BLOCK_G] tl.dot.
+        cur_batch = tl.program_id(0)
+        cur_kv_head = tl.program_id(1)
+        g_block = tl.program_id(2)
+        cur_head = cur_kv_head * GROUP_SIZE + tl.arange(0, BLOCK_H)
+        mask_h = (tl.arange(0, BLOCK_H) < GROUP_SIZE) & (cur_head < q_head_num)
+        offs_d = tl.arange(0, BLOCK_DMODEL)
+        mask_d = offs_d < Lk
+        seq = tl.load(B_Seqlen + cur_batch)
+        n_groups = tl.cdiv(seq, GROUP_TOKENS)
+        if g_block * BLOCK_G >= n_groups:
+            return
+        offs_g = g_block * BLOCK_G + tl.arange(0, BLOCK_G)
+        mask_g = offs_g < n_groups
+        g_phys = tl.load(Req_to_groups + stride_req_grp_b * cur_batch + offs_g,
+                         mask=mask_g, other=0)
+        q = tl.load(Q + cur_batch * stride_qbs + cur_head[:, None] * stride_qh
+                    + offs_d[None, :],
+                    mask=mask_h[:, None] & mask_d[None, :], other=0.0)
+        zp = tl.load(K_zp + g_phys[:, None] * stride_kz_g
+                     + cur_kv_head * stride_kz_h + offs_d[None, :] * stride_kz_d,
+                     mask=mask_g[:, None] & mask_d[None, :], other=0.0)
+        acc = tl.dot(q, tl.trans(zp.to(q.dtype))) * sm_scale
+        tl.store(QZP + cur_batch * stride_qzp_b + cur_head[:, None] * stride_qzp_h
+                 + offs_g[None, :] * stride_qzp_g,
+                 acc, mask=mask_h[:, None] & mask_g[None, :])
+
+    # --- CANONICAL-KV split-KV stage-1 (K per-channel vl=32 + V per-token vl=32) -
+    @triton.jit
+    def _canonical_splitkv_stage1(
+        Q,
+        K_base, K_scale, K_oidx, K_oval, K_crank, K_obmp, BINOM_LUT,
+        K_mapscale, K_mapcenter,
+        V_main, V_scale, V_zp,
+        QZP,
+        K_zp,
+        sm_scale,
+        Req_to_tokens, Req_to_groups, B_Seqlen,
+        Att_Out,
+        stride_req_tok_b, stride_req_grp_b,
+        stride_qbs, stride_qh,
+        stride_mid_ob, stride_mid_oh, stride_mid_os,
+        stride_kb_tok, stride_kb_h,
+        stride_ks_g, stride_ks_h, stride_ks_d,
+        stride_qzp_b, stride_qzp_h, stride_qzp_g,
+        stride_kz_g, stride_kz_h, stride_kz_d,
+        stride_koidx_g, stride_koidx_h, stride_koidx_d,
+        stride_koval_g, stride_koval_h, stride_koval_d,
+        stride_kcr_g, stride_kcr_h, stride_kcr_d,
+        stride_kbm_g, stride_kbm_h, stride_kbm_d,
+        stride_kms_g, stride_kms_h, stride_kms_d,
+        stride_kmc_g, stride_kmc_h, stride_kmc_d,
+        stride_vm_tok, stride_vm_h,
+        stride_vs_tok, stride_vs_h, stride_vs_g,
+        stride_vz_tok, stride_vz_h, stride_vz_g,
+        q_head_num: tl.constexpr,
+        BLOCK_DMODEL: tl.constexpr,
+        BLOCK_DV: tl.constexpr,
+        NUM_KV_SPLITS: tl.constexpr,
+        PAGE_SIZE: tl.constexpr,
+        START_OFFSET: tl.constexpr,
+        logit_cap: tl.constexpr,
+        Lk: tl.constexpr,
+        Lv: tl.constexpr,
+        K_OUTLIER_K: tl.constexpr,
+        RELIDX_PACKED: tl.constexpr,
+        FBI: tl.constexpr,
+        FBI_P2: tl.constexpr,
+        FBV: tl.constexpr,
+        FBV_P2: tl.constexpr,
+        WORD_SPLICE: tl.constexpr,
+        OUTLIER_FP8: tl.constexpr,
+        COMBINADIC_READ: tl.constexpr,
+        FBR: tl.constexpr,
+        FBR_P2: tl.constexpr,
+        BITMAP_READ: tl.constexpr,
+        FBB: tl.constexpr,
+        FBB_P2: tl.constexpr,
+        VL: tl.constexpr,
+        OUTLIER_BITMAP: tl.constexpr,
+        KV_OUTLIER_MAP: tl.constexpr,
+        K_DECOUPLE: tl.constexpr,
+        K_SCALE_INT8: tl.constexpr,
+        V_SCALE_INT8: tl.constexpr,
+        K_BASE_BITS: tl.constexpr,
+        GROUP_TOKENS: tl.constexpr,
+        GROUP_CHANNELS: tl.constexpr,
+        GROUP_SIZE: tl.constexpr,
+        BLOCK_H: tl.constexpr,
+        CANON_V_HOIST: tl.constexpr,
+        CANON_SPLIT_PV: tl.constexpr,
+        CANON_K_HOIST: tl.constexpr,
+        V_VLUT: tl.constexpr,
+        V_VLOP3: tl.constexpr,
+        V_INT_PV: tl.constexpr,
+        CANON_WIDE_N: tl.constexpr,
+        N_GROUPS_PER_TILE: tl.constexpr,
+        WIDE_STAGES: tl.constexpr,
+        SKIP_QZP: tl.constexpr,
+        FOLD_QZP: tl.constexpr,
+        SEG_GROUP_BASE: tl.constexpr,
+        ABL: tl.constexpr,
+        FP8_QK: tl.constexpr,
+    ):
+        # ===== ABLATION-ONLY (timing, PARITY-BREAKING) — see launcher env gate =====
+        # ABL bit-encodes four differential-timing SKIPs, each isolating ONE decode
+        # cost so its TPOT delta is measurable (ncu is admin-blocked cluster-wide):
+        #   bit0 ABL_NO_OUTLIER  -> skip the relidx7 O(k) outlier splice entirely
+        #   bit1 ABL_V_NODEQUANT -> skip the V INT2->bf16 dequant (garbage V tile)
+        #   bit2 ABL_K_NODEQUANT -> skip the K dequant (no s-fold, no qzp)
+        #   bit3 ABL_NO_UNPACK   -> force the K/V raw codes to a CONSTANT (skip the
+        #                           (packed>>sh)&0x3 bit-extract ALU) but KEEP the
+        #                           scale/zp multiply + the outlier path. Isolates the
+        #                           bit-extraction ALU from the scale/zp dequant:
+        #                             (full)-(NO_UNPACK)        = bit-extract ALU alone
+        #                             (NO_UNPACK)-(V|K_NODEQUANT)= scale/zp dequant alone
+        # Each branch is a tl.constexpr so the skipped work compiles OUT (no runtime
+        # cost in the kept config). NOT for production; default ABL=0 (all off).
+        ABL_NO_OUTLIER: tl.constexpr = (ABL & 1) != 0
+        ABL_V_NODEQUANT: tl.constexpr = (ABL & 2) != 0
+        ABL_K_NODEQUANT: tl.constexpr = (ABL & 4) != 0
+        ABL_NO_UNPACK: tl.constexpr = (ABL & 8) != 0
+        # ===========================================================================
+        # LEVER 1 RECONCILE: V_VLUT bakes vz INTO the 4 levels (L_i = i*vs + vz), so
+        # the fast-path output is the FULL dequant code*vs+vz — the +vz is already
+        # present and the split-PV bias dot would DOUBLE-COUNT it. So the effective
+        # split-PV is forced OFF whenever VLUT is active. V_VLOP3 only changes how the
+        # raw code reaches bf16 (lop3 splice vs (>>sh)&3 cast); the v*vs+vz / split-PV
+        # math downstream is unchanged, so VLOP3 stays compatible with CANON_SPLIT_PV.
+        EFF_SPLIT_PV: tl.constexpr = (CANON_SPLIT_PV or V_INT_PV) and (not V_VLUT)
+        # V_INT_PV (FA/flashinfer idiom): keep V codes RAW (no per-element v*vs), fold
+        # the per-(token,channel-group) vs into P per group -> NGV masked-sum dots. The
+        # vz bias rides the existing acc_bias=dot(p,vz_b). Removes the 12-23ms V-mul.
+        EFF_INT_PV: tl.constexpr = V_INT_PV and (not V_VLUT)
+        # CANONICAL KV mode (see ommx_paged_decode_attention_canonical for the
+        # full ABI contract). The per-channel K fold: dequant(k)[d,t] =
+        # c[d,t]*s[d,g] + zp[d,g] (g = token-group t//32), so
+        #   qk[t] = dot(q*sm_scale, s_g∘c[:,t]) + QZP[b,h,g]
+        # — s_g is loaded ONCE per tile (BLOCK_N == GROUP_TOKENS and every
+        # split starts on a group boundary, so a tile covers EXACTLY one group)
+        # and folded into the K CODES in registers. The q·zp_g term is
+        # PRECOMPUTED for all groups by _canonical_qzp_preamble (one launch per
+        # step) and enters as a scalar load per (head, group). An FP4 outlier
+        # at (d,t) splices the e2m1f LEVEL in place of the code BEFORE the
+        # s-multiply (same ·s + zp affine map ⇒ the fold stays exact). V is
+        # per-token vl=32: PV uses v_final = code*vs[t, c//32] + vzp[t, c//32].
+        #
+        # NOTE (extraction): CANON_WIDE_N is a dead, constexpr-FALSE branch in
+        # this file (the launcher always passes False) — see module header.
+        cur_batch = tl.program_id(0)
+        cur_kv_head = tl.program_id(1)
+        split_kv_id = tl.program_id(2)
+        cur_head = cur_kv_head * GROUP_SIZE + tl.arange(0, BLOCK_H)
+        mask_h = (tl.arange(0, BLOCK_H) < GROUP_SIZE) & (cur_head < q_head_num)
+
+        K_BYTE_COUNT: tl.constexpr = BLOCK_DMODEL // 2
+        offs_kbyte = tl.arange(0, K_BYTE_COUNT)
+        offs_de = offs_kbyte * 2
+        offs_do = offs_de + 1
+        mask_de = offs_de < Lk
+        mask_do = offs_do < Lk
+
+        V_BYTE_COUNT: tl.constexpr = BLOCK_DV // 4
+        VG_BYTES: tl.constexpr = GROUP_CHANNELS // 4
+        NGV: tl.constexpr = BLOCK_DV // GROUP_CHANNELS
+        offs_vbyte = tl.arange(0, V_BYTE_COUNT)
+        offs_v0 = offs_vbyte * 4
+        offs_v1 = offs_v0 + 1
+        offs_v2 = offs_v0 + 2
+        offs_v3 = offs_v0 + 3
+        mask_vbyte = offs_v0 < Lv
+        mask_v1 = offs_v1 < Lv
+        mask_v2 = offs_v2 < Lv
+        mask_v3 = offs_v3 < Lv
+        offs_vg = tl.arange(0, NGV)
+        mask_vg = offs_vg * GROUP_CHANNELS < Lv
+
+        # Wave-3 Stage B (CANON_WIDE_N): process N_GROUPS_PER_TILE consecutive
+        # 32-token scale-groups per loop iteration so the V dequant + 4-lane PV
+        # dot + online-softmax rescale are amortized over N_TILE tokens (the V
+        # side is the per-program tax; the K fold/splice stay EXACT per 32-group).
+        N_TILE: tl.constexpr = N_GROUPS_PER_TILE * GROUP_TOKENS
+        V_SMEM_BYTES: tl.constexpr = N_TILE * BLOCK_DV * 2 * WIDE_STAGES
+        if CANON_WIDE_N:
+            tl.static_assert(
+                V_SMEM_BYTES <= 200 * 1024,
+                "CANON_WIDE_N V smem tile exceeds the 200 KiB safe cap; lower "
+                "N_GROUPS_PER_TILE or WIDE_STAGES for this head_dim.")
+
+        # SEGMENT partial-emit (cascade / context-parallel / radix-split): when
+        # SEG_GROUP_BASE > 0 this program attends ONLY the group-range sub-segment
+        # [SEG_GROUP_BASE, SEG_GROUP_BASE + n_seg_groups) of the request. B_Seqlen
+        # carries the SEGMENT token count (the caller's segment length, group-
+        # aligned at the base). The packed-relative token / group / qzp indices are
+        # shifted by the segment base (page addressing by SEG_TOK_BASE; group-slot
+        # and qzp by SEG_GROUP_BASE) so the split-KV math, online-softmax, and the
+        # stored (o = acc/e_sum, lse = e_max + log e_sum) are EXACTLY this segment's
+        # un-merged softmax state — the caller composes segments via
+        # merge_attention_states. SEG_GROUP_BASE == 0 is the full-range default
+        # (constexpr-folded to no-ops). NOTE: 32-token groups are page-aligned
+        # (page_size | GROUP_TOKENS), so SEG_TOK_BASE never splits a page.
+        SEG_TOK_BASE: tl.constexpr = SEG_GROUP_BASE * GROUP_TOKENS
+        cur_batch_seq_len = tl.load(B_Seqlen + cur_batch)
+        kv_len_per_split = tl.cdiv(
+            tl.cdiv(cur_batch_seq_len, NUM_KV_SPLITS), GROUP_TOKENS) * GROUP_TOKENS
+        split_kv_start = kv_len_per_split * split_kv_id
+        split_kv_end = tl.minimum(split_kv_start + kv_len_per_split, cur_batch_seq_len)
+
+        e_max = tl.zeros([BLOCK_H], dtype=tl.float32) - float("inf")
+        e_sum = tl.zeros([BLOCK_H], dtype=tl.float32)
+        acc_v0 = tl.zeros([BLOCK_H, V_BYTE_COUNT], dtype=tl.float32)
+        acc_v1 = tl.zeros([BLOCK_H, V_BYTE_COUNT], dtype=tl.float32)
+        acc_v2 = tl.zeros([BLOCK_H, V_BYTE_COUNT], dtype=tl.float32)
+        acc_v3 = tl.zeros([BLOCK_H, V_BYTE_COUNT], dtype=tl.float32)
+        if EFF_SPLIT_PV:
+            acc_bias = tl.zeros([BLOCK_H, V_BYTE_COUNT], dtype=tl.float32)
+
+        offs_qg = cur_batch * stride_qbs + cur_head[:, None] * stride_qh
+        q_even = tl.load(Q + offs_qg + offs_de[None, :],
+                         mask=mask_h[:, None] & mask_de[None, :], other=0.0)
+        q_odd = tl.load(Q + offs_qg + offs_do[None, :],
+                        mask=mask_h[:, None] & mask_do[None, :], other=0.0)
+        q_even_c = (q_even.to(tl.float32) * sm_scale).to(q_even.dtype)
+        q_odd_c = (q_odd.to(tl.float32) * sm_scale).to(q_odd.dtype)
+        qzp_base = QZP + cur_batch * stride_qzp_b + cur_head * stride_qzp_h
+
+        if split_kv_end > split_kv_start:
+            grp_base = Req_to_groups + stride_req_grp_b * cur_batch
+            if CANON_WIDE_N:
+              # ---- Wave-3 Stage B: wider-N tile (N_GROUPS_PER_TILE×32 tokens) --
+              offs_nt = tl.arange(0, N_TILE)
+              sub_of_col = (offs_nt // GROUP_TOKENS)         # which 32-group [N_TILE]
+              tok_local_w = (offs_nt % GROUP_TOKENS).to(tl.int32)
+              offs_ng = tl.arange(0, N_GROUPS_PER_TILE)
+              for start_tile in range(split_kv_start, split_kv_end, N_TILE):
+                offs_n = start_tile + offs_nt
+                token_mask = offs_n < split_kv_end
+                offs_phys = offs_n + START_OFFSET
+                kv_page_number = tl.load(
+                    Req_to_tokens + stride_req_tok_b * cur_batch + offs_phys // PAGE_SIZE,
+                    mask=token_mask, other=0,
+                )
+                kv_loc = kv_page_number * PAGE_SIZE + offs_phys % PAGE_SIZE
+                lg0 = start_tile // GROUP_TOKENS
+                lg_vec = lg0 + offs_ng
+                lg_valid = (start_tile + offs_ng * GROUP_TOKENS) < split_kv_end
+                g_phys_vec = tl.load(grp_base + tl.minimum(
+                    lg_vec, (split_kv_end - 1) // GROUP_TOKENS), mask=lg_valid, other=0)
+
+                if CANON_V_HOIST:
+                    v_packed_pf = tl.load(
+                        V_main + kv_loc[:, None] * stride_vm_tok
+                        + cur_kv_head * stride_vm_h + offs_vbyte[None, :],
+                        mask=token_mask[:, None] & mask_vbyte[None, :], other=0,
+                    ).to(tl.int32)
+                    vs4_pf = tl.load(V_scale + kv_loc[:, None] * stride_vs_tok
+                                     + cur_kv_head * stride_vs_h
+                                     + offs_vg[None, :] * stride_vs_g,
+                                     mask=token_mask[:, None] & mask_vg[None, :],
+                                     other=0.0).to(tl.bfloat16)
+                    vz4_pf = tl.load(V_zp + kv_loc[:, None] * stride_vz_tok
+                                     + cur_kv_head * stride_vz_h
+                                     + offs_vg[None, :] * stride_vz_g,
+                                     mask=token_mask[:, None] & mask_vg[None, :],
+                                     other=0.0).to(tl.bfloat16)
+
+                ks_base = (g_phys_vec[None, :] * stride_ks_g
+                           + cur_kv_head * stride_ks_h)
+                s_e_g = tl.load(K_scale + ks_base + offs_de[:, None] * stride_ks_d,
+                                mask=mask_de[:, None] & lg_valid[None, :],
+                                other=0.0).to(q_even.dtype)
+                s_o_g = tl.load(K_scale + ks_base + offs_do[:, None] * stride_ks_d,
+                                mask=mask_do[:, None] & lg_valid[None, :],
+                                other=0.0).to(q_odd.dtype)
+                s_e_w = tl.reshape(
+                    tl.broadcast_to(s_e_g[:, :, None],
+                                    [K_BYTE_COUNT, N_GROUPS_PER_TILE, GROUP_TOKENS]),
+                    [K_BYTE_COUNT, N_TILE])
+                s_o_w = tl.reshape(
+                    tl.broadcast_to(s_o_g[:, :, None],
+                                    [K_BYTE_COUNT, N_GROUPS_PER_TILE, GROUP_TOKENS]),
+                    [K_BYTE_COUNT, N_TILE])
+                if SKIP_QZP:
+                    q_zp_w = tl.zeros([BLOCK_H, N_TILE], dtype=tl.float32)
+                else:
+                    q_zp_g = tl.load(
+                        qzp_base[:, None] + lg_vec[None, :] * stride_qzp_g,
+                        mask=mask_h[:, None] & lg_valid[None, :], other=0.0)
+                    q_zp_w = tl.reshape(
+                        tl.broadcast_to(q_zp_g[:, :, None],
+                                        [BLOCK_H, N_GROUPS_PER_TILE, GROUP_TOKENS]),
+                        [BLOCK_H, N_TILE])
+
+                if K_BASE_BITS == 4:
+                    # dead branch (i4f8 removed 2026-07-02; K_BASE_BITS always 2):
+                    # INT4 base 2 codes/byte, byte = offs_kbyte, even = low
+                    # nibble / odd = high nibble.
+                    base_packed = tl.load(
+                        K_base + kv_loc[None, :] * stride_kb_tok
+                        + cur_kv_head * stride_kb_h + offs_kbyte[:, None],
+                        mask=token_mask[None, :] & mask_de[:, None], other=0,
+                    ).to(tl.int32)
+                    code_even = (base_packed & 0xF).to(tl.int32)
+                    code_odd = ((base_packed >> 4) & 0xF).to(tl.int32)
+                else:
+                    base_packed = tl.load(
+                        K_base + kv_loc[None, :] * stride_kb_tok
+                        + cur_kv_head * stride_kb_h + (offs_kbyte // 2)[:, None],
+                        mask=token_mask[None, :] & mask_de[:, None], other=0,
+                    ).to(tl.int32)
+                    sh2 = ((offs_kbyte % 2) * 4).to(tl.int32)
+                    code_even = ((base_packed >> sh2[:, None]) & 0x3).to(tl.int32)
+                    code_odd = ((base_packed >> (sh2[:, None] + 2)) & 0x3).to(tl.int32)
+                k_even = code_even.to(q_even.dtype)
+                k_odd = code_odd.to(q_odd.dtype)
+                if K_OUTLIER_K > 0:
+                    for gi in tl.static_range(N_GROUPS_PER_TILE):
+                        in_blk = (sub_of_col == gi) & token_mask
+                        g_phys_i = tl.load(
+                            grp_base + tl.minimum(lg0 + gi,
+                                                  (split_kv_end - 1) // GROUP_TOKENS),
+                            mask=(start_tile + gi * GROUP_TOKENS) < split_kv_end,
+                            other=0)
+                        k_even = _canonical_single_group_splice(
+                            k_even, tok_local_w, g_phys_i, in_blk, mask_de,
+                            K_oidx, K_oval, K_crank, K_obmp, BINOM_LUT,
+                            cur_kv_head * stride_koidx_h, stride_koidx_g,
+                            offs_de * stride_koidx_d,
+                            cur_kv_head * stride_koval_h, stride_koval_g,
+                            offs_de * stride_koval_d,
+                            cur_kv_head * stride_kcr_h, stride_kcr_g,
+                            offs_de * stride_kcr_d,
+                            cur_kv_head * stride_kbm_h, stride_kbm_g,
+                            offs_de * stride_kbm_d,
+                            K_OUTLIER_K, RELIDX_PACKED,
+                            FBI, FBI_P2, FBV, FBV_P2, WORD_SPLICE, OUTLIER_FP8,
+                            COMBINADIC_READ, FBR, FBR_P2,
+                            BITMAP_READ, FBB, FBB_P2, VL,
+                            OUTLIER_BITMAP)
+                        k_odd = _canonical_single_group_splice(
+                            k_odd, tok_local_w, g_phys_i, in_blk, mask_do,
+                            K_oidx, K_oval, K_crank, K_obmp, BINOM_LUT,
+                            cur_kv_head * stride_koidx_h, stride_koidx_g,
+                            offs_do * stride_koidx_d,
+                            cur_kv_head * stride_koval_h, stride_koval_g,
+                            offs_do * stride_koval_d,
+                            cur_kv_head * stride_kcr_h, stride_kcr_g,
+                            offs_do * stride_kcr_d,
+                            cur_kv_head * stride_kbm_h, stride_kbm_g,
+                            offs_do * stride_kbm_d,
+                            K_OUTLIER_K, RELIDX_PACKED,
+                            FBI, FBI_P2, FBV, FBV_P2, WORD_SPLICE, OUTLIER_FP8,
+                            COMBINADIC_READ, FBR, FBR_P2,
+                            BITMAP_READ, FBB, FBB_P2, VL,
+                            OUTLIER_BITMAP)
+
+                k_even = k_even * s_e_w
+                k_odd = k_odd * s_o_w
+                qk = (_grouped_qk_accumulate(q_even_c, k_even, BLOCK_H).to(tl.float32)
+                      + _grouped_qk_accumulate(q_odd_c, k_odd, BLOCK_H).to(tl.float32)
+                      + q_zp_w)
+                if logit_cap > 0:
+                    qk = logit_cap * (2 * tl.sigmoid(2 * qk / logit_cap) - 1)
+                qk = tl.where(mask_h[:, None] & token_mask[None, :], qk, float("-inf"))
+
+                n_e_max = tl.maximum(tl.max(qk, 1), e_max)
+                re_scale = tl.exp(e_max - n_e_max)
+                p = tl.exp(qk - n_e_max[:, None])
+                acc_v0 *= re_scale[:, None]
+                acc_v1 *= re_scale[:, None]
+                acc_v2 *= re_scale[:, None]
+                acc_v3 *= re_scale[:, None]
+                if EFF_SPLIT_PV:
+                    acc_bias *= re_scale[:, None]
+
+                if CANON_V_HOIST:
+                    v_packed = v_packed_pf
+                    vs4 = vs4_pf
+                    vz4 = vz4_pf
+                else:
+                    v_packed = tl.load(
+                        V_main + kv_loc[:, None] * stride_vm_tok
+                        + cur_kv_head * stride_vm_h + offs_vbyte[None, :],
+                        mask=token_mask[:, None] & mask_vbyte[None, :], other=0,
+                    ).to(tl.int32)
+                    vs4 = tl.load(V_scale + kv_loc[:, None] * stride_vs_tok
+                                  + cur_kv_head * stride_vs_h
+                                  + offs_vg[None, :] * stride_vs_g,
+                                  mask=token_mask[:, None] & mask_vg[None, :],
+                                  other=0.0).to(tl.bfloat16)
+                    vz4 = tl.load(V_zp + kv_loc[:, None] * stride_vz_tok
+                                  + cur_kv_head * stride_vz_h
+                                  + offs_vg[None, :] * stride_vz_g,
+                                  mask=token_mask[:, None] & mask_vg[None, :],
+                                  other=0.0).to(tl.bfloat16)
+                # WIDE_N is dead (constexpr-False); the V dequant fast-paths
+                # (VLUT/VLOP3) are wired in the production Stage-A loop only, so
+                # this branch keeps the canonical (>>sh)&3 cast + v*vs+vz math.
+                v0 = (v_packed & 0x3).to(tl.bfloat16)
+                v1 = ((v_packed >> 2) & 0x3).to(tl.bfloat16)
+                v2 = ((v_packed >> 4) & 0x3).to(tl.bfloat16)
+                v3 = ((v_packed >> 6) & 0x3).to(tl.bfloat16)
+                vs_b = tl.reshape(
+                    tl.broadcast_to(vs4[:, :, None],
+                                    [N_TILE, NGV, VG_BYTES]),
+                    [N_TILE, V_BYTE_COUNT])
+                vz_b = tl.reshape(
+                    tl.broadcast_to(vz4[:, :, None],
+                                    [N_TILE, NGV, VG_BYTES]),
+                    [N_TILE, V_BYTE_COUNT])
+                if EFF_SPLIT_PV:
+                    v_sc0 = v0 * vs_b
+                    v_sc1 = v1 * vs_b
+                    v_sc2 = v2 * vs_b
+                    v_sc3 = v3 * vs_b
+                    acc_v0 += _grouped_pv_accumulate(p, v_sc0, BLOCK_H)
+                    acc_v1 += _grouped_pv_accumulate(p, v_sc1, BLOCK_H)
+                    acc_v2 += _grouped_pv_accumulate(p, v_sc2, BLOCK_H)
+                    acc_v3 += _grouped_pv_accumulate(p, v_sc3, BLOCK_H)
+                    acc_bias += _grouped_pv_accumulate(p, vz_b, BLOCK_H)
+                else:
+                    v_final0 = v0 * vs_b + vz_b
+                    v_final1 = v1 * vs_b + vz_b
+                    v_final2 = v2 * vs_b + vz_b
+                    v_final3 = v3 * vs_b + vz_b
+                    acc_v0 += _grouped_pv_accumulate(p, v_final0, BLOCK_H)
+                    acc_v1 += _grouped_pv_accumulate(p, v_final1, BLOCK_H)
+                    acc_v2 += _grouped_pv_accumulate(p, v_final2, BLOCK_H)
+                    acc_v3 += _grouped_pv_accumulate(p, v_final3, BLOCK_H)
+                e_sum = e_sum * re_scale + tl.sum(p, 1)
+                e_max = n_e_max
+            else:
+              g_next = tl.load(grp_base + SEG_GROUP_BASE + split_kv_start // GROUP_TOKENS)
+              for start_n in range(split_kv_start, split_kv_end, GROUP_TOKENS):
+                offs_n = start_n + tl.arange(0, GROUP_TOKENS)
+                token_mask = offs_n < split_kv_end
+                # START_OFFSET = in-page token offset of the packed start (the
+                # serving exact-token sink, e.g. sink [0,8) with page_size=16):
+                # only the (page, slot) addressing shifts — group indexing
+                # (req_to_group / QZP) stays packed-relative. SEG_TOK_BASE adds the
+                # segment's packed token base (page addressing); SEG_GROUP_BASE adds
+                # the segment's group base (group-slot / QZP). Both 0 for full-range.
+                offs_phys = offs_n + SEG_TOK_BASE + START_OFFSET
+                kv_page_number = tl.load(
+                    Req_to_tokens + stride_req_tok_b * cur_batch + offs_phys // PAGE_SIZE,
+                    mask=token_mask, other=0,
+                )
+                kv_loc = kv_page_number * PAGE_SIZE + offs_phys % PAGE_SIZE
+                g_phys = g_next
+                g_next = tl.load(
+                    grp_base + SEG_GROUP_BASE + tl.minimum(start_n + GROUP_TOKENS,
+                                          split_kv_end - 1) // GROUP_TOKENS)
+
+                # V load-hoist (cp.async latency hiding): the packed V bytes +
+                # per-(token, channel-group) scale/zp are loaded HERE at the loop
+                # head — before the QK dot / online-softmax dependency chain — so
+                # their HBM latency overlaps the QK+softmax compute of the SAME
+                # tile. SSA-safe + parity-neutral: value DEFINED early, USED late.
+                if CANON_V_HOIST:
+                    v_packed_pf = tl.load(
+                        V_main + kv_loc[:, None] * stride_vm_tok
+                        + cur_kv_head * stride_vm_h + offs_vbyte[None, :],
+                        mask=token_mask[:, None] & mask_vbyte[None, :], other=0,
+                    ).to(tl.int32)
+                    if V_SCALE_INT8:
+                        vs4_pf = tl.exp2(tl.load(
+                            V_scale + kv_loc[:, None] * stride_vs_tok
+                            + cur_kv_head * stride_vs_h + offs_vg[None, :] * stride_vs_g,
+                            mask=token_mask[:, None] & mask_vg[None, :],
+                            other=0.0).to(tl.float32)).to(tl.bfloat16)
+                    else:
+                        vs4_pf = tl.load(V_scale + kv_loc[:, None] * stride_vs_tok
+                                         + cur_kv_head * stride_vs_h
+                                         + offs_vg[None, :] * stride_vs_g,
+                                         mask=token_mask[:, None] & mask_vg[None, :],
+                                         other=0.0).to(tl.bfloat16)
+                    vz4_pf = tl.load(V_zp + kv_loc[:, None] * stride_vz_tok
+                                     + cur_kv_head * stride_vz_h
+                                     + offs_vg[None, :] * stride_vz_g,
+                                     mask=token_mask[:, None] & mask_vg[None, :],
+                                     other=0.0).to(tl.bfloat16)
+
+                # LEVER 2 K load-hoist (CANON_K_HOIST, cp.async double-buffer): mirror
+                # CANON_V_HOIST for the K base plane so BOTH K and V tiles are issued
+                # at the loop head (before the QK / online-softmax dependency chain)
+                # and num_stages>1 can cp.async-prefetch the NEXT tile's K and V into
+                # the pipeline while the current tile's QK+softmax+PV runs. We hoist
+                # the TOKEN-MAJOR packed-byte tl.load ONLY (the [BLOCK_N, *bytes]
+                # global read); the in-register tl.trans + nibble extract stay at the
+                # decode site (pure ALU, no HBM). SSA-safe + PARITY-NEUTRAL: the same
+                # bytes are read, just DEFINED earlier (CUDA law #4/#12 — gate cos).
+                if CANON_K_HOIST:
+                    if K_BASE_BITS == 4:
+                        kbase_pf = tl.load(
+                            K_base + kv_loc[:, None] * stride_kb_tok
+                            + cur_kv_head * stride_kb_h + offs_kbyte[None, :],
+                            mask=token_mask[:, None] & mask_de[None, :], other=0,
+                        ).to(tl.int32)
+                    else:
+                        PHYS_K_BYTES_PF: tl.constexpr = BLOCK_DMODEL // 4
+                        offs_pkbyte_pf = tl.arange(0, PHYS_K_BYTES_PF)
+                        mask_pkbyte_pf = offs_pkbyte_pf * 4 < Lk
+                        kbase_pf = tl.load(
+                            K_base + kv_loc[:, None] * stride_kb_tok
+                            + cur_kv_head * stride_kb_h + offs_pkbyte_pf[None, :],
+                            mask=token_mask[:, None] & mask_pkbyte_pf[None, :],
+                            other=0,
+                        ).to(tl.int32)
+
+                # Per-(channel, token-group) scale — loaded once per tile,
+                # folded into the K codes below. q·zp_g comes precomputed.
+                ks_base = g_phys * stride_ks_g + cur_kv_head * stride_ks_h
+                if K_SCALE_INT8:
+                    # int8 pow2-exp scale: stored exponent e -> scale = 2^e (BIT-EXACT
+                    # to the use_pow2 bf16 scale). exp2f via tl.exp2 (SFU, one per chan).
+                    s_e = tl.exp2(tl.load(K_scale + ks_base + offs_de * stride_ks_d,
+                                          mask=mask_de, other=0.0).to(tl.float32)
+                                  ).to(q_even.dtype)
+                    s_o = tl.exp2(tl.load(K_scale + ks_base + offs_do * stride_ks_d,
+                                          mask=mask_do, other=0.0).to(tl.float32)
+                                  ).to(q_odd.dtype)
+                else:
+                    s_e = tl.load(K_scale + ks_base + offs_de * stride_ks_d,
+                                  mask=mask_de, other=0.0).to(q_even.dtype)
+                    s_o = tl.load(K_scale + ks_base + offs_do * stride_ks_d,
+                                  mask=mask_do, other=0.0).to(q_odd.dtype)
+                if SKIP_QZP:
+                    q_zp = tl.zeros([BLOCK_H], dtype=tl.float32)
+                elif FOLD_QZP:
+                    # Lever B (qzp preamble fused into stage1): the tile owns
+                    # exactly one token-group (g_phys), so K_zp[g_phys, kvh, :] is
+                    # read ONCE here and reduced against q to form the q·zp_g
+                    # scalar — removing the separate _canonical_qzp_preamble launch
+                    # + its QZP fp32 buffer round-trip. q·zp_g = sm_scale·Σ_d q·zp,
+                    # matching the preamble's dot; uses raw q + one sm_scale (the
+                    # scaled q_*_c are reused for the K dot only).
+                    kz_base = g_phys * stride_kz_g + cur_kv_head * stride_kz_h
+                    zp_e = tl.load(K_zp + kz_base + offs_de * stride_kz_d,
+                                   mask=mask_de, other=0.0).to(tl.float32)
+                    zp_o = tl.load(K_zp + kz_base + offs_do * stride_kz_d,
+                                   mask=mask_do, other=0.0).to(tl.float32)
+                    q_zp = (tl.sum(q_even.to(tl.float32) * zp_e[None, :], 1)
+                            + tl.sum(q_odd.to(tl.float32) * zp_o[None, :], 1)
+                            ) * sm_scale
+                    q_zp = tl.where(mask_h, q_zp, 0.0)
+                else:
+                    q_zp = tl.load(
+                        qzp_base
+                        + (SEG_GROUP_BASE + start_n // GROUP_TOKENS) * stride_qzp_g,
+                        mask=mask_h, other=0.0)
+
+                # LEVER coalesced-K: the K-base DRAM load is now COALESCED (physical
+                # byte on the warp-LANE axis, stride-1, EXACTLY like the V load) and
+                # each byte is fetched ONCE, then TRANSPOSED in-register to the
+                # [K_BYTE_COUNT, BLOCK_N] (channel-row × token-col) layout the QK dot +
+                # per-channel s-fold require. The prior load put the TOKEN axis on the
+                # warp lanes (stride_kb_tok ~256B), so a warp pulled the same DRAM
+                # sectors as bf16 (the 5.3× K byte savings were UNREALIZED) AND read
+                # every byte TWICE (kbyte//2 row-dup before the transpose). k_base
+                # layout [pages, page_size, H, D//{4|2}] is token-major / byte-
+                # contiguous == the V plane, so NO packer repack is needed — only the
+                # kernel load ORIENTATION changes (token-major load, then tl.trans).
+                # PARITY-NEUTRAL: the transpose + broadcast-reshape reproduce the exact
+                # (offs_kbyte//2) gather, and the same sh2/nibble extract runs unchanged
+                # (law #4/#12: gate on cos>=0.9999 — _vl_gpu_parity must stay bit-exact).
+                if K_BASE_BITS == 4:
+                    # dead branch (i4f8 removed 2026-07-02; K_BASE_BITS always 2).
+                    # INT4 base plane (2 channel codes/byte): byte = offs_kbyte,
+                    # even = low nibble / odd = high nibble. Coalesced [BLOCK_N,
+                    # K_BYTE_COUNT] load (byte = lane, stride-1) then transpose to the
+                    # channel-row layout — K_BYTE_COUNT == #physical bytes here (1:1,
+                    # no row-dup needed). CANON_K_HOIST reuses the loop-head prefetch.
+                    if CANON_K_HOIST:
+                        base_packed = tl.trans(kbase_pf)
+                    else:
+                        base_packed = tl.trans(tl.load(
+                            K_base + kv_loc[:, None] * stride_kb_tok
+                            + cur_kv_head * stride_kb_h + offs_kbyte[None, :],
+                            mask=token_mask[:, None] & mask_de[None, :], other=0,
+                        ).to(tl.int32))
+                    if ABL_NO_UNPACK:
+                        # ABLATION: skip the nibble bit-extract ALU (force code 0);
+                        # the s-fold/qzp dequant + outlier splice downstream KEPT, so
+                        # delta vs baseline = the K bit-extract ALU cost ALONE.
+                        code_even = tl.zeros([K_BYTE_COUNT, GROUP_TOKENS], dtype=tl.int32)
+                        code_odd = tl.zeros([K_BYTE_COUNT, GROUP_TOKENS], dtype=tl.int32)
+                    else:
+                        code_even = (base_packed & 0xF).to(tl.int32)
+                        code_odd = ((base_packed >> 4) & 0xF).to(tl.int32)
+                else:
+                    # TRUE 2-bit K base plane (4 channel codes/byte) — V-plane lane map.
+                    # Coalesced [BLOCK_N, PHYS_K_BYTES] load (physical byte = lane,
+                    # stride-1, ONE fetch/byte). Byte b packs channels 4b (bits 1:0),
+                    # 4b+1 (3:2), 4b+2 (5:4), 4b+3 (7:6); kbyte row r of the even tile
+                    # is channel 2r, so rows 2b / 2b+1 are the bit-0 / bit-4 codes of
+                    # byte b (odd tile: bits 2 / 6). The four code planes are extracted
+                    # on the token-major tile, cast to bf16, and the two planes of each
+                    # tile are INTERLEAVED along the byte axis, then transposed — NO
+                    # replicated [K_BYTE_COUNT, BLOCK_N] int32 tile is materialised
+                    # (the previous broadcast+reshape held every byte twice in int32
+                    # for the sh2 extract). Same integer codes in the same row order
+                    # -> BIT-EXACT to the replicated-tile extract.
+                    PHYS_K_BYTES: tl.constexpr = BLOCK_DMODEL // 4
+                    offs_pkbyte = tl.arange(0, PHYS_K_BYTES)
+                    mask_pkbyte = offs_pkbyte * 4 < Lk
+                    if CANON_K_HOIST:
+                        kpk = kbase_pf                          # [BLOCK_N, PHYS_K_BYTES]
+                    else:
+                        kpk = tl.load(
+                            K_base + kv_loc[:, None] * stride_kb_tok
+                            + cur_kv_head * stride_kb_h + offs_pkbyte[None, :],
+                            mask=token_mask[:, None] & mask_pkbyte[None, :], other=0,
+                        ).to(tl.int32)                          # [BLOCK_N, PHYS_K_BYTES]
+                    if ABL_NO_UNPACK:
+                        # ABLATION: skip the 2-bit bit-extract ALU (force code 0); the
+                        # s-fold/qzp dequant + outlier splice downstream KEPT, so delta
+                        # vs baseline = the K bit-extract ALU cost ALONE.
+                        code_even = tl.zeros([K_BYTE_COUNT, GROUP_TOKENS], dtype=tl.int32)
+                        code_odd = tl.zeros([K_BYTE_COUNT, GROUP_TOKENS], dtype=tl.int32)
+                    else:
+                        c0 = (kpk & 0x3).to(q_even.dtype)         # ch 4b   -> even row 2b
+                        c1 = ((kpk >> 2) & 0x3).to(q_odd.dtype)   # ch 4b+1 -> odd  row 2b
+                        c2 = ((kpk >> 4) & 0x3).to(q_even.dtype)  # ch 4b+2 -> even row 2b+1
+                        c3 = ((kpk >> 6) & 0x3).to(q_odd.dtype)   # ch 4b+3 -> odd  row 2b+1
+                        # interleave (join + order-preserving reshape): [BLOCK_N,
+                        # K_BYTE_COUNT] with col 2b = c0/c1 and col 2b+1 = c2/c3; trans
+                        # -> [K_BYTE_COUNT, BLOCK_N]. Already bf16, so the
+                        # .to(q_*.dtype) below is a same-dtype no-op for this branch.
+                        code_even = tl.trans(tl.interleave(c0, c2))
+                        code_odd = tl.trans(tl.interleave(c1, c3))
+                k_even = code_even.to(q_even.dtype)
+                k_odd = code_odd.to(q_odd.dtype)
+                # qk_map_delta: the DEDICATED-MAP additive correction (DECOUPLE) —
+                # for each outlier (channel d, token t), the QK gains
+                # q[d]·((lvl/map_scale + o_center) - (code·s + zp)) relative to the
+                # base affine. Zero everywhere on the non-MAP path (constexpr-folded).
+                qk_map_delta = tl.zeros([BLOCK_H, GROUP_TOKENS], dtype=tl.float32)
+                if K_OUTLIER_K > 0 and not ABL_NO_OUTLIER:
+                    # ABLATION: ABL_NO_OUTLIER skips this whole relidx7 splice
+                    # (treat all K as base, no membership match) — delta vs
+                    # baseline = the outlier-decode O(k) membership cost.
+                    # relidx7 splice, frames keyed by (d × token-group): the 7-bit
+                    # local index addresses 0..31 within the 32-token vector. The
+                    # affine splice substitutes the FP4 e2m1f LEVEL for the raw
+                    # code BEFORE the s-fold — dequant fp4·s + zp matches it.
+                    # Single-group specialization: the tile owns exactly one
+                    # frame (g_phys), so the generic 2-block chain is skipped.
+                    tok_local = (offs_n % GROUP_TOKENS).to(tl.int32)
+                    if KV_OUTLIER_MAP:
+                        # DEDICATED FP4 MAP (weight-space center/span, fakequant-EXACT):
+                        # the outlier value is lvl/map_scale + o_center, which does NOT
+                        # fit the base affine (code·s + zp) + q·zp fold. DECOUPLE: keep
+                        # the base affine for ALL lanes (k_even/k_odd stay codes), and
+                        # build an ADDITIVE delta over the outlier lanes only —
+                        #   delta(d,t) = (lvl/map_scale + o_center) - (code·s + zp)
+                        # then qk += Σ_d q[d]·delta(d,t). map_scale/o_center + the
+                        # per-channel zp are loaded once per tile (the tile owns g_phys).
+                        kms_base = g_phys * stride_kms_g + cur_kv_head * stride_kms_h
+                        kmc_base = g_phys * stride_kmc_g + cur_kv_head * stride_kmc_h
+                        ms_e = tl.load(K_mapscale + kms_base + offs_de * stride_kms_d,
+                                       mask=mask_de, other=1.0).to(tl.float32)
+                        ms_o = tl.load(K_mapscale + kms_base + offs_do * stride_kms_d,
+                                       mask=mask_do, other=1.0).to(tl.float32)
+                        mc_e = tl.load(K_mapcenter + kmc_base + offs_de * stride_kmc_d,
+                                       mask=mask_de, other=0.0).to(tl.float32)
+                        mc_o = tl.load(K_mapcenter + kmc_base + offs_do * stride_kmc_d,
+                                       mask=mask_do, other=0.0).to(tl.float32)
+                        kz_base = g_phys * stride_kz_g + cur_kv_head * stride_kz_h
+                        zpc_e = tl.load(K_zp + kz_base + offs_de * stride_kz_d,
+                                        mask=mask_de, other=0.0).to(tl.float32)
+                        zpc_o = tl.load(K_zp + kz_base + offs_do * stride_kz_d,
+                                        mask=mask_do, other=0.0).to(tl.float32)
+                        # per-(channel, token) K-domain delta over the outlier lanes.
+                        # [K_BYTE, BLOCK_N] base = code·s + zp ; mapped = lvl/ms + center.
+                        # REGISTER LIFETIME: each channel half runs splice -> delta ->
+                        # delta-dot to completion BEFORE the other half's splice starts,
+                        # so only ONE half's [K_BYTE, BLOCK_N] mask / level / delta tiles
+                        # are live at a time; what carries across is the [BLOCK_H,
+                        # BLOCK_N] fp32 dot result. Same ops on the same operands and the
+                        # final even+odd sum keeps its order -> BIT-EXACT to the
+                        # both-halves-first ordering (statement order only).
+                        oe_mask, oe_lvl = _canonical_single_group_splice_maplvl(
+                            k_even, tok_local, g_phys, token_mask, mask_de,
+                            K_oidx, K_oval, K_crank, K_obmp, BINOM_LUT,
+                            cur_kv_head * stride_koidx_h, stride_koidx_g,
+                            offs_de * stride_koidx_d,
+                            cur_kv_head * stride_koval_h, stride_koval_g,
+                            offs_de * stride_koval_d,
+                            cur_kv_head * stride_kcr_h, stride_kcr_g,
+                            offs_de * stride_kcr_d,
+                            cur_kv_head * stride_kbm_h, stride_kbm_g,
+                            offs_de * stride_kbm_d,
+                            K_OUTLIER_K, RELIDX_PACKED,
+                            FBI, FBI_P2, FBV, FBV_P2, WORD_SPLICE, OUTLIER_FP8,
+                            COMBINADIC_READ, FBR, FBR_P2,
+                            BITMAP_READ, FBB, FBB_P2, VL,
+                            OUTLIER_BITMAP)
+                        dq_base_e = (k_even * s_e[:, None] + zpc_e[:, None])
+                        dq_map_e = (oe_lvl.to(tl.float32) / ms_e[:, None]
+                                    + mc_e[:, None])
+                        delta_e = tl.where(oe_mask, dq_map_e - dq_base_e, 0.0)
+                        qk_map_e = _grouped_qk_accumulate(
+                            q_even_c, delta_e.to(q_even.dtype), BLOCK_H).to(tl.float32)
+                        oo_mask, oo_lvl = _canonical_single_group_splice_maplvl(
+                            k_odd, tok_local, g_phys, token_mask, mask_do,
+                            K_oidx, K_oval, K_crank, K_obmp, BINOM_LUT,
+                            cur_kv_head * stride_koidx_h, stride_koidx_g,
+                            offs_do * stride_koidx_d,
+                            cur_kv_head * stride_koval_h, stride_koval_g,
+                            offs_do * stride_koval_d,
+                            cur_kv_head * stride_kcr_h, stride_kcr_g,
+                            offs_do * stride_kcr_d,
+                            cur_kv_head * stride_kbm_h, stride_kbm_g,
+                            offs_do * stride_kbm_d,
+                            K_OUTLIER_K, RELIDX_PACKED,
+                            FBI, FBI_P2, FBV, FBV_P2, WORD_SPLICE, OUTLIER_FP8,
+                            COMBINADIC_READ, FBR, FBR_P2,
+                            BITMAP_READ, FBB, FBB_P2, VL,
+                            OUTLIER_BITMAP)
+                        dq_base_o = (k_odd * s_o[:, None] + zpc_o[:, None])
+                        dq_map_o = (oo_lvl.to(tl.float32) / ms_o[:, None]
+                                    + mc_o[:, None])
+                        delta_o = tl.where(oo_mask, dq_map_o - dq_base_o, 0.0)
+                        qk_map_o = _grouped_qk_accumulate(
+                            q_odd_c, delta_o.to(q_odd.dtype), BLOCK_H).to(tl.float32)
+                        qk_map_delta = qk_map_e + qk_map_o
+                    elif K_DECOUPLE:
+                        # base-shared i2f4 DECOUPLE (port of the KV_OUTLIER_MAP
+                        # decouple to the base-affine path): keep k_even/k_odd as
+                        # BASE codes (NO splice-into-k) and add the outlier QK delta
+                        # q·((lvl - code)·s) over the outlier lanes only. Removes the
+                        # splice-into-k sel_code carry from the hot QK path. Exact:
+                        # outlier = lvl·s + zp, base = code·s + zp -> delta=(lvl-code)·s
+                        # (the per-channel zp cancels; q·zp folded once downstream).
+                        oe_mask, oe_lvl = _canonical_single_group_splice_maplvl(
+                            k_even, tok_local, g_phys, token_mask, mask_de,
+                            K_oidx, K_oval, K_crank, K_obmp, BINOM_LUT,
+                            cur_kv_head * stride_koidx_h, stride_koidx_g,
+                            offs_de * stride_koidx_d,
+                            cur_kv_head * stride_koval_h, stride_koval_g,
+                            offs_de * stride_koval_d,
+                            cur_kv_head * stride_kcr_h, stride_kcr_g,
+                            offs_de * stride_kcr_d,
+                            cur_kv_head * stride_kbm_h, stride_kbm_g,
+                            offs_de * stride_kbm_d,
+                            K_OUTLIER_K, RELIDX_PACKED,
+                            FBI, FBI_P2, FBV, FBV_P2, WORD_SPLICE, OUTLIER_FP8,
+                            COMBINADIC_READ, FBR, FBR_P2,
+                            BITMAP_READ, FBB, FBB_P2, VL,
+                            OUTLIER_BITMAP)
+                        oo_mask, oo_lvl = _canonical_single_group_splice_maplvl(
+                            k_odd, tok_local, g_phys, token_mask, mask_do,
+                            K_oidx, K_oval, K_crank, K_obmp, BINOM_LUT,
+                            cur_kv_head * stride_koidx_h, stride_koidx_g,
+                            offs_do * stride_koidx_d,
+                            cur_kv_head * stride_koval_h, stride_koval_g,
+                            offs_do * stride_koval_d,
+                            cur_kv_head * stride_kcr_h, stride_kcr_g,
+                            offs_do * stride_kcr_d,
+                            cur_kv_head * stride_kbm_h, stride_kbm_g,
+                            offs_do * stride_kbm_d,
+                            K_OUTLIER_K, RELIDX_PACKED,
+                            FBI, FBI_P2, FBV, FBV_P2, WORD_SPLICE, OUTLIER_FP8,
+                            COMBINADIC_READ, FBR, FBR_P2,
+                            BITMAP_READ, FBB, FBB_P2, VL,
+                            OUTLIER_BITMAP)
+                        delta_e = tl.where(
+                            oe_mask, (oe_lvl.to(tl.float32) - k_even) * s_e[:, None],
+                            0.0)
+                        delta_o = tl.where(
+                            oo_mask, (oo_lvl.to(tl.float32) - k_odd) * s_o[:, None],
+                            0.0)
+                        qk_map_delta = (
+                            _grouped_qk_accumulate(
+                                q_even_c, delta_e.to(q_even.dtype),
+                                BLOCK_H).to(tl.float32)
+                            + _grouped_qk_accumulate(
+                                q_odd_c, delta_o.to(q_odd.dtype),
+                                BLOCK_H).to(tl.float32))
+                    else:
+                        k_even = _canonical_single_group_splice(
+                            k_even, tok_local, g_phys, token_mask, mask_de,
+                            K_oidx, K_oval, K_crank, K_obmp, BINOM_LUT,
+                            cur_kv_head * stride_koidx_h, stride_koidx_g,
+                            offs_de * stride_koidx_d,
+                            cur_kv_head * stride_koval_h, stride_koval_g,
+                            offs_de * stride_koval_d,
+                            cur_kv_head * stride_kcr_h, stride_kcr_g,
+                            offs_de * stride_kcr_d,
+                            cur_kv_head * stride_kbm_h, stride_kbm_g,
+                            offs_de * stride_kbm_d,
+                            K_OUTLIER_K, RELIDX_PACKED,
+                            FBI, FBI_P2, FBV, FBV_P2, WORD_SPLICE, OUTLIER_FP8,
+                            COMBINADIC_READ, FBR, FBR_P2,
+                            BITMAP_READ, FBB, FBB_P2, VL,
+                            OUTLIER_BITMAP)
+                        k_odd = _canonical_single_group_splice(
+                            k_odd, tok_local, g_phys, token_mask, mask_do,
+                            K_oidx, K_oval, K_crank, K_obmp, BINOM_LUT,
+                            cur_kv_head * stride_koidx_h, stride_koidx_g,
+                            offs_do * stride_koidx_d,
+                            cur_kv_head * stride_koval_h, stride_koval_g,
+                            offs_do * stride_koval_d,
+                            cur_kv_head * stride_kcr_h, stride_kcr_g,
+                            offs_do * stride_kcr_d,
+                            cur_kv_head * stride_kbm_h, stride_kbm_g,
+                            offs_do * stride_kbm_d,
+                            K_OUTLIER_K, RELIDX_PACKED,
+                            FBI, FBI_P2, FBV, FBV_P2, WORD_SPLICE, OUTLIER_FP8,
+                            COMBINADIC_READ, FBR, FBR_P2,
+                            BITMAP_READ, FBB, FBB_P2, VL,
+                            OUTLIER_BITMAP)
+
+                # ABLATION: ABL_K_NODEQUANT skips the K affine dequant — no s-fold
+                # of the codes and no q·zp_g term — leaving the raw INT codes into
+                # the QK dot. Delta vs baseline = the K-dequant (code·s + zp) cost.
+                if not ABL_K_NODEQUANT:
+                    k_even = k_even * s_e[:, None]
+                    k_odd = k_odd * s_o[:, None]
+                    q_zp_t = q_zp[:, None]
+                else:
+                    q_zp_t = 0.0
+                if FP8_QK:
+                    qk = (_grouped_qk_accumulate_fp8(q_even_c, k_even, BLOCK_H).to(tl.float32)
+                          + _grouped_qk_accumulate_fp8(q_odd_c, k_odd, BLOCK_H).to(tl.float32)
+                          + q_zp_t + qk_map_delta)
+                else:
+                    qk = (_grouped_qk_accumulate(q_even_c, k_even, BLOCK_H).to(tl.float32)
+                          + _grouped_qk_accumulate(q_odd_c, k_odd, BLOCK_H).to(tl.float32)
+                          + q_zp_t + qk_map_delta)
+                if logit_cap > 0:
+                    qk = logit_cap * (2 * tl.sigmoid(2 * qk / logit_cap) - 1)
+                qk = tl.where(mask_h[:, None] & token_mask[None, :], qk, float("-inf"))
+
+                n_e_max = tl.maximum(tl.max(qk, 1), e_max)
+                re_scale = tl.exp(e_max - n_e_max)
+                p = tl.exp(qk - n_e_max[:, None])
+                acc_v0 *= re_scale[:, None]
+                acc_v1 *= re_scale[:, None]
+                acc_v2 *= re_scale[:, None]
+                acc_v3 *= re_scale[:, None]
+                if EFF_SPLIT_PV:
+                    acc_bias *= re_scale[:, None]
+
+                # V per-token vl=32: scale/zp per (token, channel-group of 32) —
+                # byte b covers cols 4b..4b+3, all inside group b // (32/4).
+                if CANON_V_HOIST:
+                    v_packed = v_packed_pf
+                    vs4 = vs4_pf
+                    vz4 = vz4_pf
+                else:
+                    v_packed = tl.load(
+                        V_main + kv_loc[:, None] * stride_vm_tok
+                        + cur_kv_head * stride_vm_h + offs_vbyte[None, :],
+                        mask=token_mask[:, None] & mask_vbyte[None, :], other=0,
+                    ).to(tl.int32)
+                    if V_SCALE_INT8:
+                        vs4 = tl.exp2(tl.load(
+                            V_scale + kv_loc[:, None] * stride_vs_tok
+                            + cur_kv_head * stride_vs_h + offs_vg[None, :] * stride_vs_g,
+                            mask=token_mask[:, None] & mask_vg[None, :],
+                            other=0.0).to(tl.float32)).to(tl.bfloat16)
+                    else:
+                        vs4 = tl.load(V_scale + kv_loc[:, None] * stride_vs_tok
+                                      + cur_kv_head * stride_vs_h
+                                      + offs_vg[None, :] * stride_vs_g,
+                                      mask=token_mask[:, None] & mask_vg[None, :],
+                                      other=0.0).to(tl.bfloat16)
+                    vz4 = tl.load(V_zp + kv_loc[:, None] * stride_vz_tok
+                                  + cur_kv_head * stride_vz_h
+                                  + offs_vg[None, :] * stride_vz_g,
+                                  mask=token_mask[:, None] & mask_vg[None, :],
+                                  other=0.0).to(tl.bfloat16)
+                # LEVER 1 V-dequant fast-paths. V_VLUT folds vz into 4 levels and
+                # produces FULL dequant via a 4-way select (EFF_SPLIT_PV forced
+                # OFF); the V_VLOP3 / cast paths only change how the raw code
+                # reaches bf16 and keep the standard v*vs+vz / split-PV accumulate
+                # (which ABL_V_NODEQUANT also shares, so its garbage-V timing arm
+                # still runs the full PV dot). All gated default OFF.
+                if V_VLUT and not ABL_V_NODEQUANT:
+                    # LEVER 1(a) V-DEQUANT LUT: build the 4 COMPACT levels in the
+                    # [GT, NGV] channel-group space ONCE per tile (L_i = i*vs4+vz4,
+                    # bf16), then SELECT per byte by indexing the broadcast level
+                    # tiles. The +vz is BAKED into the levels, so the fast-path
+                    # output is the FULL dequant (code*vs+vz) -> EFF_SPLIT_PV is
+                    # FALSE (no double-counted bias dot). vs4/vz4 are [GT, NGV];
+                    # broadcast each compact level to [GT, V_BYTE_COUNT]
+                    # (NGV*VG_BYTES == V_BYTE_COUNT) so a byte b reads the level of
+                    # its group b//VG_BYTES. PARITY: L_i == i*vs+vz in bf16 (same
+                    # product/round), and select(code) picks exactly L_code ->
+                    # bit-exact to the v*vs+vz non-split path.
+                    L0c = vz4
+                    L1c = (vs4 + vz4)
+                    L2c = (2.0 * vs4 + vz4)
+                    L3c = (3.0 * vs4 + vz4)
+                    L0 = tl.reshape(tl.broadcast_to(
+                        L0c[:, :, None], [GROUP_TOKENS, NGV, VG_BYTES]),
+                        [GROUP_TOKENS, V_BYTE_COUNT])
+                    L1 = tl.reshape(tl.broadcast_to(
+                        L1c[:, :, None], [GROUP_TOKENS, NGV, VG_BYTES]),
+                        [GROUP_TOKENS, V_BYTE_COUNT])
+                    L2 = tl.reshape(tl.broadcast_to(
+                        L2c[:, :, None], [GROUP_TOKENS, NGV, VG_BYTES]),
+                        [GROUP_TOKENS, V_BYTE_COUNT])
+                    L3 = tl.reshape(tl.broadcast_to(
+                        L3c[:, :, None], [GROUP_TOKENS, NGV, VG_BYTES]),
+                        [GROUP_TOKENS, V_BYTE_COUNT])
+                    c0 = (v_packed & 0x3)
+                    c1 = ((v_packed >> 2) & 0x3)
+                    c2 = ((v_packed >> 4) & 0x3)
+                    c3 = ((v_packed >> 6) & 0x3)
+                    # _vlut_select returns the FULL dequant v_final_j (vz folded).
+                    v_final0 = _vlut_select(c0, L0, L1, L2, L3)
+                    v_final1 = _vlut_select(c1, L0, L1, L2, L3)
+                    v_final2 = _vlut_select(c2, L0, L1, L2, L3)
+                    v_final3 = _vlut_select(c3, L0, L1, L2, L3)
+                    acc_v0 += _grouped_pv_accumulate(p, v_final0, BLOCK_H)
+                    acc_v1 += _grouped_pv_accumulate(p, v_final1, BLOCK_H)
+                    acc_v2 += _grouped_pv_accumulate(p, v_final2, BLOCK_H)
+                    acc_v3 += _grouped_pv_accumulate(p, v_final3, BLOCK_H)
+                else:
+                    # ABLATION: ABL_V_NODEQUANT skips the V INT2->bf16 dequant — the
+                    # bit-unpack of v0..v3 from v_packed AND the per-(token, channel-
+                    # group) scale/zp broadcast+multiply — feeding a constant (garbage)
+                    # V tile into PV. The V HBM load (v_packed_pf/vs4/vz4, hoisted) is
+                    # KEPT, so the delta vs baseline = the V-dequant ALU cost ALONE
+                    # (not the V memory traffic).
+                    if ABL_V_NODEQUANT:
+                        # garbage-V timing arm: skip the INT2->bf16 unpack + per-(token,
+                        # channel-group) scale/zp multiply (the V-dequant ALU). The V HBM
+                        # load (v_packed/vs4/vz4) is KEPT above, so the delta vs baseline
+                        # isolates the V-dequant ALU cost ALONE. tl.zeros with a constexpr
+                        # shape replaces the illegal `(vs4*0.0)[:, :1].broadcast_to` slice.
+                        z = tl.zeros([GROUP_TOKENS, V_BYTE_COUNT], dtype=tl.bfloat16)
+                        v0 = z
+                        v1 = z
+                        v2 = z
+                        v3 = z
+                        vs_b = z
+                        vz_b = z
+                    elif ABL_NO_UNPACK:
+                        # ABLATION: skip the V bit-extract ALU ((v_packed>>sh)&3 ->
+                        # bf16, force code 0) but KEEP the per-(token,channel-group)
+                        # scale/zp multiply below — so delta vs baseline = the V
+                        # bit-extract ALU cost ALONE, while (NO_UNPACK)-(V_NODEQUANT)
+                        # leaves the scale/zp dequant cost.
+                        v0 = tl.zeros([GROUP_TOKENS, V_BYTE_COUNT], dtype=tl.bfloat16)
+                        v1 = v0
+                        v2 = v0
+                        v3 = v0
+                        vs_b = tl.reshape(
+                            tl.broadcast_to(vs4[:, :, None],
+                                            [GROUP_TOKENS, NGV, VG_BYTES]),
+                            [GROUP_TOKENS, V_BYTE_COUNT])
+                        vz_b = tl.reshape(
+                            tl.broadcast_to(vz4[:, :, None],
+                                            [GROUP_TOKENS, NGV, VG_BYTES]),
+                            [GROUP_TOKENS, V_BYTE_COUNT])
+                    else:
+                        if V_VLOP3:
+                            # LEVER 1(b) lop3-in-Triton: replace the (>>sh)&3 -> bf16
+                            # cast with ONE lop3.b32 splice per byte-lane
+                            # (numeric_core ommx_int2_splice_bf16x2 twin). Produces
+                            # (float)code as bf16 BIT-EXACTLY for 0..3 (no rounding);
+                            # the downstream v*vs+vz / split-PV math is IDENTICAL to
+                            # the cast path, so VLOP3 stays compatible with split-PV.
+                            v0 = _int2_to_bf16_lop3((v_packed & 0x3))
+                            v1 = _int2_to_bf16_lop3((v_packed >> 2) & 0x3)
+                            v2 = _int2_to_bf16_lop3((v_packed >> 4) & 0x3)
+                            v3 = _int2_to_bf16_lop3((v_packed >> 6) & 0x3)
+                        else:
+                            v0 = (v_packed & 0x3).to(tl.bfloat16)
+                            v1 = ((v_packed >> 2) & 0x3).to(tl.bfloat16)
+                            v2 = ((v_packed >> 4) & 0x3).to(tl.bfloat16)
+                            v3 = ((v_packed >> 6) & 0x3).to(tl.bfloat16)
+                        vs_b = tl.reshape(
+                            tl.broadcast_to(vs4[:, :, None],
+                                            [GROUP_TOKENS, NGV, VG_BYTES]),
+                            [GROUP_TOKENS, V_BYTE_COUNT])
+                        vz_b = tl.reshape(
+                            tl.broadcast_to(vz4[:, :, None],
+                                            [GROUP_TOKENS, NGV, VG_BYTES]),
+                            [GROUP_TOKENS, V_BYTE_COUNT])
+                    if EFF_INT_PV:
+                        # FA/flashinfer idiom (keep V codes RAW, scale on P, WIDE dot):
+                        # out[h,d in g] = Σ_t (p·vs[t,g])·code[t,d]. Fold the per-(token,
+                        # channel-group) vs into P per group g (NGV groups), dot the RAW
+                        # codes masked to that group, sum (no slice-assign). Removes the
+                        # per-element v_j·vs_b multiply (the measured 12-23ms). vz rides
+                        # the shared acc_bias dot. vs[:,g] extracted via masked reduce
+                        # (Triton has no 2D-tile column indexing).
+                        g_of_byte = offs_vbyte // VG_BYTES        # [V_BYTE_COUNT] 0..NGV-1
+                        for g in tl.static_range(NGV):
+                            vs_g = tl.sum(
+                                tl.where(offs_vg[None, :] == g, vs4, 0.0), axis=1)  # [GT]
+                            pg = p * vs_g[None, :]                 # [BLOCK_H, GT]
+                            gm = (g_of_byte == g)[None, :]         # [1, V_BYTE_COUNT]
+                            acc_v0 += _grouped_pv_accumulate(
+                                pg, tl.where(gm, v0, 0.0), BLOCK_H)
+                            acc_v1 += _grouped_pv_accumulate(
+                                pg, tl.where(gm, v1, 0.0), BLOCK_H)
+                            acc_v2 += _grouped_pv_accumulate(
+                                pg, tl.where(gm, v2, 0.0), BLOCK_H)
+                            acc_v3 += _grouped_pv_accumulate(
+                                pg, tl.where(gm, v3, 0.0), BLOCK_H)
+                        acc_bias += _grouped_pv_accumulate(p, vz_b, BLOCK_H)
+                    elif EFF_SPLIT_PV:
+                        # code-domain split-PV: dequant is
+                        #   acc_vj = Σ_t p·(v_j·vs_b + vz_b)
+                        #          = Σ_t p·(v_j·vs_b)  +  Σ_t p·vz_b.
+                        # The 2nd (zp/bias) term is IDENTICAL across the 4 byte
+                        # lanes (vz_b is lane-independent), so it is accumulated
+                        # ONCE here and added at store — replacing 3 redundant
+                        # per-element `+ vz_b` adds (4 lanes -> 1 shared dot).
+                        v_sc0 = v0 * vs_b
+                        v_sc1 = v1 * vs_b
+                        v_sc2 = v2 * vs_b
+                        v_sc3 = v3 * vs_b
+                        acc_v0 += _grouped_pv_accumulate(p, v_sc0, BLOCK_H)
+                        acc_v1 += _grouped_pv_accumulate(p, v_sc1, BLOCK_H)
+                        acc_v2 += _grouped_pv_accumulate(p, v_sc2, BLOCK_H)
+                        acc_v3 += _grouped_pv_accumulate(p, v_sc3, BLOCK_H)
+                        acc_bias += _grouped_pv_accumulate(p, vz_b, BLOCK_H)
+                    else:
+                        v_final0 = v0 * vs_b + vz_b
+                        v_final1 = v1 * vs_b + vz_b
+                        v_final2 = v2 * vs_b + vz_b
+                        v_final3 = v3 * vs_b + vz_b
+                        acc_v0 += _grouped_pv_accumulate(p, v_final0, BLOCK_H)
+                        acc_v1 += _grouped_pv_accumulate(p, v_final1, BLOCK_H)
+                        acc_v2 += _grouped_pv_accumulate(p, v_final2, BLOCK_H)
+                        acc_v3 += _grouped_pv_accumulate(p, v_final3, BLOCK_H)
+                e_sum = e_sum * re_scale + tl.sum(p, 1)
+                e_max = n_e_max
+
+            base_mid_o = (cur_batch * stride_mid_ob + cur_head[:, None] * stride_mid_oh
+                          + split_kv_id * stride_mid_os)
+            # This finalization is OUTSIDE the `if split_kv_end > split_kv_start`
+            # accumulation guard, so an empty split reaches here with e_sum==0.
+            # Guard the divide (o=0, not 0/0=NaN) and the lse (-inf, which the
+            # merge zero-weights via exp(-inf)=0). Previously only the merge's
+            # packed_valid mask kept the NaN out of the result — latent landmine.
+            e_sum_safe = tl.where(e_sum > 0.0, e_sum, 1.0)
+            if EFF_SPLIT_PV:
+                o_v0 = (acc_v0 + acc_bias) / e_sum_safe[:, None]
+                o_v1 = (acc_v1 + acc_bias) / e_sum_safe[:, None]
+                o_v2 = (acc_v2 + acc_bias) / e_sum_safe[:, None]
+                o_v3 = (acc_v3 + acc_bias) / e_sum_safe[:, None]
+            else:
+                o_v0 = acc_v0 / e_sum_safe[:, None]
+                o_v1 = acc_v1 / e_sum_safe[:, None]
+                o_v2 = acc_v2 / e_sum_safe[:, None]
+                o_v3 = acc_v3 / e_sum_safe[:, None]
+            tl.store(Att_Out + base_mid_o + offs_v0[None, :],
+                     o_v0, mask=mask_h[:, None] & mask_vbyte[None, :])
+            tl.store(Att_Out + base_mid_o + offs_v1[None, :],
+                     o_v1, mask=mask_h[:, None] & mask_v1[None, :])
+            tl.store(Att_Out + base_mid_o + offs_v2[None, :],
+                     o_v2, mask=mask_h[:, None] & mask_v2[None, :])
+            tl.store(Att_Out + base_mid_o + offs_v3[None, :],
+                     o_v3, mask=mask_h[:, None] & mask_v3[None, :])
+            offs_mid_o_1 = (cur_batch * stride_mid_ob + cur_head * stride_mid_oh
+                            + split_kv_id * stride_mid_os + Lv)
+            lse = tl.where(e_sum > 0.0, e_max + tl.log(e_sum_safe), float("-inf"))
+            tl.store(Att_Out + offs_mid_o_1, lse, mask=mask_h)
+
+    # --- CANONICAL-KV bf16 residual (sink ∪ recent tail) pass ----------------
+    @triton.jit
+    def _canonical_bf16_tail(
+        Q, K_tail, V_tail,
+        sm_scale,
+        B_TailLen,
+        Att_Out,
+        stride_qbs, stride_qh,
+        stride_kt_b, stride_kt_t, stride_kt_h,
+        stride_vt_b, stride_vt_t, stride_vt_h,
+        stride_mid_ob, stride_mid_oh, stride_mid_os,
+        q_head_num: tl.constexpr,
+        TAIL_SLOT: tl.constexpr,
+        BLOCK_DMODEL: tl.constexpr,
+        BLOCK_DV: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        Lk: tl.constexpr,
+        Lv: tl.constexpr,
+        logit_cap: tl.constexpr,
+        GROUP_SIZE: tl.constexpr,
+        BLOCK_H: tl.constexpr,
+    ):
+        # SDPA-style bf16 attention over the residual window (sink tokens +
+        # recent tail, CONCATENATED in K_tail/V_tail — attention is permutation-
+        # invariant over the KV set so the order inside the buffer is free).
+        # Writes the (acc/e_sum, lse) pair into Att_Out slot TAIL_SLOT — merged
+        # with the packed splits by _canonical_lse_merge. Empty tail ⇒ no store
+        # (the merge validity-gates on B_TailLen > 0).
+        cur_batch = tl.program_id(0)
+        cur_kv_head = tl.program_id(1)
+        cur_head = cur_kv_head * GROUP_SIZE + tl.arange(0, BLOCK_H)
+        mask_h = (tl.arange(0, BLOCK_H) < GROUP_SIZE) & (cur_head < q_head_num)
+        tail_len = tl.load(B_TailLen + cur_batch)
+        if tail_len > 0:
+            offs_d = tl.arange(0, BLOCK_DMODEL)
+            mask_d = offs_d < Lk
+            offs_dv = tl.arange(0, BLOCK_DV)
+            mask_dv = offs_dv < Lv
+            q = tl.load(Q + cur_batch * stride_qbs + cur_head[:, None] * stride_qh
+                        + offs_d[None, :],
+                        mask=mask_h[:, None] & mask_d[None, :], other=0.0)
+            e_max = tl.zeros([BLOCK_H], dtype=tl.float32) - float("inf")
+            e_sum = tl.zeros([BLOCK_H], dtype=tl.float32)
+            acc = tl.zeros([BLOCK_H, BLOCK_DV], dtype=tl.float32)
+            for start_n in range(0, tail_len, BLOCK_N):
+                offs_n = start_n + tl.arange(0, BLOCK_N)
+                tmask = offs_n < tail_len
+                k = tl.load(K_tail + cur_batch * stride_kt_b
+                            + offs_n[None, :] * stride_kt_t
+                            + cur_kv_head * stride_kt_h + offs_d[:, None],
+                            mask=tmask[None, :] & mask_d[:, None], other=0.0)
+                qk = _grouped_qk_accumulate(q, k, BLOCK_H).to(tl.float32) * sm_scale
+                if logit_cap > 0:
+                    qk = logit_cap * (2 * tl.sigmoid(2 * qk / logit_cap) - 1)
+                qk = tl.where(mask_h[:, None] & tmask[None, :], qk, float("-inf"))
+                n_e_max = tl.maximum(tl.max(qk, 1), e_max)
+                re_scale = tl.exp(e_max - n_e_max)
+                p = tl.exp(qk - n_e_max[:, None])
+                acc *= re_scale[:, None]
+                v = tl.load(V_tail + cur_batch * stride_vt_b
+                            + offs_n[:, None] * stride_vt_t
+                            + cur_kv_head * stride_vt_h + offs_dv[None, :],
+                            mask=tmask[:, None] & mask_dv[None, :], other=0.0)
+                acc += _grouped_pv_accumulate(p, v, BLOCK_H)
+                e_sum = e_sum * re_scale + tl.sum(p, 1)
+                e_max = n_e_max
+            base_mid = (cur_batch * stride_mid_ob + cur_head[:, None] * stride_mid_oh
+                        + TAIL_SLOT * stride_mid_os)
+            # tail_len>0 guarantees e_sum>=1 for valid head rows (mask_h), and masked
+            # rows are dropped by the store mask — but guard for defense-in-depth so a
+            # masked row never even transiently computes 0/0=NaN (mirrors stage1).
+            e_sum_safe = tl.where(e_sum > 0.0, e_sum, 1.0)
+            tl.store(Att_Out + base_mid + offs_dv[None, :], acc / e_sum_safe[:, None],
+                     mask=mask_h[:, None] & mask_dv[None, :])
+            tl.store(Att_Out + cur_batch * stride_mid_ob + cur_head * stride_mid_oh
+                     + TAIL_SLOT * stride_mid_os + Lv,
+                     tl.where(e_sum > 0.0, e_max + tl.log(e_sum_safe), float("-inf")), mask=mask_h)
+
+    # --- CANONICAL-KV LSE merge: packed splits + bf16 tail slot --------------
+    @triton.jit
+    def _canonical_lse_merge(
+        Mid_O, o, lse, B_Seqlen, B_TailLen,
+        stride_mid_ob, stride_mid_oh, stride_mid_os,
+        stride_obs, stride_oh, stride_lse_bs,
+        # FUSE_TAIL extra args (the bf16 sink/recent residual computed INLINE in
+        # the merge prologue instead of a separate _canonical_bf16_tail launch +
+        # its Mid_O[TAIL_SLOT] round-trip). Ignored (dummy ptrs/0) when FUSE_TAIL
+        # is False.
+        Q, K_tail, V_tail, sm_scale,
+        stride_qbs, stride_qh,
+        stride_kt_b, stride_kt_t, stride_kt_h,
+        stride_vt_b, stride_vt_t, stride_vt_h,
+        NUM_KV_SPLITS: tl.constexpr,
+        SPLIT_POW2: tl.constexpr,
+        GROUP_TOKENS: tl.constexpr,
+        BLOCK_DV: tl.constexpr,
+        Lv: tl.constexpr,
+        FUSE_TAIL: tl.constexpr,
+        BLOCK_DMODEL: tl.constexpr,
+        Lk: tl.constexpr,
+        TAIL_BLOCK_N: tl.constexpr,
+        logit_cap: tl.constexpr,
+        GROUP_SIZE: tl.constexpr,
+    ):
+        # Wide-parallel LSE merge over NUM_KV_SPLITS packed slots + 1 tail slot.
+        # Replicates the stage-1 GROUP-ROUNDED split sizing exactly (an unrounded
+        # cdiv would mark trailing empty splits valid and read garbage). NaN-safe
+        # for zero-length segments (B=seq 0 packed / empty tail): acc=0, lse=-inf.
+        #
+        # FUSE_TAIL (Lever B launch-fusion): the bf16 sink/recent residual is
+        # computed HERE per (batch, q-head) and folded into the reduction as one
+        # extra part — dropping the standalone _canonical_bf16_tail launch AND its
+        # Mid_O[TAIL_SLOT] fp32 workspace round-trip. The merge grid is per q-head
+        # so the tail QK is a single-row dot (no BLOCK_H tile).
+        cur_batch = tl.program_id(0)
+        cur_head = tl.program_id(1)
+        seq = tl.load(B_Seqlen + cur_batch)
+        tail = tl.load(B_TailLen + cur_batch)
+        offs_d = tl.arange(0, BLOCK_DV)
+        mask_d = offs_d < Lv
+        offs_s = tl.arange(0, SPLIT_POW2)
+        per = tl.cdiv(tl.cdiv(seq, NUM_KV_SPLITS), GROUP_TOKENS) * GROUP_TOKENS
+        s_start = per * offs_s
+        s_end = tl.minimum(s_start + per, seq)
+        packed_valid = (offs_s < NUM_KV_SPLITS) & (s_end > s_start)
+        if FUSE_TAIL:
+            # The tail slot is NOT written by a separate kernel anymore; read only
+            # the packed split slots and add the inline tail part below.
+            split_valid = packed_valid
+        else:
+            tail_valid = (offs_s == NUM_KV_SPLITS) & (tail > 0)
+            split_valid = packed_valid | tail_valid
+        base = cur_batch * stride_mid_ob + cur_head * stride_mid_oh
+        tv = tl.load(
+            Mid_O + base + offs_s[:, None] * stride_mid_os + offs_d[None, :],
+            mask=split_valid[:, None] & mask_d[None, :],
+            other=0.0,
+        )
+        tlogic = tl.load(
+            Mid_O + base + offs_s * stride_mid_os + Lv,
+            mask=split_valid,
+            other=-float("inf"),
+        )
+        tlogic = tl.where(split_valid, tlogic, -float("inf"))
+        e_max = tl.max(tlogic, 0)
+
+        if FUSE_TAIL:
+            # ---- inline bf16 tail (sink ∪ recent) for this single q-head -------
+            # Online-softmax over the residual window -> (o_tail[Lv], lse_tail);
+            # folded into the split reduction as an additional part. Mirrors the
+            # math of _canonical_bf16_tail exactly (permutation-invariant set).
+            t_emax = -float("inf")
+            t_esum = 0.0
+            t_acc = tl.zeros([BLOCK_DV], dtype=tl.float32)
+            if tail > 0:
+                # K_tail / V_tail are indexed by KV head; the merge grid is per
+                # q-head, so map q-head -> kv head (GQA group).
+                cur_kv_head = cur_head // GROUP_SIZE
+                offs_dk = tl.arange(0, BLOCK_DMODEL)
+                mask_dk = offs_dk < Lk
+                q_row = tl.load(
+                    Q + cur_batch * stride_qbs + cur_head * stride_qh + offs_dk,
+                    mask=mask_dk, other=0.0).to(tl.float32)
+                for start_n in range(0, tail, TAIL_BLOCK_N):
+                    offs_n = start_n + tl.arange(0, TAIL_BLOCK_N)
+                    tmask = offs_n < tail
+                    k = tl.load(
+                        K_tail + cur_batch * stride_kt_b
+                        + offs_n[:, None] * stride_kt_t
+                        + cur_kv_head * stride_kt_h + offs_dk[None, :],
+                        mask=tmask[:, None] & mask_dk[None, :], other=0.0
+                    ).to(tl.float32)
+                    qk = tl.sum(q_row[None, :] * k, 1) * sm_scale
+                    if logit_cap > 0:
+                        qk = logit_cap * (2 * tl.sigmoid(2 * qk / logit_cap) - 1)
+                    qk = tl.where(tmask, qk, float("-inf"))
+                    n_emax = tl.maximum(tl.max(qk, 0), t_emax)
+                    rescale = tl.exp(t_emax - n_emax)
+                    p = tl.exp(qk - n_emax)
+                    t_acc = t_acc * rescale
+                    v = tl.load(
+                        V_tail + cur_batch * stride_vt_b
+                        + offs_n[:, None] * stride_vt_t
+                        + cur_kv_head * stride_vt_h + offs_d[None, :],
+                        mask=tmask[:, None] & mask_d[None, :], other=0.0
+                    ).to(tl.float32)
+                    t_acc += tl.sum(p[:, None] * v, 0)
+                    t_esum = t_esum * rescale + tl.sum(p, 0)
+                    t_emax = n_emax
+            tail_lse = tl.where(t_esum > 0.0, t_emax + tl.log(t_esum),
+                                -float("inf"))
+            t_esum_safe = tl.where(t_esum > 0.0, t_esum, 1.0)
+            o_tail = t_acc / t_esum_safe          # normalized tail state [Lv]
+            # fold the tail part into the global max, then combine. The packed
+            # splits store NORMALIZED o_p (= acc/e_sum) in tv with lse_p = tlogic,
+            # so the tail enters the SAME way: o_tail (normalized) weighted by
+            # exp(tail_lse - g_max).
+            g_max = tl.maximum(e_max, tail_lse)
+            g_max_safe = tl.where(g_max == -float("inf"), 0.0, g_max)
+            w = tl.exp(tlogic - g_max_safe)
+            e_sum = tl.sum(w, 0)
+            acc = tl.sum(w[:, None] * tv, 0)
+            t_w = tl.where(t_esum > 0.0, tl.exp(tail_lse - g_max_safe), 0.0)
+            e_sum += t_w
+            acc += t_w * o_tail
+            e_max = g_max
+        else:
+            e_max_safe = tl.where(e_max == -float("inf"), 0.0, e_max)
+            w = tl.exp(tlogic - e_max_safe)
+            e_sum = tl.sum(w, 0)
+            acc = tl.sum(w[:, None] * tv, 0)
+        e_sum_safe = tl.where(e_sum > 0.0, e_sum, 1.0)
+        tl.store(o + cur_batch * stride_obs + cur_head * stride_oh + offs_d,
+                 acc / e_sum_safe, mask=mask_d)
+        tl.store(lse + cur_batch * stride_lse_bs + cur_head, e_max + tl.log(e_sum))
+
+    # --- CANONICAL-KV LSE merge, head_dim-TILED wide grid (OMMX_MERGE_WIDE) ----
+    @triton.jit
+    def _canonical_lse_merge_wide(
+        Mid_O, o, lse, B_Seqlen, B_TailLen,
+        stride_mid_ob, stride_mid_oh, stride_mid_os,
+        stride_obs, stride_oh, stride_lse_bs,
+        # FUSE_TAIL extra args — same ABI as _canonical_lse_merge so the launcher
+        # can pass an identical arg list. When FUSE_TAIL is False the tail is read
+        # from the TAIL_SLOT workspace (written by the GQA-grouped _canonical_bf16
+        # _tail launch), so these are still loaded for the inline-fold variant.
+        Q, K_tail, V_tail, sm_scale,
+        stride_qbs, stride_qh,
+        stride_kt_b, stride_kt_t, stride_kt_h,
+        stride_vt_b, stride_vt_t, stride_vt_h,
+        NUM_KV_SPLITS: tl.constexpr,
+        SPLIT_POW2: tl.constexpr,
+        GROUP_TOKENS: tl.constexpr,
+        BLOCK_DV: tl.constexpr,          # head_dim TILE width (per-CTA channel slice)
+        Lv: tl.constexpr,
+        FUSE_TAIL: tl.constexpr,
+        BLOCK_DMODEL: tl.constexpr,
+        Lk: tl.constexpr,
+        TAIL_BLOCK_N: tl.constexpr,
+        logit_cap: tl.constexpr,
+        GROUP_SIZE: tl.constexpr,
+        TAIL_SLOT: tl.constexpr,         # workspace slot for the (non-fused) tail
+    ):
+        # Wide / occupancy-filling variant of _canonical_lse_merge. The grid adds a
+        # third program axis (n_dv_tiles = cdiv(Lv, BLOCK_DV)); each CTA reduces the
+        # NUM_KV_SPLITS packed partials for ONE head_dim slice of one (batch, q-head)
+        # — so a B=1 decode launches batch*head_num*n_dv_tiles CTAs (≥64-128) and
+        # fills the SMs that the (batch, head_num)=32-CTA default leaves idle.
+        #
+        # PARITY (bit-exact vs _canonical_lse_merge): the slot reduction is
+        # INDEPENDENT per head_dim channel; e_max / e_sum / w depend ONLY on the
+        # per-slot lse (tlogic), NOT on the channel. Each dv-tile recomputes that
+        # scalar reduction from the SAME tlogic loads (identical Triton ops on
+        # identical inputs => bit-identical e_max/e_sum/w), then normalizes its own
+        # channel slice with the SAME denominator. So channel d of the wide output
+        # equals channel d of the default output, op-for-op. The recompute cost is
+        # SPLIT_POW2 scalar loads + a tiny reduction — cheap, and avoids any
+        # cross-CTA sync.
+        cur_batch = tl.program_id(0)
+        cur_head = tl.program_id(1)
+        dv_tile = tl.program_id(2)
+        seq = tl.load(B_Seqlen + cur_batch)
+        tail = tl.load(B_TailLen + cur_batch)
+        # this CTA's head_dim slice [dv_tile*BLOCK_DV, +BLOCK_DV)
+        offs_d = dv_tile * BLOCK_DV + tl.arange(0, BLOCK_DV)
+        mask_d = offs_d < Lv
+        offs_s = tl.arange(0, SPLIT_POW2)
+        per = tl.cdiv(tl.cdiv(seq, NUM_KV_SPLITS), GROUP_TOKENS) * GROUP_TOKENS
+        s_start = per * offs_s
+        s_end = tl.minimum(s_start + per, seq)
+        packed_valid = (offs_s < NUM_KV_SPLITS) & (s_end > s_start)
+        if FUSE_TAIL:
+            split_valid = packed_valid
+        else:
+            tail_valid = (offs_s == TAIL_SLOT) & (tail > 0)
+            split_valid = packed_valid | tail_valid
+        base = cur_batch * stride_mid_ob + cur_head * stride_mid_oh
+        # NORMALIZED partial o_p for THIS channel slice only (the occupancy /
+        # bandwidth win: each CTA touches Lv/n_dv_tiles channels of Mid_O, not Lv).
+        tv = tl.load(
+            Mid_O + base + offs_s[:, None] * stride_mid_os + offs_d[None, :],
+            mask=split_valid[:, None] & mask_d[None, :],
+            other=0.0,
+        )
+        # per-slot lse — recomputed identically in every dv-tile (full SPLIT_POW2
+        # scalar load) so the softmax denominator MATCHES across tiles bit-for-bit.
+        tlogic = tl.load(
+            Mid_O + base + offs_s * stride_mid_os + Lv,
+            mask=split_valid,
+            other=-float("inf"),
+        )
+        tlogic = tl.where(split_valid, tlogic, -float("inf"))
+        e_max = tl.max(tlogic, 0)
+
+        if FUSE_TAIL:
+            # ---- inline bf16 tail folded into THIS dv-tile -----------------------
+            # tail_lse is a per-(batch,head) SCALAR (full-head_dim QK) — recomputed
+            # identically per tile. o_tail is loaded only for THIS channel slice, so
+            # each channel's tail contribution is bit-exact vs the non-wide fold.
+            t_emax = -float("inf")
+            t_esum = 0.0
+            t_acc = tl.zeros([BLOCK_DV], dtype=tl.float32)
+            if tail > 0:
+                cur_kv_head = cur_head // GROUP_SIZE
+                offs_dk = tl.arange(0, BLOCK_DMODEL)
+                mask_dk = offs_dk < Lk
+                q_row = tl.load(
+                    Q + cur_batch * stride_qbs + cur_head * stride_qh + offs_dk,
+                    mask=mask_dk, other=0.0).to(tl.float32)
+                for start_n in range(0, tail, TAIL_BLOCK_N):
+                    offs_n = start_n + tl.arange(0, TAIL_BLOCK_N)
+                    tmask = offs_n < tail
+                    k = tl.load(
+                        K_tail + cur_batch * stride_kt_b
+                        + offs_n[:, None] * stride_kt_t
+                        + cur_kv_head * stride_kt_h + offs_dk[None, :],
+                        mask=tmask[:, None] & mask_dk[None, :], other=0.0
+                    ).to(tl.float32)
+                    qk = tl.sum(q_row[None, :] * k, 1) * sm_scale
+                    if logit_cap > 0:
+                        qk = logit_cap * (2 * tl.sigmoid(2 * qk / logit_cap) - 1)
+                    qk = tl.where(tmask, qk, float("-inf"))
+                    n_emax = tl.maximum(tl.max(qk, 0), t_emax)
+                    rescale = tl.exp(t_emax - n_emax)
+                    p = tl.exp(qk - n_emax)
+                    t_acc = t_acc * rescale
+                    v = tl.load(
+                        V_tail + cur_batch * stride_vt_b
+                        + offs_n[:, None] * stride_vt_t
+                        + cur_kv_head * stride_vt_h + offs_d[None, :],
+                        mask=tmask[:, None] & mask_d[None, :], other=0.0
+                    ).to(tl.float32)
+                    t_acc += tl.sum(p[:, None] * v, 0)
+                    t_esum = t_esum * rescale + tl.sum(p, 0)
+                    t_emax = n_emax
+            tail_lse = tl.where(t_esum > 0.0, t_emax + tl.log(t_esum),
+                                -float("inf"))
+            t_esum_safe = tl.where(t_esum > 0.0, t_esum, 1.0)
+            o_tail = t_acc / t_esum_safe
+            g_max = tl.maximum(e_max, tail_lse)
+            g_max_safe = tl.where(g_max == -float("inf"), 0.0, g_max)
+            w = tl.exp(tlogic - g_max_safe)
+            e_sum = tl.sum(w, 0)
+            acc = tl.sum(w[:, None] * tv, 0)
+            t_w = tl.where(t_esum > 0.0, tl.exp(tail_lse - g_max_safe), 0.0)
+            e_sum += t_w
+            acc += t_w * o_tail
+            e_max = g_max
+        else:
+            e_max_safe = tl.where(e_max == -float("inf"), 0.0, e_max)
+            w = tl.exp(tlogic - e_max_safe)
+            e_sum = tl.sum(w, 0)
+            acc = tl.sum(w[:, None] * tv, 0)
+        e_sum_safe = tl.where(e_sum > 0.0, e_sum, 1.0)
+        tl.store(o + cur_batch * stride_obs + cur_head * stride_oh + offs_d,
+                 acc / e_sum_safe, mask=mask_d)
+        # lse is a per-(batch,head) scalar — write it once (dv_tile 0) to avoid
+        # redundant identical stores from every tile.
+        if dv_tile == 0:
+            tl.store(lse + cur_batch * stride_lse_bs + cur_head,
+                     e_max + tl.log(e_sum))
+
+    # --- PUBLIC attention-state merge (FlashInfer-style cross-segment reduce) -
+    @triton.jit
+    def _merge_attention_states_kernel(
+        O_parts, LSE_parts, O_out, LSE_out, ValidLen,
+        stride_op_s, stride_op_r, stride_op_d,
+        stride_lp_s, stride_lp_r,
+        stride_oo_r, stride_oo_d,
+        stride_lo_r,
+        N_PARTS: tl.constexpr,
+        PARTS_POW2: tl.constexpr,
+        BLOCK_D: tl.constexpr,
+        Lv: tl.constexpr,
+    ):
+        # Recursive attention-state merge: combine N_PARTS partial (o, lse) states
+        # for one (row r) into a single (o, lse) via the SAME stable online-softmax
+        # reduction the split-KV LSE merge uses —
+        #   m = max_s lse_s ;  w_s = exp(lse_s - m)
+        #   o = (Σ_s w_s · o_s) / Σ_s w_s ;  lse = m + log(Σ_s w_s).
+        # ``ValidLen`` (optional, -1 sentinel = "all valid") gates ragged part
+        # counts per row (cp / chunked). Empty row -> o=0, lse=-inf (NaN-safe).
+        r = tl.program_id(0)
+        offs_d = tl.arange(0, BLOCK_D)
+        mask_d = offs_d < Lv
+        offs_s = tl.arange(0, PARTS_POW2)
+        n_valid = tl.load(ValidLen + r)
+        n_valid = tl.where(n_valid < 0, N_PARTS, n_valid)
+        part_valid = (offs_s < N_PARTS) & (offs_s < n_valid)
+        lse = tl.load(LSE_parts + offs_s * stride_lp_s + r * stride_lp_r,
+                      mask=part_valid, other=-float("inf"))
+        lse = tl.where(part_valid, lse, -float("inf"))
+        e_max = tl.max(lse, 0)
+        e_max_safe = tl.where(e_max == -float("inf"), 0.0, e_max)
+        w = tl.exp(lse - e_max_safe)
+        e_sum = tl.sum(w, 0)
+        ov = tl.load(
+            O_parts + offs_s[:, None] * stride_op_s + r * stride_op_r
+            + offs_d[None, :] * stride_op_d,
+            mask=part_valid[:, None] & mask_d[None, :], other=0.0)
+        acc = tl.sum(w[:, None] * ov, 0)
+        e_sum_safe = tl.where(e_sum > 0.0, e_sum, 1.0)
+        tl.store(O_out + r * stride_oo_r + offs_d * stride_oo_d,
+                 acc / e_sum_safe, mask=mask_d)
+        tl.store(LSE_out + r * stride_lo_r, e_max + tl.log(e_sum))
+
+    # Publish the shared jit helpers into module globals so the kernels that
+    # CALL them resolve the helper names through __globals__ at compile time
+    # (closure locals are invisible to the triton compiler — same reason `tl`
+    # must be a module global above).
+    g["_grouped_qk_accumulate"] = _grouped_qk_accumulate
+    g["_grouped_qk_accumulate_fp8"] = _grouped_qk_accumulate_fp8
+    g["_grouped_pv_accumulate"] = _grouped_pv_accumulate
+    g["_vlut_select"] = _vlut_select
+    g["_int2_to_bf16_lop3"] = _int2_to_bf16_lop3
+    g["_relidx7_splice_block"] = _relidx7_splice_block
+    g["_combinadic_unrank_oi"] = _combinadic_unrank_oi
+    g["_popcount32"] = _popcount32
+    g["_bitmap_splice_from_word"] = _bitmap_splice_from_word
+    g["_bitmap_splice_from_bytes"] = _bitmap_splice_from_bytes
+    g["_canonical_single_group_splice"] = _canonical_single_group_splice
+    g["_canonical_single_group_splice_maplvl"] = _canonical_single_group_splice_maplvl
+
+    global _merge_attention_states_kernel_h
+    _merge_attention_states_kernel_h = _merge_attention_states_kernel
+    _canonical_splitkv_stage1_kernel = _canonical_splitkv_stage1
+    _canonical_qzp_preamble_kernel = _canonical_qzp_preamble
+    _canonical_bf16_tail_kernel = _canonical_bf16_tail
+    _canonical_lse_merge_kernel = _canonical_lse_merge
+    global _canonical_lse_merge_wide_kernel
+    _canonical_lse_merge_wide_kernel = _canonical_lse_merge_wide
+
+
+# ===========================================================================
+# Public entry
+# ===========================================================================
+
+#: Launch evidence for callers that cannot read the vLLM sentinel file (HF-eager, the
+#: demo, tests): how many times the canonical decode launcher ran in this process, and
+#: how many of those read the bitmap outlier encoding. A label that says "OMMX" with
+#: launch_stats()["stage1"] == 0 is a bf16 fallback wearing the wrong name (law #5).
+_LAUNCHES = {"stage1": 0, "bitmap": 0, "abl": 0}
+
+
+def launch_stats() -> dict:
+    """Copy of the per-process launch counters (see ``_LAUNCHES``)."""
+    return dict(_LAUNCHES)
+
+
+def reset_launch_stats() -> None:
+    for k in _LAUNCHES:
+        _LAUNCHES[k] = 0
+
+
+ABL_FLAG_NAMES = ("OMMX_ABL_NO_OUTLIER", "OMMX_ABL_V_NODEQUANT", "OMMX_ABL_K_NODEQUANT",
+                  "OMMX_ABL_NO_UNPACK")
+
+
+def abl_flag_names(mask: int) -> list:
+    """The ablation flags a launch resolved, by name (bit i <-> ABL_FLAG_NAMES[i])."""
+    return [n for i, n in enumerate(ABL_FLAG_NAMES) if int(mask) & (1 << i)]
+
+
+def ommx_paged_decode_attention_canonical(
+    q,
+    k_base, k_scale, k_zp, k_oidx, k_oval,
+    v_main, v_scale, v_zp,
+    k_tail, v_tail, b_tail_len,
+    o, lse,
+    req_to_token, req_to_group, b_seq_len,
+    *,
+    sm_scale: float = 1.0,
+    page_size: int = 16,
+    logit_cap: float = 0.0,
+    k_outliers_per_vector: int = 3,
+    k_format: str = "i2f4",
+    combinadic_read: bool = False,
+    k_crank: Any = None,
+    bitmap_read: bool = False,
+    k_obmp: Any = None,
+    k_fp4_mapscale: Any = None,
+    k_fp4_mapcenter: Any = None,
+    kv_outlier_map: bool = False,
+    kv_int8_scale: bool = False,
+    num_kv_splits: Optional[int] = None,
+    num_stages: Optional[int] = None,
+    num_warps: Optional[int] = None,
+    max_seq_len: Optional[int] = None,
+    max_tail_len: Optional[int] = None,
+    attn_logits: Any = None,
+    qzp_buf: Any = None,
+    packed_start_offset: int = 0,
+    seg_group_base: int = 0,
+) -> None:
+    """CANONICAL-KV paged decode attention (Triton). Writes ``o``/``lse`` in place.
+
+    Relidx7-only production extraction: the K outlier membership is the 7-bit
+    local-token index per (group, head, channel) slot, with the FP outlier value
+    in the shared ``k_oval`` stream. All quantization is AFFINE
+    (``dequant = code·scale + zp`` with ``zp = group min``); there is no
+    symmetric mode in this format.
+
+    ``k_format`` selects the K base width + outlier value codec (the FP4 ≤3-bit
+    core):
+
+      * ``"i2f4"`` / ``"itf4"`` (≤3-bit CORE) — INT2 base (``D//4`` bytes,
+        4 codes/byte) + FP4 e2m1f outlier (4-bit nibble, ``ceil(k/2)`` bytes/frame).
+
+    ``combinadic_read`` (env ``OMMX_VLLM_KV_COMBINADIC_READ=1``; default OFF) swaps
+    the OUTLIER INDEX source from the relidx7 idx bitstream to the combinadic RANK
+    plane ``k_crank`` (the storage-floor index, ~ceil(log2 C(32,k)) bits/vec — 16
+    bits @ k=4 vs relidx7's 4·7=28). The kernel reads the rank, then EXPANDS it to
+    the k ascending outlier positions IN-REGISTER (greedy unrank, mirror of
+    ``codec.combinadic_decode``), once per (group, head, channel) tile. The
+    ``k_oval`` FP4 VALUE read is UNCHANGED — only the index source changes; the
+    membership/splice is bit-exact vs relidx7 (CPU-parity-validated). HONEST: this
+    trades HBM read bytes for in-register unrank ALU. On a COMPUTE-BOUND decode (the
+    V=i2 regime) it may be parity or a slight regression — the GPU A/B decides, and
+    the relidx7 default stays for that case. Gated to ``k<=4`` (rank fits a 16-bit
+    word at vl=32). Pass ``k_crank`` from ``ommx_pack_kv_canonical_block(...,
+    outlier_repr="combinadic")``.
+
+    ``bitmap_read`` (env ``OMMX_VLLM_KV_BITMAP_READ=1``; ON by default, because
+    ``outlier_repr`` defaults to ``bitmap`` and the tri-state follows it) swaps the OUTLIER
+    INDEX source to the FLAT BITMASK plane ``k_obmp`` — ``ceil(VL/8)`` bytes per (group,
+    head, channel) frame, one bit per token position, LSB-first — which is the storage
+    the ICCAD paper attributes to the GPU implementation ("positions are stored as a flat
+    bitmask (N bits per group)"). The kernel then does NOT rebuild an occupancy word from
+    relidx7: it loads the words the packer already wrote and runs the same O(1) membership
+    bit-test + masked prefix-popcount rank, so the index cost is FLAT in k (1.0 bit/element
+    at any VL that is a multiple of 8) instead of relidx7's 7k/VL — cheaper than relidx7
+    above the 1/7 = 14.3% density crossover, and 32 bit vs 48 bit per frame at the
+    canonical VL=32, k=6 recipe. The ``k_oval`` VALUE read is UNCHANGED. Mutually
+    exclusive with ``combinadic_read``. Gated to ``k <= 8`` (the value stream must fit one
+    int32 word). Pass ``k_obmp`` from ``ommx_pack_kv_canonical_block(...,
+    outlier_repr="bitmap")``.
+
+    VERIFIED ON HARDWARE (H200 NVL, 2026-09-04): tests/test_decode_kernel_parity.py 17/17, whose eight ``bitmap`` parametrisations (GT 32 and 64) reach THIS branch (BITMAP_READ=True is refused without a k_obmp plane) and match an independent PyTorch attention oracle at cos>=0.999.
+    bitmap is the SERVING DEFAULT; relidx7 remains selectable and its code path is
+    byte-identical to before this branch existed. The CPU-side contract (byte layout,
+    popcount-rank identity, membership equality with relidx7/combinadic) is gated in
+    ``tests/test_bitmap_outlier.py``. ``combinadic_read`` is the branch that is still
+    UNVERIFIED ON HARDWARE.
+
+    GROUP SIZES (vector_length): ``GROUP_TOKENS`` (K token-group) and
+    ``GROUP_CHANNELS`` (V channel-group) are an OPTION in {16,32,64,128}, DERIVED
+    from the plane shapes (no op-arg change): ``GROUP_TOKENS = pages*page_size /
+    k_scale.shape[0]`` and ``GROUP_CHANNELS = head_dim / v_scale.shape[-1]``. Larger
+    GROUP_TOKENS = fewer K scale/zp groups = lower K bit/elem (VL=128 reaches the
+    ≤3-bit K target). ``head_dim`` must be a multiple of GROUP_CHANNELS.
+
+    PACKED-REGION PLANES (p = packed-relative token, page = p // page_size,
+    group g = p // 32):
+
+      ``k_base``  uint8 [num_pages, page_size, n_kv_heads, D//4]
+          K INT base codes. TRUE 2-bit (channel ``c`` in byte ``c//4`` at bit
+          ``2*(c%4)``). Outlier lanes also hold their base code (the splice
+          overrides them at read).
+      ``k_scale`` / ``k_zp``  bf16|fp32 [n_group_slots, n_kv_heads, D]
+          K per-CHANNEL affine scale / zero-point per (channel d, token-group):
+          ``dequant_base = code·k_scale[slot, h, d] + k_zp[slot, h, d]``.
+      ``k_oidx``  uint8 [n_group_slots, n_kv_heads, D, ceil(7k/8)]
+          relidx7-packed outlier sidecar (LSB-first 7-bit bitstream). Unpacked
+          int16 [.., k] frames are auto-detected by dtype.
+      ``k_oval``  uint8 [n_group_slots, n_kv_heads, D, ceil(k/2)]
+          Outlier value codes. FP4 e2m1f (even slot = low nibble). Outlier dequant =
+          ``fp_level·k_scale + k_zp`` (``fp_level`` = ``decode_fp4_e2m1f``).
+      ``v_main``  uint8 [num_pages, page_size, n_kv_heads, D//4]
+          V INT2 codes, TRUE 2-bit, same lane map as ``k_base``. No outliers.
+      ``v_scale`` / ``v_zp``  bf16|fp32 [num_pages, page_size, n_kv_heads, D//32]
+          V per-TOKEN affine scale / zp per (token, channel-group of 32).
+      ``req_to_token``  int32 [batch, >= ceil(max packed len / page_size)]
+          page table over packed-relative positions. ``packed_start_offset``
+          adds an IN-PAGE token offset to the (page, slot) addressing.
+      ``req_to_group``  int32 [batch, >= ceil(max packed len / 32)]
+          group-slot table: logical group g -> row of k_scale/k_zp/k_oidx/k_oval.
+      ``b_seq_len``  int32 [batch] device — packed token count per request.
+
+    BF16 RESIDUAL (sink ∪ recent tail):
+
+      ``k_tail`` / ``v_tail``  bf16 [batch, T_tail_max, n_kv_heads, D]
+          row-concatenated sink + recent rows (any order); contiguous.
+      ``b_tail_len``  int32 [batch] device — valid rows (0 allowed).
+
+    GRAPH CAPTURE: pass ``max_seq_len`` AND ``max_tail_len`` explicitly (else a
+    ``.item()`` sync reads them from the device buffers).
+
+    SEGMENT PARTIAL-EMIT (``seg_group_base`` > 0): attend ONLY the group-range
+    sub-segment ``[seg_group_base, seg_group_base + n_seg_groups)`` of each request
+    and write THIS segment's un-merged softmax state into ``o``/``lse`` (``o`` =
+    Σp·v / Σp, ``lse`` = max + log Σp over the segment's tokens) — NOT a merged
+    final. ``b_seq_len`` then carries the SEGMENT packed token count (group-aligned
+    at the base); ``req_to_token``/``req_to_group`` are the request's full tables
+    (the kernel offsets into them by the base). Pass ``max_tail_len=0`` / empty tail
+    for a segment (the bf16 residual is composed as its own segment). The caller
+    stacks each segment's ``(o, lse)`` and runs ``merge_attention_states`` to combine
+    disjoint segments (cascade / context-parallel / radix-split). Requires FOLD_QZP
+    (the default). ``seg_group_base == 0`` is the full-range default.
+
+    PREFILL runs on bf16 — this kernel is decode-only.
+    """
+    _LAUNCHES["stage1"] += 1
+    if bitmap_read:
+        _LAUNCHES["bitmap"] += 1
+    _require_triton()
+    triton = _triton
+    import torch
+
+    # GROUP_TOKENS (K token-group / K vector_length) and GROUP_CHANNELS (V channel-
+    # group / V vector_length) are now a PER-PACK option in {16,32,64,128} (not the
+    # old hardcoded 32). They are derived from the plane SHAPES so the op ABI is
+    # unchanged (no new op arg): k_scale is [n_group_slots, H, D] with
+    # n_group_slots = total_tokens / GROUP_TOKENS, and v_scale's last dim is
+    # NGV = head_dim / GROUP_CHANNELS. total_tokens = pages * page_size.
+    _pages = int(k_base.shape[0])
+    _ngroups = int(k_scale.shape[0])
+    if _pages == 0 or _ngroups == 0:
+        # TAIL-ONLY decode (no packed quantized groups yet — below sink+recent+1
+        # group): the packed loop never runs, so the group size is unobservable.
+        # Default to 32 (the constexpr only gates dead code in this case).
+        GROUP_TOKENS = 32
+    else:
+        GROUP_TOKENS = (_pages * int(page_size)) // _ngroups
+        if GROUP_TOKENS not in (16, 32, 64, 128):
+            raise ValueError(
+                f"derived GROUP_TOKENS={GROUP_TOKENS} (pages={_pages} "
+                f"page_size={page_size} n_group_slots={_ngroups}) must be in "
+                "{16,32,64,128}")
+    _vsc = int(v_scale.shape[-1])
+    if _vsc == 0:
+        GROUP_CHANNELS = 32
+    else:
+        GROUP_CHANNELS = (int(v_main.shape[-1]) * 4) // _vsc
+        if GROUP_CHANNELS not in (16, 32, 64, 128):
+            raise ValueError(
+                f"derived GROUP_CHANNELS={GROUP_CHANNELS} must be in {{16,32,64,128}}")
+    # i2f4 / itf4 (≤3-bit): INT2 base (4 codes/byte) + FP4 nibble.
+    kfmt = str(k_format).lower()
+    if kfmt not in ("i2f4", "itf4"):
+        raise ValueError(f"k_format must be i2f4|itf4; got {k_format!r}")
+    outlier_fp8 = False
+    k_base_bits = 2
+    k_codes_per_byte = 4
+    # COMBINADIC-READ (storage-floor index source): read the combinadic RANK plane
+    # (k_crank, ~ceil(log2 C(32,k)) bits/vec, 16 bits @ k=4) and expand it to the k
+    # outlier positions IN-REGISTER (greedy unrank) instead of reading the relidx7
+    # idx bitstream (4·7=28 bits @ k=4). Trades HBM read bytes for unrank ALU — on a
+    # compute-bound decode (V=i2 regime) it may be parity / a slight regression, so
+    # the relidx7 default stays. GATED: kwarg OR env OMMX_VLLM_KV_COMBINADIC_READ=1.
+    combinadic_read = bool(combinadic_read) or _env_bool(
+        "OMMX_VLLM_KV_COMBINADIC_READ", False)
+    # BITMAP-READ (the paper's flat N-bit-per-group mask as the RESIDENT plane): read
+    # ``k_obmp`` instead of the relidx7 idx bitstream. Unlike the OMMX_ATTN_OUTLIER_BITMAP
+    # lever — which derives an occupancy word IN REGISTERS from a relidx7 plane that is
+    # still what HBM stores — this changes WHAT IS STORED, so it moves bytes, not just
+    # ALU. GATED: kwarg OR env OMMX_VLLM_KV_BITMAP_READ=1.
+    bitmap_read = bool(bitmap_read) or _env_bool("OMMX_VLLM_KV_BITMAP_READ", False)
+    if bitmap_read and combinadic_read:
+        raise ValueError(
+            "combinadic_read and bitmap_read are mutually exclusive outlier-index "
+            "sources (a pack carries exactly one of k_crank / k_obmp). Pick one.")
+    batch, head_num = int(q.shape[0]), int(q.shape[1])
+    Lk = int(k_base.shape[-1]) * k_codes_per_byte
+    Lv = int(v_main.shape[-1]) * 4
+    n_kv_heads = int(k_base.shape[-2])
+    if Lv % GROUP_CHANNELS != 0:
+        raise ValueError(
+            f"canonical KV requires head_dim % {GROUP_CHANNELS} == 0; got Lv={Lv}.")
+    kv_group_num = head_num // n_kv_heads
+    if kv_group_num < 1 or head_num != n_kv_heads * kv_group_num:
+        raise NotImplementedError(
+            "ommx_paged_decode_attention_canonical requires q_head_num to be an "
+            f"integer multiple of n_kv_heads; got q_head_num={head_num} "
+            f"n_kv_heads={n_kv_heads}.")
+    group_size = int(kv_group_num)
+    for name, t in (("k_base", k_base), ("v_main", v_main),
+                    ("v_scale", v_scale), ("v_zp", v_zp)):
+        if t.stride(0) != int(page_size) * t.stride(1) or t.stride(-1) != 1:
+            raise ValueError(
+                f"{name} must be a contiguous [pages, page_size, h, w] plane "
+                f"(kv_loc addressing needs stride(0) == page_size*stride(1)).")
+    start_offset = int(packed_start_offset or 0)
+    if start_offset < 0 or start_offset >= int(page_size):
+        raise ValueError(
+            f"packed_start_offset={start_offset} must be in "
+            f"[0, page_size={page_size})")
+    # SEGMENT partial-emit: group-range base (constexpr group offset baked into
+    # the stage-1 kernel). 0 = full-range default. Must be a NON-negative group
+    # index; the kernel reads req_to_group[seg_group_base + ...] and pages from
+    # token base seg_group_base*GROUP_TOKENS, so the segment's group-slot / page
+    # tables must extend that far. Group base * 32 is page-aligned (page_size |
+    # 32), so it never splits a page.
+    seg_group_base = int(seg_group_base or 0)
+    if seg_group_base < 0:
+        raise ValueError(f"seg_group_base={seg_group_base} must be >= 0")
+
+    if max_seq_len is not None:
+        max_seq = max(1, int(max_seq_len))
+    else:
+        max_seq = int(b_seq_len.max().item()) if int(b_seq_len.numel()) > 0 else 1
+    if max_tail_len is not None:
+        max_tail = int(max_tail_len)
+    else:
+        max_tail = int(b_tail_len.max().item()) if int(b_tail_len.numel()) > 0 else 0
+
+    # BLOCK_H selection (broadcast tile for tiny GQA work, tensor-core m16 tile
+    # for batched / long-context decode).
+    block_h_default = max(8, 1 << (max(1, group_size - 1)).bit_length())
+    block_h = _env_int("OMMX_ATTN_BLOCK_H", block_h_default)
+    block_h = 1 << (max(1, block_h - 1)).bit_length()
+    block_h = max(block_h, 1 << (max(1, group_size - 1)).bit_length())
+    tc_auto = (batch >= 2 and batch * group_size >= 4) or (
+        batch == 1 and group_size >= 4 and max_seq >= 4096)
+    if block_h < 16 and _env_bool("OMMX_ATTN_TENSOR_CORE", tc_auto):
+        block_h = 16
+
+    # FP8 e4m3 tensor-core QK^T (measure-first): opt-in via OMMX_ATTN_FP8_QK. Only
+    # meaningful on the m16 tensor-core tile (block_h>=16) and sm_90+ (native FP8
+    # wgmma); silently no-ops otherwise so the bf16 path stays the default (parity).
+    fp8_qk = _env_bool("OMMX_ATTN_FP8_QK", False)
+    _fp8_requested = fp8_qk
+    if fp8_qk:
+        try:
+            _idx = q.device.index if q.device.index is not None \
+                else torch.cuda.current_device()
+            _sm_ok = torch.cuda.get_device_capability(_idx)[0] >= 9
+        except Exception:
+            _sm_ok = False
+        fp8_qk = bool(block_h >= 16 and _sm_ok)
+        if _fp8_requested and not fp8_qk and not _LAUNCHES.get("_fp8_warned"):
+            _LAUNCHES["_fp8_warned"] = 1
+            import warnings
+            warnings.warn("OMMX_ATTN_FP8_QK=1 ignored: needs sm_90+ and the m16 tensor-core "
+                          f"tile (block_h={block_h}); running the bf16 path", RuntimeWarning)
+
+    k_outlier_k = int(k_outliers_per_vector)
+    # Default: the K outlier membership is relidx7. COMBINADIC_READ swaps the INDEX
+    # source to the combinadic rank plane (k_crank) + in-register unrank; the k_oval
+    # VALUE stream is read unchanged either way.
+    if k_outlier_k > 0 and k_oval is None:
+        raise ValueError(
+            "k_outliers_per_vector > 0 requires the k_oval sidecar plane.")
+    if combinadic_read and k_outlier_k > 0 and k_crank is None:
+        raise ValueError(
+            "combinadic_read=True requires the k_crank combinadic-rank plane.")
+    if combinadic_read and k_outlier_k > 4:
+        raise ValueError(
+            "combinadic_read in-register unrank is gated to k<=4 (the rank fits a "
+            f"<=16-bit word for vl=32); got k={k_outlier_k}. Use relidx7 instead.")
+    if bitmap_read and k_outlier_k > 0 and k_obmp is None:
+        raise ValueError(
+            "bitmap_read=True requires the k_obmp flat-bitmask plane (pack with "
+            "ommx_pack_kv_canonical_block(..., outlier_repr='bitmap')).")
+    if bitmap_read and k_outlier_k > 8:
+        raise ValueError(
+            "bitmap_read packs the k_oval value stream into ONE int32 word, which holds "
+            f"ceil(k/2) <= 4 bytes, i.e. k <= 8; got k={k_outlier_k}. Use relidx7.")
+    if (not combinadic_read) and (not bitmap_read) and k_outlier_k > 0 \
+            and k_oidx is None:
+        raise ValueError(
+            "k_outliers_per_vector > 0 requires the k_oidx relidx7 sidecar plane "
+            "(or pass combinadic_read=True with a k_crank plane, or bitmap_read=True "
+            "with a k_obmp plane).")
+
+    # combinadic binomial LUT C(c, j) for c in 0..VL, j in 1..k — the compile-time
+    # table the in-register unrank indexes (flat [(VL+1)*k], LUT[c*k + (j-1)]).
+    VL = GROUP_TOKENS  # K token-group vector_length in {16,32,64,128}
+    fbr = fbr_p2 = 0
+    if combinadic_read and k_outlier_k > 0:
+        import math as _math
+        lut = torch.zeros((VL + 1) * k_outlier_k, dtype=torch.int32, device=q.device)
+        for c in range(VL + 1):
+            for j in range(1, k_outlier_k + 1):
+                lut[c * k_outlier_k + (j - 1)] = _math.comb(c, j)
+        binom_lut = lut
+        total = _math.comb(VL, k_outlier_k)
+        fbr = (max(1, (total - 1).bit_length()) + 7) // 8           # rank field bytes
+        fbr_p2 = triton.next_power_of_2(max(1, fbr))
+    else:
+        binom_lut = torch.zeros(1, dtype=torch.int32, device=q.device)
+    # FLAT BITMASK field width: ceil(VL/8) bytes per frame — sized by the GROUP, NOT
+    # by k (that flatness is the encoding's whole point). FBB_P2 is the next-pow2
+    # tl.arange load width the kernel tiles the frame with.
+    fbb = ((VL + 7) // 8) if (bitmap_read and k_outlier_k > 0) else 0
+    fbb_p2 = triton.next_power_of_2(max(1, fbb))
+
+    if k_outlier_k > 0:
+        # relidx_packed: uint8 sidecar => the 7-bit-packed bitstream; int16 =>
+        # the unpacked [.., k] frames (auto-detected by dtype).
+        relidx_packed = (k_oidx is not None) and bool(k_oidx.dtype == torch.uint8)
+        if k_oidx is not None:
+            koidx_t = k_oidx
+            s_koidx_g, s_koidx_h, s_koidx_d = (
+                int(k_oidx.stride(0)), int(k_oidx.stride(1)), int(k_oidx.stride(2)))
+        else:
+            # combinadic_read / bitmap_read with no relidx7 plane: dummy idx pointer
+            # (unused — the alternate index plane is the real source).
+            relidx_packed = True
+            koidx_t = torch.zeros(1, dtype=torch.uint8, device=q.device)
+            s_koidx_g = s_koidx_h = s_koidx_d = 0
+        koval_t = k_oval
+        s_koval_g, s_koval_h, s_koval_d = (
+            int(k_oval.stride(0)), int(k_oval.stride(1)), int(k_oval.stride(2)))
+        if combinadic_read:
+            kcrank_t = k_crank
+            s_kcr_g, s_kcr_h, s_kcr_d = (
+                int(k_crank.stride(0)), int(k_crank.stride(1)),
+                int(k_crank.stride(2)))
+        else:
+            kcrank_t = torch.zeros(1, dtype=torch.uint8, device=q.device)
+            s_kcr_g = s_kcr_h = s_kcr_d = 0
+        if bitmap_read:
+            kobmp_t = k_obmp
+            s_kbm_g, s_kbm_h, s_kbm_d = (
+                int(k_obmp.stride(0)), int(k_obmp.stride(1)),
+                int(k_obmp.stride(2)))
+        else:
+            kobmp_t = torch.zeros(1, dtype=torch.uint8, device=q.device)
+            s_kbm_g = s_kbm_h = s_kbm_d = 0
+    else:
+        relidx_packed = False
+        koidx_t = torch.zeros(1, dtype=torch.int16, device=q.device)
+        koval_t = torch.zeros(1, dtype=torch.uint8, device=q.device)
+        kcrank_t = torch.zeros(1, dtype=torch.uint8, device=q.device)
+        kobmp_t = torch.zeros(1, dtype=torch.uint8, device=q.device)
+        s_koidx_g = s_koidx_h = s_koidx_d = 0
+        s_koval_g = s_koval_h = s_koval_d = 0
+        s_kcr_g = s_kcr_h = s_kcr_d = 0
+        s_kbm_g = s_kbm_h = s_kbm_d = 0
+
+    if num_kv_splits is None:
+        num_kv_splits = _auto_num_kv_splits(
+            max_seq, batch, device=q.device, kv_heads=n_kv_heads)
+    num_kv_splits = max(1, int(num_kv_splits))
+    if num_stages is None:
+        # Base ladder (seq/batch tuned, s=2 plateau at seq>=4096) then raise to
+        # the per-arch cp.async pipeline cap so sm_90 double-buffers KV at depth 4
+        # and sm_80 at depth 3, while still respecting an explicit env override
+        # via _auto_num_stages_decode -> _env_int("OMMX_V4_NUM_STAGES", ...).
+        base_stages = _auto_num_stages_decode(max_seq, batch)
+        if str(os.environ.get("OMMX_V4_NUM_STAGES") or "").strip():
+            # Explicit env pin wins verbatim (do not silently override a tuned pin).
+            # `.strip()` (not bare truthiness) because a WHITESPACE-ONLY value has to
+            # mean the same thing on both sides of this branch: _env_int treats blank as
+            # "unset -> default", so a bare truthiness test made OMMX_V4_NUM_STAGES="  "
+            # count as an explicit pin whose pinned value was in fact the ladder default
+            # — silently dropping the per-arch cp.async depth cap below with nothing in
+            # the output to say the geometry had changed. Every non-blank value (a real
+            # pin, or a malformed one that _env_int raises on above) is unaffected.
+            num_stages = base_stages
+        else:
+            num_stages = max(base_stages, _arch_num_stages_cap(q.device))
+    if num_warps is None:
+        if k_outlier_k > 0:
+            num_warps = _auto_num_warps_outlier(max_seq, batch, _sm_major(q.device))
+        else:
+            num_warps = _auto_num_warps_decode(max_seq, batch)
+
+    # CANON_WIDE_N is a dead, constexpr-FALSE branch in this extraction (see the
+    # module header) — the launcher always passes False so the kernel's
+    # `if CANON_WIDE_N:` paths are dead-code-eliminated at compile time. The
+    # production path is the Stage-A 32-token loop.
+    canon_wide_n = False
+    n_groups_per_tile = 1
+    wide_stages = 1
+
+    # LEVER 3 (V dequant-once-per-tile reuse, A/B gate). The V INT2->bf16 dequant
+    # + per-(token,channel-group) scale is computed ONCE per V tile and fed to a
+    # SINGLE tl.dot shared across all BLOCK_H GQA query rows (the dot's row dim),
+    # never recomputed per head/per kv-split (splits are separate program
+    # instances). CANON_SPLIT_PV additionally hoists the lane-independent zp/bias
+    # out of the 4 byte-lane dots into one shared bias dot (v*vs once, +vz once
+    # at store) — replacing the per-lane `+ vz_b` adds. OMMX_ATTN_VDEQ_ONCE=0
+    # reverts to the per-lane recompute path (v_final_j = v_j*vs + vz, 4 fused
+    # adds) for A/B. NOT bit-exact, and the comment here used to claim it was:
+    # the per-lane path computes bf16(v·vs + vz) — one rounding on the SUM — while
+    # the split path keeps bf16(v·vs) and accumulates vz through its own dot, so the
+    # two differ by that rounding (the split path is the slightly more accurate of
+    # the two). Σ p·(v·vs+vz) = Σ p·(v·vs) + Σ p·vz holds in exact arithmetic, not in
+    # bf16. Treat this switch as a numeric arm, not a scheduling one.
+    # Default BATCH-AWARE: OFF at B<8 (~10% FASTER at B=1 — the shared-bias dot adds a
+    # dependency that hurts the latency-bound single-stream decode; CUDA law #3), ON at
+    # B>=8 where the kernel is compute-bound and the op-count cut wins (B=8 ctx4096
+    # graphed A/B: 26.86->25.35ms; parity greedy stream == bf16). Env
+    # OMMX_ATTN_VDEQ_ONCE overrides. NOTE the default is BATCH-DEPENDENT and the two
+    # sides round differently, so a sweep that crosses B=8 changes numeric path
+    # mid-sweep: pin the env when A/B-ing across batch.
+    vdeq_once = _env_bool("OMMX_ATTN_VDEQ_ONCE", int(batch) >= 8)
+
+    # LEVER 1 (V-dequant fast-paths, A/B gates, both default OFF):
+    #   OMMX_ATTN_VLUT  — 4-level register LUT select (L_i = i*vs+vz folded; the
+    #     +vz is baked in so the kernel forces the non-split PV path EFF_SPLIT_PV
+    #     = CANON_SPLIT_PV and not VLUT to avoid double-counting the bias).
+    #   OMMX_ATTN_VLOP3 — single lop3.b32 INT2->bf16 splice (numeric_core
+    #     ommx_int2_splice_bf16x2 twin) replacing the (>>sh)&3 -> bf16 cast;
+    #     downstream v*vs+vz / split-PV math is unchanged (split-PV compatible).
+    # Both are parity-by-construction (CUDA law #10 integer RNE — exact for codes
+    # 0..3, no .to(bf16).to(f32) const-fold). VLUT and VLOP3 are independent; if
+    # BOTH are set VLUT wins (its select subsumes the code-to-bf16 step).
+    v_vlut = _env_bool("OMMX_ATTN_VLUT", False)
+    v_vlop3 = _env_bool("OMMX_ATTN_VLOP3", False)
+    # V_INT_PV: keep V codes raw + fold per-(token,group) vs into P (FA/flashinfer idiom);
+    # removes the per-element v*vs multiply. Mutually exclusive with VLUT.
+    v_int_pv = _env_bool("OMMX_ATTN_V_INT_PV", False)
+
+    # LEVER 2 (BitDecoding cp.async K+V double-buffer, default OFF). OMMX_ATTN_KV_PIPE
+    # hoists the K base load to the loop head (CANON_K_HOIST) mirroring CANON_V_HOIST
+    # so BOTH K and V tiles are issued before the QK/softmax dependency chain and
+    # num_stages>1 can cp.async-prefetch the NEXT tile's K and V into the pipeline.
+    # Pure SCHEDULING (the same bytes are read, the QK/PV math is untouched) ->
+    # PARITY-NEUTRAL. OMMX_V4_NUM_STAGES (existing) tunes the pipeline depth (the
+    # cp.async double-buffer count); raising it deepens K+V prefetch overlap.
+    # Default BATCH-AWARE: ON at B>=8 (overlaps the memory latency the batch kernel
+    # exposes; pairs with vdeq_once — the ALU cut frees the pipeline to be
+    # memory-overlapped). Pure scheduling, parity-neutral. Env overrides.
+    kv_pipe = _env_bool("OMMX_ATTN_KV_PIPE", int(batch) >= 8)
+
+    # Workspace: num_kv_splits packed slots + 1 bf16-residual slot.
+    if attn_logits is None:
+        attn_logits = _make_attn_logits(
+            batch, head_num, num_kv_splits + 1, Lv, q.device)
+
+    # q·zp_g preamble: ONE tiny launch per decode step precomputes the zp term
+    # for every (head, logical group). SKIP_QZP stays False for the AFFINE
+    # canonical serving base (zp = group min, nonzero).
+    skip_qzp = False
+    # FOLD_QZP (Lever B launch-fusion): compute q·zp_g INSIDE stage1 (each
+    # group-rounded tile owns one group -> K_zp[g_phys] read once per tile) instead
+    # of the separate _canonical_qzp_preamble launch + its QZP fp32 buffer
+    # round-trip. Trades a small per-tile K_zp re-read for one fewer launch + no
+    # QZP HBM write/read. Default ON; OMMX_ATTN_FOLD_QZP=0 reverts to the preamble.
+    fold_qzp = _env_bool("OMMX_ATTN_FOLD_QZP", True)
+    # SEGMENT note: stage-1 indexes QZP at SEG_GROUP_BASE + (start_n // 32). The
+    # standalone preamble below only fills groups [0, max_groups) (max_groups from
+    # the SEGMENT seq), so a segment base needs FOLD_QZP (qzp read inline from the
+    # already-offset g_phys, no preamble buffer). FOLD_QZP defaults ON.
+    if seg_group_base > 0 and not fold_qzp:
+        raise ValueError(
+            "seg_group_base > 0 requires FOLD_QZP (the standalone qzp preamble "
+            "does not cover the segment's group offset); unset OMMX_ATTN_FOLD_QZP=0.")
+    max_groups = max(1, (max_seq + GROUP_TOKENS - 1) // GROUP_TOKENS)
+    if qzp_buf is None:
+        qzp_buf = torch.empty(batch, head_num, max_groups,
+                              dtype=torch.float32, device=q.device)
+    QZP_BLOCK_G = 64
+    if (not skip_qzp) and (not fold_qzp):
+        _canonical_qzp_preamble_kernel[
+            (batch, n_kv_heads, triton.cdiv(max_groups, QZP_BLOCK_G))](
+            q, k_zp, req_to_group, b_seq_len, qzp_buf,
+            sm_scale,
+            req_to_group.stride(0),
+            q.stride(0), q.stride(1),
+            k_zp.stride(0), k_zp.stride(1), k_zp.stride(2),
+            qzp_buf.stride(0), qzp_buf.stride(1), qzp_buf.stride(2),
+            q_head_num=head_num,
+            BLOCK_DMODEL=triton.next_power_of_2(Lk),
+            Lk=Lk,
+            GROUP_TOKENS=GROUP_TOKENS,
+            GROUP_SIZE=group_size,
+            BLOCK_H=max(16, block_h),
+            BLOCK_G=QZP_BLOCK_G,
+            num_warps=4,
+            num_stages=2,
+        )
+
+    # ABLATION-ONLY (differential-timing; PARITY-BREAKING) — bit-encode the four
+    # decode-cost SKIPs into the stage-1 ABL constexpr. Default 0 (all off =
+    # production). Each toggle compiles its branch OUT via tl.constexpr.
+    #   OMMX_ABL_NO_OUTLIER  -> bit0 : skip relidx7 O(k) outlier splice
+    #   OMMX_ABL_V_NODEQUANT -> bit1 : skip V INT2->bf16 dequant
+    #   OMMX_ABL_K_NODEQUANT -> bit2 : skip K dequant (s-fold + qzp)
+    #   OMMX_ABL_NO_UNPACK   -> bit3 : force K/V codes to 0 (skip bit-extract ALU,
+    #                                  keep scale/zp + outlier) — isolates the
+    #                                  bit-extract ALU from the scale/zp dequant
+    abl_flags = ((1 if _env_bool("OMMX_ABL_NO_OUTLIER", False) else 0)
+                 | (2 if _env_bool("OMMX_ABL_V_NODEQUANT", False) else 0)
+                 | (4 if _env_bool("OMMX_ABL_K_NODEQUANT", False) else 0)
+                 | (8 if _env_bool("OMMX_ABL_NO_UNPACK", False) else 0))
+    # Recorded, never assumed: an ablation flag inherited from the shell would otherwise
+    # publish a kernel without its outlier splice under a plain "OMMX" label (law #5).
+    _LAUNCHES["abl"] |= int(abl_flags)
+
+    # LAW #15 outlier-decode O(k)->O(1): the WORD_SPLICE relidx7 path replaces the
+    # per-slot membership scan with a per-row occupancy bitmap + ONE masked
+    # prefix-popcount (rank) over [K_BYTE, BLOCK_N]. Eligible iff the index source
+    # is the relidx7 packed WORD (not the combinadic in-register unrank, which has
+    # no contiguous index word) and WORD_SPLICE is active (i2f4/itf4, k<=4).
+    # Parity-neutral at EVERY VL (the FP4 dequant +
+    # LSE merge are untouched; pack.py's ascending sort makes the popcount rank ==
+    # ascending slot index exactly; out-of-VL positions never set a bit).
+    #
+    # VL-AWARE DEFAULT: the single-word bitmap WINS at VL<=32 (the 32-token group),
+    # but for VL=64/128 the membership/rank now need ceil(VL/32) int32 occupancy
+    # words and the per-token cost (per-word popcount + masked-select over the wider
+    # BLOCK_N=VL tile) GROWS with VL_WORDS, while the per-slot scan is still only
+    # O(k<=4). Measured (H200, ctx16384, k=3): VL=128 bitmap=215us vs
+    # per-slot=154us — the bitmap LOSES at VL=128. So the bitmap is the DEFAULT only
+    # for VL<=32; VL>32 defaults to the per-slot membership scan (also O(1)-ish at
+    # k<=4). OMMX_ATTN_OUTLIER_BITMAP forces it ON/OFF at any VL for A/B.
+    word_splice_active = ((not outlier_fp8) and k_outlier_k <= 4)
+    _bitmap_default = GROUP_TOKENS <= 32        # single-word fast lane only
+    # NOT eligible under bitmap_read: that path loads the occupancy words from k_obmp
+    # instead of deriving them, so the register-derive lever has nothing to do (its
+    # branch is not even reached — BITMAP_READ takes the first arm of the splice).
+    outlier_bitmap = (
+        k_outlier_k > 0 and (not combinadic_read) and (not bitmap_read)
+        and word_splice_active
+        and _env_bool("OMMX_ATTN_OUTLIER_BITMAP", _bitmap_default))
+
+    # KV DEDICATED FP4 OUTLIER MAP (weight-space center/span — fakequant-EXACT). When
+    # active the kernel keeps the base affine for ALL lanes and ADDS the outlier
+    # delta ((lvl/map_scale + o_center) - (code·s + zp)); see the stage-1 DECOUPLE
+    # block. Only meaningful for FP4 outliers (i2f4/itf4) with k>0. Requires the
+    # map-param planes.
+    kv_outlier_map = bool(kv_outlier_map) and (not outlier_fp8) and k_outlier_k > 0
+    # K-OUTLIER DECOUPLE (OMMX_ATTN_K_DECOUPLE): on the base-affine i2f4 path (NOT the
+    # dedicated map, which already decouples), keep K base codes and add the outlier QK
+    # delta q·((lvl-code)·s) instead of splicing the FP4 level into K before the dot.
+    # Removes the splice-into-k sel_code carry from the hot QK path. Parity ~1 ULP.
+    k_decouple = (_env_bool("OMMX_ATTN_K_DECOUPLE", False)
+                  and (not kv_outlier_map) and (not outlier_fp8) and k_outlier_k > 0)
+    if kv_outlier_map and (k_fp4_mapscale is None or k_fp4_mapcenter is None):
+        raise ValueError(
+            "kv_outlier_map=True requires k_fp4_mapscale + k_fp4_mapcenter planes.")
+    if kv_outlier_map:
+        kms_t, kmc_t = k_fp4_mapscale, k_fp4_mapcenter
+        s_kms_g, s_kms_h, s_kms_d = (int(kms_t.stride(0)), int(kms_t.stride(1)),
+                                     int(kms_t.stride(2)))
+        s_kmc_g, s_kmc_h, s_kmc_d = (int(kmc_t.stride(0)), int(kmc_t.stride(1)),
+                                     int(kmc_t.stride(2)))
+    else:
+        kms_t = torch.zeros(1, dtype=k_scale.dtype if k_scale.dtype.is_floating_point
+                            else torch.bfloat16, device=q.device)
+        kmc_t = kms_t
+        s_kms_g = s_kms_h = s_kms_d = 0
+        s_kmc_g = s_kmc_h = s_kmc_d = 0
+
+    # int8 pow2-exp scale: the kernel reconstructs scale = 2^exp (BIT-EXACT to the
+    # use_pow2 bf16 scale). Auto-detected from the plane dtype (the packer stores the
+    # int8 exponent when kv_int8_scale) OR forced by the kwarg.
+    k_scale_int8 = bool(kv_int8_scale) or (k_scale.dtype == torch.int8)
+    v_scale_int8 = bool(kv_int8_scale) or (v_scale.dtype == torch.int8)
+
+    grid1 = (batch, n_kv_heads, num_kv_splits)
+    _canonical_splitkv_stage1_kernel[grid1](
+        q,
+        k_base, k_scale, koidx_t, koval_t, kcrank_t, kobmp_t, binom_lut,
+        kms_t, kmc_t,
+        v_main, v_scale, v_zp,
+        qzp_buf,
+        k_zp,
+        sm_scale,
+        req_to_token, req_to_group, b_seq_len,
+        attn_logits,
+        req_to_token.stride(0), req_to_group.stride(0),
+        q.stride(0), q.stride(1),
+        attn_logits.stride(0), attn_logits.stride(1), attn_logits.stride(2),
+        k_base.stride(1), k_base.stride(2),
+        k_scale.stride(0), k_scale.stride(1), k_scale.stride(2),
+        qzp_buf.stride(0), qzp_buf.stride(1), qzp_buf.stride(2),
+        k_zp.stride(0), k_zp.stride(1), k_zp.stride(2),
+        s_koidx_g, s_koidx_h, s_koidx_d,
+        s_koval_g, s_koval_h, s_koval_d,
+        s_kcr_g, s_kcr_h, s_kcr_d,
+        s_kbm_g, s_kbm_h, s_kbm_d,
+        s_kms_g, s_kms_h, s_kms_d,
+        s_kmc_g, s_kmc_h, s_kmc_d,
+        v_main.stride(1), v_main.stride(2),
+        v_scale.stride(1), v_scale.stride(2), v_scale.stride(3),
+        v_zp.stride(1), v_zp.stride(2), v_zp.stride(3),
+        q_head_num=head_num,
+        BLOCK_DMODEL=triton.next_power_of_2(Lk),
+        BLOCK_DV=triton.next_power_of_2(Lv),
+        NUM_KV_SPLITS=num_kv_splits,
+        PAGE_SIZE=page_size,
+        START_OFFSET=start_offset,
+        logit_cap=logit_cap,
+        Lk=Lk, Lv=Lv,
+        K_OUTLIER_K=k_outlier_k,
+        RELIDX_PACKED=bool(relidx_packed),
+        FBI=(7 * k_outlier_k + 7) // 8,
+        FBI_P2=triton.next_power_of_2(max(1, (7 * k_outlier_k + 7) // 8)),
+        # i2f4/itf4 FP4 outlier = 1 nibble/slot (FBV = ceil(k/2)). WORD_SPLICE packs
+        # the value stream into an int32.
+        FBV=(k_outlier_k if outlier_fp8 else (k_outlier_k + 1) // 2),
+        FBV_P2=triton.next_power_of_2(
+            max(1, k_outlier_k if outlier_fp8 else (k_outlier_k + 1) // 2)),
+        WORD_SPLICE=((not outlier_fp8) and k_outlier_k <= 4),
+        OUTLIER_FP8=bool(outlier_fp8),
+        # COMBINADIC_READ: index source = combinadic rank plane + in-register unrank
+        # (gated; relidx7 default unchanged). FBR = rank field bytes, FBR_P2 its
+        # next-pow2 load width, VL = combinadic universe (32-token group).
+        COMBINADIC_READ=bool(combinadic_read and k_outlier_k > 0),
+        FBR=int(fbr),
+        FBR_P2=int(fbr_p2),
+        # BITMAP_READ: index source = the STORED flat bitmask plane k_obmp (paper item
+        # B4). FBB = ceil(VL/8) frame bytes, FBB_P2 its next-pow2 load width.
+        BITMAP_READ=bool(bitmap_read and k_outlier_k > 0),
+        FBB=int(fbb),
+        FBB_P2=int(fbb_p2),
+        VL=VL,
+        OUTLIER_BITMAP=bool(outlier_bitmap),
+        KV_OUTLIER_MAP=bool(kv_outlier_map),
+        K_DECOUPLE=bool(k_decouple),
+        K_SCALE_INT8=bool(k_scale_int8),
+        V_SCALE_INT8=bool(v_scale_int8),
+        K_BASE_BITS=k_base_bits,
+        GROUP_TOKENS=GROUP_TOKENS,
+        GROUP_CHANNELS=GROUP_CHANNELS,
+        GROUP_SIZE=group_size,
+        BLOCK_H=block_h,
+        # Wave-3 Stage A (validated, default-ON parity-neutral V-side levers):
+        #   CANON_V_HOIST   — hoist the V load to the loop head (cp.async latency)
+        #   CANON_SPLIT_PV  — code-domain split-PV (lane-shared zp bias dot)
+        CANON_V_HOIST=True,
+        CANON_SPLIT_PV=bool(vdeq_once),
+        # LEVER 2: CANON_K_HOIST mirrors CANON_V_HOIST so K+V both prefetch (KV_PIPE).
+        CANON_K_HOIST=bool(kv_pipe),
+        # LEVER 1: V-dequant fast-paths (VLUT folds vz -> forces non-split PV).
+        V_VLUT=bool(v_vlut),
+        V_VLOP3=bool(v_vlop3 and not v_vlut),
+        V_INT_PV=bool(v_int_pv and not v_vlut),
+        # CANON_WIDE_N dead-False (extraction): retained branch, never taken.
+        CANON_WIDE_N=canon_wide_n,
+        N_GROUPS_PER_TILE=n_groups_per_tile,
+        WIDE_STAGES=wide_stages,
+        SKIP_QZP=skip_qzp,
+        FOLD_QZP=bool(fold_qzp),
+        SEG_GROUP_BASE=seg_group_base,
+        ABL=int(abl_flags),
+        FP8_QK=bool(fp8_qk),
+        num_warps=num_warps,
+        num_stages=num_stages,
+    )
+
+    # FUSE_TAIL (Lever B launch-fusion): fold the bf16 sink/recent residual into
+    # the LSE merge prologue (computed per q-head) instead of a separate tail
+    # launch + its Mid_O[TAIL_SLOT] fp32 round-trip — one fewer launch + one fewer
+    # workspace slot touched. Default ON; OMMX_ATTN_FUSE_TAIL=0 reverts to the
+    # standalone tail kernel path. Parity-neutral (same online-softmax math).
+    fuse_tail = _env_bool("OMMX_ATTN_FUSE_TAIL", True)
+    tail_block_n = max(16, min(64, triton.next_power_of_2(max(1, max_tail))))
+
+    # OMMX_MERGE_WIDE (toward-parity occupancy lever — NOT a win): the default
+    # LSE merge launches only (batch, head_num) = 32 CTAs at B=1, severely
+    # under-filling H200's 132 SMs (the merge is a separate launch that adds
+    # directly to B=1 TPOT). The wide variant adds a third grid axis that tiles
+    # the head_dim into n_dv_tiles slices, so B=1 launches batch*head_num*n_dv_tiles
+    # CTAs (≥64-128). Default OFF => byte-identical default path below.
+    #
+    # Tail dedup (constraint b): when wide is ON we route the bf16 sink/recent
+    # tail through the standalone _canonical_bf16_tail launch (grid
+    # (batch, n_kv_heads), BLOCK_H GQA tile via the shared _grouped_qk/pv helpers).
+    # That kernel ALREADY shares the tail K/V read across the GQA group's q-heads
+    # (4× fewer tail K/V reads vs the FUSE_TAIL per-q-head single-row tl.sum) and
+    # spreads the tail across n_kv_heads CTAs — exactly the dedup the task asks for,
+    # reusing the existing grouped helpers rather than re-deriving them. The wide
+    # merge then reads the tail from TAIL_SLOT (FUSE_TAIL=False), splitting that
+    # read per dv-tile too. (The wide kernel also carries an inline-fold FUSE_TAIL
+    # path for completeness, but the standalone-grouped tail is the deduped default.)
+    merge_wide = _env_bool("OMMX_MERGE_WIDE", False)
+    if merge_wide:
+        fuse_tail = False  # route tail through the GQA-grouped standalone launch
+
+    if (not fuse_tail) and max_tail > 0:
+        _canonical_bf16_tail_kernel[(batch, n_kv_heads)](
+            q, k_tail, v_tail,
+            sm_scale,
+            b_tail_len,
+            attn_logits,
+            q.stride(0), q.stride(1),
+            k_tail.stride(0), k_tail.stride(1), k_tail.stride(2),
+            v_tail.stride(0), v_tail.stride(1), v_tail.stride(2),
+            attn_logits.stride(0), attn_logits.stride(1), attn_logits.stride(2),
+            q_head_num=head_num,
+            TAIL_SLOT=num_kv_splits,
+            BLOCK_DMODEL=triton.next_power_of_2(Lk),
+            BLOCK_DV=triton.next_power_of_2(Lv),
+            BLOCK_N=tail_block_n,
+            Lk=Lk, Lv=Lv,
+            logit_cap=logit_cap,
+            GROUP_SIZE=group_size,
+            BLOCK_H=block_h,
+            num_warps=4,
+            num_stages=2,
+        )
+
+    split_pow2 = triton.next_power_of_2(num_kv_splits + 1)
+    if merge_wide:
+        # head_dim-tiled wide grid: BLOCK_DV is the per-CTA channel slice (tunable
+        # via OMMX_MERGE_WIDE_BLOCK_DV; default Lv//2 -> 2 tiles for head_dim 128,
+        # i.e. 2x the CTA count). n_dv_tiles = cdiv(Lv, block_dv_w).
+        bdv_full = triton.next_power_of_2(Lv)
+        block_dv_w = _env_int("OMMX_MERGE_WIDE_BLOCK_DV", max(1, bdv_full // 2))
+        block_dv_w = 1 << (max(1, block_dv_w - 1)).bit_length()  # round to pow2
+        block_dv_w = max(1, min(bdv_full, block_dv_w))
+        n_dv_tiles = (bdv_full + block_dv_w - 1) // block_dv_w
+        merge_warps = _env_int("OMMX_MERGE_WIDE_NUM_WARPS", 2)
+        _canonical_lse_merge_wide_kernel[(batch, head_num, n_dv_tiles)](
+            attn_logits, o, lse, b_seq_len, b_tail_len,
+            attn_logits.stride(0), attn_logits.stride(1), attn_logits.stride(2),
+            o.stride(0), o.stride(1), lse.stride(0),
+            q, k_tail, v_tail, sm_scale,
+            q.stride(0), q.stride(1),
+            k_tail.stride(0), k_tail.stride(1), k_tail.stride(2),
+            v_tail.stride(0), v_tail.stride(1), v_tail.stride(2),
+            NUM_KV_SPLITS=num_kv_splits,
+            SPLIT_POW2=split_pow2,
+            GROUP_TOKENS=GROUP_TOKENS,
+            BLOCK_DV=block_dv_w,
+            Lv=Lv,
+            FUSE_TAIL=bool(fuse_tail),  # False under wide (tail via standalone launch)
+            BLOCK_DMODEL=triton.next_power_of_2(Lk),
+            Lk=Lk,
+            TAIL_BLOCK_N=tail_block_n,
+            logit_cap=logit_cap,
+            GROUP_SIZE=group_size,
+            TAIL_SLOT=num_kv_splits,
+            num_warps=merge_warps,
+            num_stages=1,
+        )
+    else:
+        _canonical_lse_merge_kernel[(batch, head_num)](
+            attn_logits, o, lse, b_seq_len, b_tail_len,
+            attn_logits.stride(0), attn_logits.stride(1), attn_logits.stride(2),
+            o.stride(0), o.stride(1), lse.stride(0),
+            q, k_tail, v_tail, sm_scale,
+            q.stride(0), q.stride(1),
+            k_tail.stride(0), k_tail.stride(1), k_tail.stride(2),
+            v_tail.stride(0), v_tail.stride(1), v_tail.stride(2),
+            NUM_KV_SPLITS=num_kv_splits,
+            SPLIT_POW2=split_pow2,
+            GROUP_TOKENS=GROUP_TOKENS,
+            BLOCK_DV=triton.next_power_of_2(Lv),
+            Lv=Lv,
+            FUSE_TAIL=bool(fuse_tail),
+            BLOCK_DMODEL=triton.next_power_of_2(Lk),
+            Lk=Lk,
+            TAIL_BLOCK_N=tail_block_n,
+            logit_cap=logit_cap,
+            GROUP_SIZE=group_size,
+            num_warps=4,
+            num_stages=1,
+        )
+
+
+# ===========================================================================
+# Public attention-state merge primitive (cascade / radix / cp / chunked reduce)
+# ===========================================================================
+
+def merge_attention_states(o_parts, lse_parts, *, valid_lens=None, out=None,
+                           lse_out=None):
+    """Merge partial attention states ``(o_parts, lse_parts)`` -> ``(o, lse)``.
+
+    The FlashInfer-style recursive attention-state merge: combine ``P`` partial
+    outputs of the SAME query rows — produced over DISJOINT KV segments (cascade /
+    radix shared-prefix splits, context-parallel ranks, chunked-prefill chunks) —
+    into one exact softmax-over-the-union state, using the SAME numerically-stable
+    online-softmax math the split-KV LSE merge validates:
+
+        m = max_p lse_p ;  w_p = exp(lse_p - m)
+        o = (Σ_p w_p · o_p) / Σ_p w_p ;  lse = m + log(Σ_p w_p)
+
+    This is THE single reduce every cross-segment / cross-rank feature folds down
+    to — the decode kernel itself needs no per-feature variant; a framework runs
+    the kernel per segment and calls this once to combine. Associative + (under
+    exact arithmetic) order-independent, so it composes in any tree.
+
+    Args:
+      o_parts:   ``[P, R, D]`` float — P partial outputs per row R (head_dim D).
+      lse_parts: ``[P, R]``   float — the matching log-sum-exp per (part, row).
+      valid_lens: optional ``[R]`` int — per-row valid part count for RAGGED
+        merges (cp / chunked); ``None`` = all P parts valid for every row.
+      out / lse_out: optional pre-allocated ``[R, D]`` / ``[R]`` outputs (in-place).
+
+    Returns ``(o, lse)`` with ``o`` ``[R, D]`` and ``lse`` ``[R]`` (same dtype as
+    ``o_parts`` / fp32). ``R`` is a FLAT row axis: callers with ``[N_heads, ...]``
+    structure reshape to ``[P, R, D]`` first (the merge is per-row independent).
+    """
+    _require_triton()
+    triton = _triton
+    import torch
+
+    if o_parts.dim() != 3:
+        raise ValueError(
+            f"o_parts must be [P, R, D]; got shape {tuple(o_parts.shape)}. "
+            "Reshape any [P, ..., D] structure to a flat row axis R first.")
+    if lse_parts.dim() != 2 or tuple(lse_parts.shape) != tuple(o_parts.shape[:2]):
+        raise ValueError(
+            f"lse_parts must be [P, R] matching o_parts[:2]; got "
+            f"{tuple(lse_parts.shape)} vs {tuple(o_parts.shape[:2])}.")
+    P, R, D = (int(s) for s in o_parts.shape)
+    o_parts = o_parts.contiguous()
+    lse_parts = lse_parts.contiguous().to(torch.float32)
+    if out is None:
+        out = torch.empty(R, D, dtype=o_parts.dtype, device=o_parts.device)
+    if lse_out is None:
+        lse_out = torch.empty(R, dtype=torch.float32, device=o_parts.device)
+    if valid_lens is None:
+        valid = torch.full((R,), -1, dtype=torch.int32, device=o_parts.device)
+    else:
+        valid = valid_lens.to(device=o_parts.device, dtype=torch.int32).contiguous()
+        if int(valid.numel()) != R:
+            raise ValueError(f"valid_lens must have R={R} entries; got {valid.numel()}.")
+
+    _merge_attention_states_kernel_h[(R,)](
+        o_parts, lse_parts, out, lse_out, valid,
+        o_parts.stride(0), o_parts.stride(1), o_parts.stride(2),
+        lse_parts.stride(0), lse_parts.stride(1),
+        out.stride(0), out.stride(1),
+        lse_out.stride(0),
+        N_PARTS=P,
+        PARTS_POW2=triton.next_power_of_2(P),
+        BLOCK_D=triton.next_power_of_2(D),
+        Lv=D,
+        num_warps=4,
+        num_stages=1,
+    )
+    return out, lse_out
+
+
+__all__ = [
+    "ommx_paged_decode_attention_canonical",
+    "merge_attention_states",
+    "is_available",
+]

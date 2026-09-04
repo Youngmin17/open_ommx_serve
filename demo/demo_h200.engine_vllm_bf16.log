@@ -1,0 +1,4 @@
+[ommx] attention: REGISTERED (AttentionBackendEnum.CUSTOM -> OMMXCanonicalBackend; select with --attention-backend CUSTOM) | ommx_w: REGISTERED (--quantization ommx_w)
+INFO 09-05 09:26:49 [core.py:109] Initializing a V1 LLM engine (v0.21.0) with config: model='<path>
+INFO 09-05 09:26:51 [cuda.py:372] Using FLASH_ATTN attention backend out of potential backends: ['FLASH_ATTN', 'FLASHINFER', 'TRITON_ATTN', 'FLEX_ATTENTION'].
+INFO 09-05 09:26:51 [weight_utils.py:900] Prefetching checkpoint files into page cache started (in background, num_threads=8, block_size=16777216 bytes)

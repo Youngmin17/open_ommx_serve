@@ -1,0 +1,458 @@
+{
+  "gpu": "H200",
+  "ctxs": [
+    1024,
+    4096,
+    16384,
+    32768,
+    65536
+  ],
+  "methods": {
+    "ommx_vllm": {
+      "tpot": [
+        8.366,
+        7.6144,
+        13.9391,
+        20.9087,
+        37.6848
+      ],
+      "peak": [
+        null,
+        null,
+        null,
+        null,
+        null
+      ],
+      "provenance": {
+        "source_file": "ommx_vllm.json",
+        "dtype": "bf16",
+        "arm_label": null,
+        "payload_method": "ommx_vllm",
+        "arm": "abl_attn",
+        "attention_backend": "CUSTOM"
+      },
+      "breakdown": {
+        "base": [
+          5.6987,
+          6.5749,
+          7.7408,
+          7.7591,
+          5.9091
+        ],
+        "outlier": [
+          0.0,
+          0.0,
+          2.8677,
+          7.1873,
+          20.5304
+        ],
+        "unpack": [
+          0.0,
+          0.2243,
+          1.0094,
+          1.9581,
+          3.9648
+        ],
+        "scale": [
+          0.0,
+          0.3468,
+          1.7286,
+          3.3263,
+          6.6729
+        ],
+        "pack": [
+          2.6674,
+          0.4684,
+          0.5926,
+          0.6778,
+          0.6076
+        ]
+      },
+      "breakdown_raw": {
+        "base": [
+          5.708735,
+          7.781392,
+          7.740768,
+          7.759089,
+          5.909103
+        ],
+        "outlier": [
+          0.339216,
+          -1.39728,
+          2.867729,
+          7.187314,
+          20.530352
+        ],
+        "unpack": [
+          -0.19776,
+          0.26544,
+          1.009391,
+          1.958095,
+          3.964832
+        ],
+        "scale": [
+          -0.156256,
+          0.410464,
+          1.728608,
+          3.326335,
+          6.67288
+        ],
+        "pack": [
+          2.672112,
+          0.554368,
+          0.592576,
+          0.677823,
+          0.607649
+        ]
+      },
+      "breakdown_meta": {
+        "method": "differential-ablation",
+        "clamped_negative": true,
+        "renormalized_to_total": true,
+        "residual_bucket": "outlier",
+        "segments": [
+          "base",
+          "outlier",
+          "unpack",
+          "scale",
+          "pack"
+        ],
+        "full_arm": "abl_attn",
+        "base_arm": "abl_attn_no_all",
+        "diff_arms": {
+          "unpack": "abl_attn_no_unpack",
+          "scale": "abl_attn_no_dequant",
+          "pack": "abl_attn_skipwrite"
+        },
+        "note": "breakdown = plotted segments (missing arm -> 0.0, negative -> 0.0, then x renorm_factor so the five sum to tpot_ms). breakdown_raw = the same differentials RAW: unclamped, unnormalized, null when the arm is missing. base/outlier in `breakdown` are derived from the CLAMPED diffs (historical recipe, kept so the plot is unchanged); in `breakdown_raw` they are derived from the RAW diffs, so the two can disagree whenever a diff was clamped.",
+        "renorm_factor": {
+          "1024": 0.998234,
+          "4096": 0.844948,
+          "16384": 1.0,
+          "32768": 1.0,
+          "65536": 1.0
+        },
+        "clamped_sum_ms": {
+          "1024": 8.380848,
+          "4096": 9.011664,
+          "16384": 13.939072,
+          "32768": 20.908655,
+          "65536": 37.684816
+        },
+        "clamped_segments": {
+          "1024": [
+            "outlier",
+            "unpack",
+            "scale"
+          ],
+          "4096": [
+            "outlier"
+          ],
+          "16384": [],
+          "32768": [],
+          "65536": []
+        },
+        "missing_arms": {},
+        "arm_tpot_ms": {
+          "1024": {
+            "abl_attn": 8.366048,
+            "abl_attn_no_all": 8.380848,
+            "abl_attn_no_unpack": 8.563808,
+            "abl_attn_no_dequant": 8.522304,
+            "abl_attn_skipwrite": 5.693936
+          },
+          "4096": {
+            "abl_attn": 7.614384,
+            "abl_attn_no_all": 8.33576,
+            "abl_attn_no_unpack": 7.348944,
+            "abl_attn_no_dequant": 7.20392,
+            "abl_attn_skipwrite": 7.060016
+          },
+          "16384": {
+            "abl_attn": 13.939072,
+            "abl_attn_no_all": 8.333344,
+            "abl_attn_no_unpack": 12.92968,
+            "abl_attn_no_dequant": 12.210464,
+            "abl_attn_skipwrite": 13.346496
+          },
+          "32768": {
+            "abl_attn": 20.908655,
+            "abl_attn_no_all": 8.436912,
+            "abl_attn_no_unpack": 18.950561,
+            "abl_attn_no_dequant": 17.58232,
+            "abl_attn_skipwrite": 20.230832
+          },
+          "65536": {
+            "abl_attn": 37.684816,
+            "abl_attn_no_all": 6.516752,
+            "abl_attn_no_unpack": 33.719984,
+            "abl_attn_no_dequant": 31.011936,
+            "abl_attn_skipwrite": 37.077168
+          }
+        },
+        "source_arm": {
+          "1024": "abl_attn",
+          "4096": "abl_attn",
+          "16384": "abl_attn",
+          "32768": "abl_attn",
+          "65536": "abl_attn"
+        },
+        "no_breakdown": {}
+      }
+    },
+    "ommx_hf": {
+      "tpot": [
+        21.1765,
+        20.9249,
+        21.084,
+        29.8936,
+        45.3188
+      ],
+      "peak": [
+        15.298,
+        16.1711,
+        19.6002,
+        24.179,
+        33.2464
+      ],
+      "provenance": {
+        "source_file": "ommx_hf.json",
+        "dtype": "bf16",
+        "arm_label": "ommx (bf16)",
+        "payload_method": "ommx",
+        "arm": null,
+        "attention_backend": null
+      },
+      "breakdown": {
+        "base": [
+          17.692,
+          16.4815,
+          16.1332,
+          15.595,
+          15.9346
+        ],
+        "outlier": [
+          1.9147,
+          2.0739,
+          1.9909,
+          8.4039,
+          16.623
+        ],
+        "unpack": [
+          1.5011,
+          2.1155,
+          2.1743,
+          1.5884,
+          3.7068
+        ],
+        "scale": [
+          0.0687,
+          0.254,
+          0.7856,
+          4.3063,
+          9.0544
+        ],
+        "pack": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "breakdown_raw": {
+        "base": [
+          19.8471,
+          19.8716,
+          19.7486,
+          18.099,
+          18.2205
+        ],
+        "outlier": [
+          2.1479,
+          2.5005,
+          2.4371,
+          9.7533,
+          19.0076
+        ],
+        "unpack": [
+          1.684,
+          2.5507,
+          2.6616,
+          1.8434,
+          4.2385
+        ],
+        "scale": [
+          0.0771,
+          0.3062,
+          0.9616,
+          4.9978,
+          10.3533
+        ],
+        "pack": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "breakdown_meta": {
+        "method": "differential-ablation",
+        "clamped_negative": true,
+        "renormalized_to_total": true,
+        "segments": [
+          "base",
+          "outlier",
+          "unpack",
+          "scale",
+          "pack"
+        ],
+        "full_arm": "full",
+        "base_arm": "no_all",
+        "diff_arms": {
+          "outlier": "no_outlier",
+          "unpack": "no_unpack",
+          "scale": "no_dequant"
+        },
+        "pack_segment": "absent on this path -- there is no HF equivalent of the vLLM skipwrite arm, so pack is 0 and its cost sits inside base",
+        "p99_over_median": {
+          "1024": 6.56,
+          "4096": 3.72,
+          "16384": 3.18,
+          "32768": 2.4,
+          "65536": 1.65
+        },
+        "normalized_to": "the target file's own tpot_ms, so the segments sum to the drawn bar",
+        "ablation_full_tpot": {
+          "1024": 19.8698,
+          "4096": 20.2477,
+          "16384": 20.3914,
+          "32768": 29.5121,
+          "65536": 44.7488
+        },
+        "caveat": "segments are differences of separately-timed runs; they do not sum to the total before renormalization. Short contexts are dominated by per-step Python overhead the flags do not remove -- see p99_over_median."
+      }
+    },
+    "bf16_hf": {
+      "tpot": [
+        13.5912,
+        13.7705,
+        21.7793,
+        33.426,
+        56.7406
+      ],
+      "peak": [
+        15.3739,
+        16.5055,
+        21.0349,
+        27.0742,
+        39.1528
+      ],
+      "provenance": {
+        "source_file": "bf16_hf.json",
+        "dtype": "bf16",
+        "arm_label": "bf16",
+        "payload_method": "bf16",
+        "arm": null,
+        "attention_backend": null
+      }
+    },
+    "vllm_bf16": {
+      "tpot": [
+        3.6487,
+        4.2361,
+        6.2524,
+        8.9305,
+        14.3101
+      ],
+      "peak": [
+        null,
+        null,
+        null,
+        null,
+        null
+      ],
+      "provenance": {
+        "source_file": "vllm_bf16.json",
+        "dtype": "bf16",
+        "arm_label": null,
+        "payload_method": "vllm_triton",
+        "arm": "TRITON",
+        "attention_backend": "TRITON_ATTN"
+      }
+    },
+    "kivi_hf": {
+      "tpot": [
+        33.6066,
+        33.2361,
+        52.7058,
+        89.6858,
+        163.5201
+      ],
+      "peak": [
+        15.7613,
+        18.0557,
+        27.2384,
+        39.4809,
+        63.9658
+      ],
+      "provenance": {
+        "source_file": "kivi_hf.json",
+        "dtype": "fp16",
+        "arm_label": "kivi (fp16)",
+        "payload_method": "kivi",
+        "arm": null,
+        "attention_backend": null
+      }
+    },
+    "kitty_hf": {
+      "tpot": [
+        14.5439,
+        17.0678,
+        40.2183,
+        71.329,
+        133.5156
+      ],
+      "peak": [
+        15.2908,
+        16.117,
+        19.3743,
+        23.7607,
+        32.4412
+      ],
+      "provenance": {
+        "source_file": "kitty_hf.json",
+        "dtype": "fp16",
+        "arm_label": "kitty (fp16)",
+        "payload_method": "kitty",
+        "arm": null,
+        "attention_backend": null
+      }
+    },
+    "turboquant_vllm": {
+      "tpot": [
+        6.6011,
+        7.9733,
+        13.71,
+        21.3995,
+        36.7884
+      ],
+      "peak": [
+        null,
+        null,
+        null,
+        null,
+        null
+      ],
+      "provenance": {
+        "source_file": "turboquant_vllm.json",
+        "dtype": null,
+        "arm_label": null,
+        "payload_method": "turboquant_vllm",
+        "arm": "TURBOQUANT",
+        "attention_backend": null
+      }
+    }
+  }
+}

@@ -1,0 +1,41 @@
+{
+  "method": "vllm_triton",
+  "provenance": {
+    "recipe_resolved": null,
+    "block_size": "unknown",
+    "page_grid": null,
+    "route_tags": null
+  },
+  "method_alias": "vllm_bf16",
+  "arm": "TRITON",
+  "attention_backend": "TRITON_ATTN",
+  "weights": "bf16",
+  "note": "vLLM engine, bf16 weights, TRITON_ATTN backend. vLLM's DEFAULT backend is FLASH_ATTN -- see --flash-arm for that baseline.",
+  "ctxs": {
+    "1024": {
+      "tpot_ms": 3.4946,
+      "ttft_ms": 29.851936500519514,
+      "peak_gb": null
+    },
+    "4096": {
+      "tpot_ms": 4.0216,
+      "ttft_ms": 153.651267118752,
+      "peak_gb": null
+    },
+    "16384": {
+      "tpot_ms": 6.1458,
+      "ttft_ms": 1402.706168164499,
+      "peak_gb": null
+    },
+    "32768": {
+      "tpot_ms": 8.8079,
+      "ttft_ms": 4895.231363313273,
+      "peak_gb": null
+    },
+    "65536": {
+      "tpot_ms": 14.3224,
+      "ttft_ms": 18343.622776250355,
+      "peak_gb": null
+    }
+  }
+}

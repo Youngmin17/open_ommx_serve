@@ -1,0 +1,32 @@
+{
+  "method": "turboquant_vllm",
+  "arm": "TURBOQUANT",
+  "kv_cache_dtype": "turboquant_3bit_nc",
+  "ctxs": {
+    "1024": {
+      "tpot_ms": 6.6011,
+      "ttft_ms": 41.932064056396484,
+      "peak_gb": null
+    },
+    "4096": {
+      "tpot_ms": 7.9733,
+      "ttft_ms": 0.6502400040626526,
+      "peak_gb": null
+    },
+    "16384": {
+      "tpot_ms": 13.71,
+      "ttft_ms": 553.9860832691193,
+      "peak_gb": null
+    },
+    "32768": {
+      "tpot_ms": 21.3995,
+      "ttft_ms": 1492.9816213846207,
+      "peak_gb": null
+    },
+    "65536": {
+      "tpot_ms": 36.7884,
+      "ttft_ms": 4.400864124298096,
+      "peak_gb": null
+    }
+  }
+}
