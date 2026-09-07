@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# Refuse a commit that would push a boundary violation into history.
+#
+# Enable once per clone:
+#
+#     git config core.hooksPath .githooks
+#
+# Why a hook and not only run.sh check: the gate catches a violation before
+# a release, the hook catches it before it is WRITTEN DOWN. That distinction matters
+# here in a way it does not for a normal test failure -- a credential or a foundry
+# view that reaches a public remote stays reachable from the reflog, from forks and
+# from anyone who fetched, and `git rebase` does not unpublish it. The cheapest place
+# to stop it is the commit that introduces it.
+#
+# --staged, so the hook judges what is about to be committed rather than the whole
+# tree: an unrelated pre-existing violation must not block work on something else,
+# and a violation you are in the middle of REMOVING must not block its own removal.
+#
+# To get past it deliberately, use `git commit --no-verify` -- and then explain
+# yourself in .release-hygiene-allow, which is tracked so the exemption is reviewed.
+set -o pipefail
+root="$(git rev-parse --show-toplevel)"
+[ -x "$root/scripts/check_release_hygiene.sh" ] || exit 0
+exec bash "$root/scripts/check_release_hygiene.sh" --staged

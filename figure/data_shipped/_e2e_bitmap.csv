@@ -1,0 +1,6 @@
+arch,group,arm,label,backend,quant,batch,ctx,ttft_p50,ttft_p99,tpot_p50,tpot_p99,n_steps,mode,ok,oom,err
+shipped_bitmap,abl,abl_attn,bf16-w+OMMXattn(noshadow),CUSTOM,,1,1024,82.57076,83.21724,8.57078,46.39707,800,graph,True,False,
+shipped_bitmap,abl,abl_attn,bf16-w+OMMXattn(noshadow),CUSTOM,,1,4096,191.18266,191.55253,7.61602,52.63062,800,graph,True,False,
+shipped_bitmap,abl,abl_attn,bf16-w+OMMXattn(noshadow),CUSTOM,,1,16384,742.83173,743.22913,13.93445,58.14712,800,graph,True,False,
+shipped_bitmap,abl,abl_attn,bf16-w+OMMXattn(noshadow),CUSTOM,,1,32768,1675.79323,1677.97692,20.9091,65.11647,800,graph,True,False,
+shipped_bitmap,abl,abl_attn,bf16-w+OMMXattn(noshadow),CUSTOM,,1,65536,4275.43198,4278.75501,37.69053,81.92279,800,graph,True,False,

@@ -1,0 +1,6 @@
+arch,group,arm,label,backend,quant,batch,ctx,ttft_p50,ttft_p99,tpot_p50,tpot_p99,n_steps,mode,ok,oom,err
+shipped_relidx7,abl,abl_attn,bf16-w+OMMXattn(noshadow),CUSTOM,,1,1024,80.536,81.47807,6.92526,49.13197,800,graph,True,False,
+shipped_relidx7,abl,abl_attn,bf16-w+OMMXattn(noshadow),CUSTOM,,1,4096,191.92848,192.16161,9.10386,52.00654,800,graph,True,False,
+shipped_relidx7,abl,abl_attn,bf16-w+OMMXattn(noshadow),CUSTOM,,1,16384,746.67787,748.14324,20.72683,63.18526,800,graph,True,False,
+shipped_relidx7,abl,abl_attn,bf16-w+OMMXattn(noshadow),CUSTOM,,1,32768,1685.17925,1686.08767,33.35435,75.95286,800,graph,True,False,
+shipped_relidx7,abl,abl_attn,bf16-w+OMMXattn(noshadow),CUSTOM,,1,65536,4294.56235,4303.07905,64.54502,107.06425,800,graph,True,False,

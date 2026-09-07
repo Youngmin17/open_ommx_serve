@@ -1,0 +1,2 @@
+PAGE_GRID rank=0 pid=1074312 vllm_block_size=16 ommx_group_tokens=32 pages_per_group=2
+GRAPH_ROUTE_FIRED rank=0 pid=1074312 fmt=i2f4 ctx=131072

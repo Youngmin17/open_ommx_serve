@@ -1,0 +1,6 @@
+arch,group,arm,label,backend,quant,batch,ctx,ttft_p50,ttft_p99,tpot_p50,tpot_p99,n_steps,mode,ok,oom,err
+h200tq,cmp,TURBOQUANT,turboquant_3bit_nc,,,1,1024,41.93206,335.42785,6.60106,14.4582,759,graph,True,False,
+h200tq,cmp,TURBOQUANT,turboquant_3bit_nc,,,1,4096,0.65024,105.77462,7.97331,15.34413,800,graph,True,False,
+h200tq,cmp,TURBOQUANT,turboquant_3bit_nc,,,1,16384,553.98608,554.66793,13.71,20.0931,800,graph,True,False,
+h200tq,cmp,TURBOQUANT,turboquant_3bit_nc,,,1,32768,1492.98162,1509.20797,21.39954,27.7255,800,graph,True,False,
+h200tq,cmp,TURBOQUANT,turboquant_3bit_nc,,,1,65536,4.40086,4391.15623,36.7884,45.1604,800,graph,True,False,

@@ -1,0 +1,243 @@
+{
+  "method": "ommx_vllm",
+  "arm": "abl_attn",
+  "provenance": {
+    "recipe_resolved": {
+      "k_format": "i2f4",
+      "outliers_per_vector": 6,
+      "use_pow2": true,
+      "group_tokens": 32,
+      "group_channels": 32,
+      "sink_tokens": 8,
+      "recent_window": 32,
+      "outlier_select": "signed",
+      "outlier_repr": "bitmap",
+      "kv_outlier_map": true,
+      "page_size": 16,
+      "ommx_env": {
+        "OMMX_ATTN_CUDA_DECODE": "0",
+        "OMMX_ATTN_GRAPH": "1",
+        "OMMX_ATTN_K_FORMAT": "i2f4",
+        "OMMX_ATTN_OUTLIERS": "6",
+        "OMMX_ATTN_OUTLIER_SELECT": "signed",
+        "OMMX_ATTN_POW2": "1",
+        "OMMX_KV_GPU_PACK": "1",
+        "OMMX_KV_GROUP_CHANNELS": "32",
+        "OMMX_KV_GROUP_TOKENS": "32",
+        "OMMX_KV_OUTLIER_MAP": "1",
+        "OMMX_KV_RECENT": "32",
+        "OMMX_KV_RING": "1",
+        "OMMX_KV_SINK": "8"
+      }
+    },
+    "block_size": "engine-default",
+    "page_grid": "PAGE_GRID rank=0 pid=4102408 vllm_block_size=16 ommx_group_tokens=32 pages_per_group=2",
+    "route_tags": [
+      "PAGE_GRID"
+    ]
+  },
+  "attention_backend": "CUSTOM",
+  "weights": "bf16",
+  "partial_bf16_coverage": [],
+  "informational_tags": [
+    "PAGE_GRID"
+  ],
+  "ctxs": {
+    "1024": {
+      "tpot_ms": 8.6261,
+      "ttft_ms": 82.3745952276513,
+      "peak_gb": null
+    },
+    "4096": {
+      "tpot_ms": 6.9935,
+      "ttft_ms": 190.908098786138,
+      "peak_gb": null
+    },
+    "16384": {
+      "tpot_ms": 10.6554,
+      "ttft_ms": 738.4337025228888,
+      "peak_gb": null
+    },
+    "32768": {
+      "tpot_ms": 14.5555,
+      "ttft_ms": 1671.0640130946413,
+      "peak_gb": null
+    },
+    "65536": {
+      "tpot_ms": 22.6317,
+      "ttft_ms": 4276.363983812742,
+      "peak_gb": null
+    }
+  },
+  "breakdown": {
+    "base": {
+      "1024": 6.0708,
+      "4096": 5.8561,
+      "16384": 6.8658,
+      "32768": 8.6558,
+      "65536": 9.3494
+    },
+    "outlier": {
+      "1024": 0.0,
+      "4096": 0.0,
+      "16384": 0.0,
+      "32768": 0.0,
+      "65536": 2.2097
+    },
+    "unpack": {
+      "1024": 0.0592,
+      "4096": 0.0,
+      "16384": 1.6614,
+      "32768": 3.1117,
+      "65536": 6.3744
+    },
+    "scale": {
+      "1024": 2.3552,
+      "4096": 0.8887,
+      "16384": 1.562,
+      "32768": 2.2655,
+      "65536": 4.024
+    },
+    "pack": {
+      "1024": 0.1409,
+      "4096": 0.2486,
+      "16384": 0.5662,
+      "32768": 0.5225,
+      "65536": 0.6741
+    }
+  },
+  "breakdown_raw": {
+    "base": {
+      "1024": 8.527728,
+      "4096": 8.315104,
+      "16384": 7.986848,
+      "32768": 9.360304,
+      "65536": 9.349408
+    },
+    "outlier": {
+      "1024": -3.491104,
+      "4096": -1.395488,
+      "16384": -1.73976,
+      "32768": -1.184752,
+      "65536": 2.209711
+    },
+    "unpack": {
+      "1024": 0.08312,
+      "4096": -1.54104,
+      "16384": 1.932673,
+      "32768": 3.364992,
+      "65536": 6.374433
+    },
+    "scale": {
+      "1024": 3.308432,
+      "4096": 1.261888,
+      "16384": 1.817072,
+      "32768": 2.449888,
+      "65536": 4.024049
+    },
+    "pack": {
+      "1024": 0.19792,
+      "4096": 0.353008,
+      "16384": 0.658592,
+      "32768": 0.565024,
+      "65536": 0.674129
+    }
+  },
+  "breakdown_meta": {
+    "method": "differential-ablation",
+    "clamped_negative": true,
+    "renormalized_to_total": true,
+    "residual_bucket": "outlier",
+    "segments": [
+      "base",
+      "outlier",
+      "unpack",
+      "scale",
+      "pack"
+    ],
+    "full_arm": "abl_attn",
+    "base_arm": "abl_attn_no_all",
+    "diff_arms": {
+      "unpack": "abl_attn_no_unpack",
+      "scale": "abl_attn_no_dequant",
+      "pack": "abl_attn_skipwrite"
+    },
+    "note": "breakdown = plotted segments (missing arm -> 0.0, negative -> 0.0, then x renorm_factor so the five sum to tpot_ms). breakdown_raw = the same differentials RAW: unclamped, unnormalized, null when the arm is missing. base/outlier in `breakdown` are derived from the CLAMPED diffs (historical recipe, kept so the plot is unchanged); in `breakdown_raw` they are derived from the RAW diffs, so the two can disagree whenever a diff was clamped.",
+    "renorm_factor": {
+      "1024": 0.711889,
+      "4096": 0.704277,
+      "16384": 0.859642,
+      "32768": 0.924731,
+      "65536": 1.0
+    },
+    "clamped_sum_ms": {
+      "1024": 12.117199,
+      "4096": 9.93,
+      "16384": 12.395185,
+      "32768": 15.740208,
+      "65536": 22.631728
+    },
+    "clamped_segments": {
+      "1024": [
+        "outlier"
+      ],
+      "4096": [
+        "outlier",
+        "unpack"
+      ],
+      "16384": [
+        "outlier"
+      ],
+      "32768": [
+        "outlier"
+      ],
+      "65536": []
+    },
+    "missing_arms": {},
+    "arm_tpot_ms": {
+      "1024": {
+        "abl_attn": 8.626096,
+        "abl_attn_no_all": 8.725648,
+        "abl_attn_no_unpack": 8.542976,
+        "abl_attn_no_dequant": 5.317664,
+        "abl_attn_skipwrite": 8.428176
+      },
+      "4096": {
+        "abl_attn": 6.993472,
+        "abl_attn_no_all": 8.668112,
+        "abl_attn_no_unpack": 8.534512,
+        "abl_attn_no_dequant": 5.731584,
+        "abl_attn_skipwrite": 6.640464
+      },
+      "16384": {
+        "abl_attn": 10.655424,
+        "abl_attn_no_all": 8.64544,
+        "abl_attn_no_unpack": 8.722752,
+        "abl_attn_no_dequant": 8.838352,
+        "abl_attn_skipwrite": 9.996832
+      },
+      "32768": {
+        "abl_attn": 14.555456,
+        "abl_attn_no_all": 9.925328,
+        "abl_attn_no_unpack": 11.190464,
+        "abl_attn_no_dequant": 12.105568,
+        "abl_attn_skipwrite": 13.990432
+      },
+      "65536": {
+        "abl_attn": 22.631728,
+        "abl_attn_no_all": 10.023536,
+        "abl_attn_no_unpack": 16.257296,
+        "abl_attn_no_dequant": 18.607679,
+        "abl_attn_skipwrite": 21.9576
+      }
+    },
+    "source_arm": {
+      "1024": "abl_attn",
+      "4096": "abl_attn",
+      "16384": "abl_attn",
+      "32768": "abl_attn",
+      "65536": "abl_attn"
+    },
+    "no_breakdown": {}
+  }
+}

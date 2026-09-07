@@ -1,0 +1,154 @@
+# open_ommx_serve — reproduction code for OMMX low-bit KV serving vs KIVI / Kitty.
+#
+# This root project ships NO importable package of its own; it exists to declare the
+# per-METHOD dependency bundles as optional-dependencies (extras). Because KIVI, Kitty and
+# vLLM pin mutually-incompatible transformers / engine versions, each method
+# is installed into its OWN venv (see README "Setup"), e.g.:
+#
+#   uv venv .venv-ommx  --python 3.10 && uv pip install -e '.[ommx]'  && uv pip install -e ommx_gpu_serve && uv pip install -e 'eval[ruler]'
+#   uv venv .venv-kivi  --python 3.10 && uv pip install -e '.[kivi]'  && uv pip install -e 'eval[ruler]'
+#   uv venv .venv-kitty --python 3.10 && uv pip install -e '.[kitty]' && uv pip install -e 'eval[ruler]'
+#
+# `eval[ruler]`, not a bare `-e eval`: RULER is the documented accuracy benchmark, and the
+# `ruler` task group includes `ruler_cwe`, whose builder module
+# `eval/lm_eval/tasks/ruler/cwe_utils.py` does `import wonderwords` AND instantiates
+# `wonderwords.RandomWord()` at MODULE scope. lm_eval's `!function` YAML constructor
+# (`import_function` in eval/lm_eval/utils.py) fully executes that module at task-load
+# time, so a bare `-e eval` dies with ModuleNotFoundError before a single token is
+# generated. `wonderwords` lives in eval/pyproject.toml's `ruler` extra; the `scipy` half
+# of that extra is already carried transitively by the base `scikit-learn>=0.24.1` dep.
+#
+# run.sh picks the matching venv per method. Versions below are starting pins; validate /
+# adjust on the target A100 (some are GPU-build sensitive, e.g. flash-attn).
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "open-ommx-serve"
+version = "0.1.0"
+description = "ICCAD 2026 artifact: OMMX low-bit MX outlier quantization, accuracy + serving repro"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+readme = "README.md"
+authors = [{ name = "Youngmin17", email = "galateia2331@gmail.com" }]
+# Bare install pulls nothing heavy; everything is opt-in per method.
+dependencies = []
+
+[project.optional-dependencies]
+# ── figure plotting only (CPU, no model) ──────────────────────────────────────
+fig = ["numpy", "matplotlib"]
+
+# ── OMMX: Triton paged-decode kernel + HF-eager + vLLM best-recipe ────────────
+#   also: `pip install -e ommx_gpu_serve` (the kernel package) and `-e 'eval[ruler]'` for RULER.
+#   flash-attn optional (faster long-ctx prefill); drivers fall back to sdpa if absent.
+#   The vLLM floor is 0.21, NOT the 0.11 this line used to claim: the OMMX backend
+#   subclasses `vllm.v1.attention.backend` / `v1.attention.backends.flash_attn` and
+#   overrides `FlashAttentionImpl.do_kv_cache_update` — none of which exist in a
+#   0.11-era tree. `ommx_gpu_serve/integration/vllm/preflight.py` enforces the same
+#   floor at startup (MIN_VLLM_VERSION = (0, 21)), so a resolver allowed to pick 0.11
+#   here would only move the failure from install time to run time.
+#   `--quantization ommx_w` (the WEIGHT-quant arm) additionally JIT-compiles the CUDA
+#   linear kernel at weight-load time, so it needs the `[linear]` extra on top of this
+#   one: `uv pip install -e '.[ommx]' -e '.[linear]'`. It is NOT folded in here because
+#   the KV-quant arms — which is what `.[ommx]` exists for — compile nothing.
+ommx = [
+    "torch>=2.4.0",
+    "triton>=3.0.0",
+    "transformers>=4.52",
+    "accelerate>=0.30",
+    "vllm>=0.21",
+    "numpy",
+    "matplotlib",
+]
+
+# ── weight-quant linear: the kernel, its gate, and its vLLM serving path ──────
+#   SEPARATE axis from the KV-quant serving path: this is the i2f4 WEIGHT-quant linear
+#   kernel. Two consumers now share it, and both need this extra:
+#     * the standalone microbench + correctness gate under ommx_gpu_serve/csrc/linear/;
+#     * `--quantization ommx_w` in vLLM — ommx_gpu_serve/integration/vllm/linear_method.py
+#       JIT-builds the same kernel at weight-load time. (That package declares the same
+#       requirement as its own minimal `[ommx_w]` extra; this one adds the plotter deps
+#       the microbench wants. Installing `.[linear]` covers both.)
+#   The kernel sources live outside the importable `ommx_gpu_serve` package tree (see
+#   that pyproject's layout note), so their build-time dependency is declared here.
+#
+#   ninja is a HARD requirement, not a nicety: build_ommx_linear.py compiles
+#   ommx_linear.cu through `torch.utils.cpp_extension.load()`, which SHELLS OUT to
+#   the ninja EXECUTABLE. Without it the documented correctness gate
+#   `csrc/linear/test_ommx_linear_parity.py` dies before it runs a single assert —
+#   and so does the first ommx_w layer's process_weights_after_loading():
+#       RuntimeError: Ninja is required to load C++ extensions
+#   NOTE — the wheel being installed is necessary but NOT sufficient: it drops the
+#   `ninja` BINARY into <env>/bin/, which is on PATH only while that env is ACTIVATED.
+#   Invoking `/path/to/env/bin/python test_ommx_linear_parity.py` directly does NOT
+#   put <env>/bin on PATH, and the gate still fails with the error above. Either
+#   activate the env (`conda activate ...` / `source .venv/bin/activate`) or
+#   `export PATH="/path/to/env/bin:$PATH"` before running it.
+#
+#   Also not packageable: `export LIBRARY_PATH="$CONDA_PREFIX/lib:$CONDA_PREFIX/lib64"`
+#   on cu13 conda envs — torch emits `-L$CUDA_HOME/lib64` while those envs keep
+#   libcudart.so in lib/, so the link dies as `/usr/bin/ld: cannot find -lcudart`. These
+#   are the two measured requirements linear_method.build_kernel() names when it raises.
+#
+#   Not pip-installable, so not listed: a CUTLASS 4.4.2 tree for the INT4 comparison
+#   arm (OMMX_CUTLASS_DIR) and bitsandbytes for the LLM.int8 arm — both optional, and
+#   neither is needed by the parity gate itself.
+linear = [
+    "torch>=2.4.0",
+    "ninja",
+    "numpy",
+    "matplotlib",
+]
+
+# ── KIVI: real 2-bit KV kernel (Triton fallback; build kivi_gemv CUDA from upstream) ──
+#   KIVI targets an older transformers (cache_utils.Cache + _prepare_4d_causal_attention_mask).
+kivi = [
+    "torch>=2.4.0",
+    "transformers>=4.40,<4.50",
+    "accelerate>=0.30",
+    "triton>=2.3.0",
+    "numpy",
+]
+
+# ── Kitty: 2-bit + INT4-channel boost. Needs external `kitty` package (KITTY_PKG_PATH) ──
+#   Kitty modeling pins transformers 4.53.2 exactly (masking_utils + CacheConfig).
+kitty = [
+    "torch>=2.4.0",
+    "transformers==4.53.2",
+    "accelerate>=0.30",
+    "triton>=3.0.0",
+    "numpy",
+]
+
+
+# ── lm-eval deps (RULER, coqa). Prefer `pip install -e 'eval[ruler]'` (authoritative).
+#    lm-eval degrades gracefully without sacrebleu/pytablewriter/peft (lazy-guarded),
+#    but install them for full output formatting + the HFLM adapter.
+#    `wonderwords` does NOT degrade gracefully and is NOT optional for the documented
+#    RULER-32K accuracy run: eval/lm_eval/tasks/ruler/cwe_utils.py imports it and calls
+#    `wonderwords.RandomWord()` at module scope, and cwe.yaml pulls that module in via
+#    `custom_dataset: !function cwe_utils.get_cw_dataset`, which lm_eval executes in full
+#    at task-load time. It is mirrored here so this bundle matches eval/pyproject.toml's
+#    `ruler` extra rather than silently dropping the task group.
+eval = [
+    "datasets>=2.16",
+    "evaluate",
+    "sacrebleu",
+    "rouge-score",
+    "nltk",
+    "wonderwords",
+    "jsonlines",
+    "sqlitedict",
+    "pytablewriter",
+    "peft",
+    "tqdm",
+    "numpy",
+]
+
+dev = ["pytest", "numpy", "matplotlib"]
+
+# No packages: this root is a dependency-bundle project only (real code lives in the
+# ommx_gpu_serve/, eval/ sub-packages installed separately, plus PYTHONPATH source dirs).
+[tool.setuptools]
+packages = []

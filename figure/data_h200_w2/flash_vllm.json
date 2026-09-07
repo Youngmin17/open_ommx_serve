@@ -1,0 +1,40 @@
+{
+  "method": "vllm_flash_attn",
+  "arm": "FA",
+  "provenance": {
+    "recipe_resolved": null,
+    "block_size": "unknown",
+    "page_grid": null,
+    "route_tags": null
+  },
+  "attention_backend": "FLASH_ATTN",
+  "weights": "bf16",
+  "note": "vLLM's DEFAULT attention backend -- the stock-vLLM baseline.",
+  "ctxs": {
+    "1024": {
+      "tpot_ms": 3.6198,
+      "ttft_ms": 25.57353539019823,
+      "peak_gb": null
+    },
+    "4096": {
+      "tpot_ms": 3.6898,
+      "ttft_ms": 91.18742491398007,
+      "peak_gb": null
+    },
+    "16384": {
+      "tpot_ms": 4.0777,
+      "ttft_ms": 456.33404387068003,
+      "peak_gb": null
+    },
+    "32768": {
+      "tpot_ms": 4.6284,
+      "ttft_ms": 1140.3654829058796,
+      "peak_gb": null
+    },
+    "65536": {
+      "tpot_ms": 5.7005,
+      "ttft_ms": 3242.0505083743483,
+      "peak_gb": null
+    }
+  }
+}

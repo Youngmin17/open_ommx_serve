@@ -1,0 +1,246 @@
+{
+  "gpu": "H200",
+  "ctxs": [
+    1024,
+    4096,
+    16384,
+    32768,
+    65536
+  ],
+  "methods": {
+    "ommx_vllm": {
+      "tpot": [
+        11.0328,
+        11.2921,
+        18.2002,
+        30.2294,
+        51.2557
+      ],
+      "peak": [
+        null,
+        null,
+        null,
+        null,
+        null
+      ],
+      "provenance": {
+        "source_file": "ommx_vllm.json",
+        "dtype": "bf16",
+        "arm_label": null,
+        "payload_method": "ommx_vllm",
+        "arm": "abl_attn",
+        "attention_backend": "CUSTOM"
+      },
+      "breakdown": {
+        "base": [
+          null,
+          null,
+          null,
+          null,
+          null
+        ],
+        "outlier": [
+          null,
+          null,
+          null,
+          null,
+          null
+        ],
+        "unpack": [
+          null,
+          null,
+          null,
+          null,
+          null
+        ],
+        "scale": [
+          null,
+          null,
+          null,
+          null,
+          null
+        ],
+        "pack": [
+          null,
+          null,
+          null,
+          null,
+          null
+        ]
+      },
+      "breakdown_raw": {
+        "base": [
+          null,
+          null,
+          null,
+          null,
+          null
+        ],
+        "outlier": [
+          null,
+          null,
+          null,
+          null,
+          null
+        ],
+        "unpack": [
+          null,
+          null,
+          null,
+          null,
+          null
+        ],
+        "scale": [
+          null,
+          null,
+          null,
+          null,
+          null
+        ],
+        "pack": [
+          null,
+          null,
+          null,
+          null,
+          null
+        ]
+      },
+      "breakdown_meta": {
+        "method": "differential-ablation",
+        "clamped_negative": true,
+        "renormalized_to_total": true,
+        "residual_bucket": "outlier",
+        "segments": [
+          "base",
+          "outlier",
+          "unpack",
+          "scale",
+          "pack"
+        ],
+        "full_arm": "abl_attn",
+        "base_arm": "abl_attn_no_all",
+        "diff_arms": {
+          "unpack": "abl_attn_no_unpack",
+          "scale": "abl_attn_no_dequant",
+          "pack": "abl_attn_skipwrite"
+        },
+        "note": "breakdown = plotted segments (missing arm -> 0.0, negative -> 0.0, then x renorm_factor so the five sum to tpot_ms). breakdown_raw = the same differentials RAW: unclamped, unnormalized, null when the arm is missing. base/outlier in `breakdown` are derived from the CLAMPED diffs (historical recipe, kept so the plot is unchanged); in `breakdown_raw` they are derived from the RAW diffs, so the two can disagree whenever a diff was clamped.",
+        "renorm_factor": {},
+        "clamped_sum_ms": {},
+        "clamped_segments": {},
+        "missing_arms": {},
+        "arm_tpot_ms": {},
+        "source_arm": {
+          "1024": "abl_attn",
+          "4096": "abl_attn",
+          "16384": "abl_attn",
+          "32768": "abl_attn",
+          "65536": "abl_attn"
+        },
+        "no_breakdown": {
+          "1024": "abl_attn_no_all missing",
+          "4096": "abl_attn_no_all missing",
+          "16384": "abl_attn_no_all missing",
+          "32768": "abl_attn_no_all missing",
+          "65536": "abl_attn_no_all missing"
+        }
+      }
+    },
+    "ommx_hf": {
+      "tpot": [
+        21.0857,
+        23.4975,
+        25.9822,
+        42.7802,
+        70.9876
+      ],
+      "peak": [
+        15.3001,
+        16.1791,
+        19.6344,
+        24.2498,
+        33.3725
+      ],
+      "provenance": {
+        "source_file": "ommx_hf.json",
+        "dtype": "bf16",
+        "arm_label": "ommx (bf16)",
+        "payload_method": "ommx",
+        "arm": null,
+        "attention_backend": null
+      }
+    },
+    "bf16_hf": {
+      "tpot": [
+        13.5912,
+        13.7705,
+        21.7793,
+        33.426,
+        56.7406
+      ],
+      "peak": [
+        15.3739,
+        16.5055,
+        21.0349,
+        27.0742,
+        39.1528
+      ],
+      "provenance": {
+        "source_file": "bf16_hf.json",
+        "dtype": "bf16",
+        "arm_label": "bf16",
+        "payload_method": "bf16",
+        "arm": null,
+        "attention_backend": null
+      }
+    },
+    "vllm_bf16": {
+      "tpot": [
+        3.6487,
+        4.2361,
+        6.2524,
+        8.9305,
+        14.3101
+      ],
+      "peak": [
+        null,
+        null,
+        null,
+        null,
+        null
+      ],
+      "provenance": {
+        "source_file": "vllm_bf16.json",
+        "dtype": "bf16",
+        "arm_label": null,
+        "payload_method": "vllm_triton",
+        "arm": "TRITON",
+        "attention_backend": "TRITON_ATTN"
+      }
+    },
+    "kivi_hf": {
+      "tpot": [
+        33.6066,
+        33.2361,
+        52.7058,
+        89.6858,
+        163.5201
+      ],
+      "peak": [
+        15.7613,
+        18.0557,
+        27.2384,
+        39.4809,
+        63.9658
+      ],
+      "provenance": {
+        "source_file": "kivi_hf.json",
+        "dtype": "fp16",
+        "arm_label": "kivi (fp16)",
+        "payload_method": "kivi",
+        "arm": null,
+        "attention_backend": null
+      }
+    }
+  }
+}

@@ -1,0 +1,16 @@
+# Paths exempt from scripts/check_release_hygiene.sh, one per line, prefix match.
+#
+# TRACKED on purpose. An exemption is a claim that something which looks like a
+# boundary violation is not one, and that claim belongs in a diff where it can be
+# argued with -- not in an environment variable or someone's shell history.
+#
+# Write the reason next to the path. "It was noisy" is not a reason.
+
+ommx_gpu_serve/tests/test_release_hygiene.py
+#   The end-to-end test for this check. It has to CONTAIN one example of each
+#   violation -- a fake token, a de-anonymised /scratch path, a BSD-3 header with no
+#   manifest row -- because it asserts each rule fires on its own case. Without those
+#   strings the test proves nothing.
+#
+#   Reviewable claim: every string in that file is a fixture. The token is 36 a's,
+#   the user is "jdoe". They are written only into a temporary repository it deletes.

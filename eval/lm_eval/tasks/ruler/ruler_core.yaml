@@ -1,0 +1,9 @@
+group: ruler_core
+task:
+  - niah_multikey_1
+  - ruler_qa_squad
+aggregate_metric_list:
+  - metric: "32768"
+    weight_by_size: False
+metadata:
+  version: 1 

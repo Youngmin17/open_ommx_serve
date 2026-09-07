@@ -1,0 +1,181 @@
+{
+  "model": "meta-llama/Llama-3.1-8B-Instruct",
+  "arms": {
+    "abl_attn": {
+      "b1_ctx1024": {
+        "ttft_p50": 81.83596629928797,
+        "ttft_p99": 82.24146076183766,
+        "tpot_p50": 8.487279891967773,
+        "tpot_p99": 46.21667213439942,
+        "n_steps": 800,
+        "ok": true,
+        "mode": "graph",
+        "oom": false,
+        "route_fired": true
+      },
+      "b1_ctx4096": {
+        "ttft_p50": 190.38938243873417,
+        "ttft_p99": 190.59328914839773,
+        "tpot_p50": 6.846672058105469,
+        "tpot_p99": 50.99179611206055,
+        "n_steps": 800,
+        "ok": true,
+        "mode": "graph",
+        "oom": false,
+        "route_fired": true
+      },
+      "b1_ctx16384": {
+        "ttft_p50": 739.9466147823259,
+        "ttft_p99": 740.0151469901949,
+        "tpot_p50": 10.88481616973877,
+        "tpot_p99": 55.29967189788818,
+        "n_steps": 800,
+        "ok": true,
+        "mode": "graph",
+        "oom": false,
+        "route_fired": true
+      }
+    }
+  },
+  "coherence": {
+    "abl_attn": [
+      98830,
+      755,
+      198,
+      286,
+      4304,
+      755,
+      11294,
+      766,
+      4088,
+      53045,
+      10603,
+      1214,
+      997,
+      310,
+      674,
+      21157
+    ]
+  },
+  "route_evidence": {
+    "abl_attn": {
+      "ok": true,
+      "reason": "",
+      "files": [
+        "/scratch/<user>/fig7/open_ommx_serve/runs/e2e_attrib_b16_w2/abl_attn.fire.log"
+      ],
+      "fired": [
+        "GRAPH_ROUTE_FIRED"
+      ],
+      "linear_fired": [],
+      "require_attn": true,
+      "require_linear": false,
+      "nofire": [],
+      "other_tags": [
+        "PAGE_GRID"
+      ],
+      "unrouted_batches": [],
+      "ranks_fired": [
+        "0"
+      ],
+      "procs_fired": 1,
+      "tp": 1,
+      "lines": [
+        "PAGE_GRID rank=0 pid=1695633 vllm_block_size=16 ommx_group_tokens=32 pages_per_group=2",
+        "GRAPH_ROUTE_FIRED rank=0 pid=1695633 fmt=i2f4 ctx=129"
+      ],
+      "fire_file": "/scratch/<user>/fig7/open_ommx_serve/runs/e2e_attrib_b16_w2/abl_attn.fire.log"
+    }
+  },
+  "provenance": {
+    "kvprobe": {
+      "backend": "TRITON_ATTN",
+      "quant": "",
+      "label": "kv-probe-triton",
+      "enforce_eager": false,
+      "cudagraph": "FULL",
+      "cudagraph_capture_sizes": "vLLM default ladder (not pinned by this bench)",
+      "observed_modes": [
+        "graph"
+      ],
+      "env": {},
+      "recipe_resolved": null
+    },
+    "abl_attn": {
+      "backend": "CUSTOM",
+      "quant": "",
+      "label": "bf16-w+OMMXattn(noshadow)",
+      "enforce_eager": false,
+      "cudagraph": "FULL",
+      "cudagraph_capture_sizes": "vLLM default ladder (not pinned by this bench)",
+      "observed_modes": [
+        "graph"
+      ],
+      "env": {
+        "OMMX_ATTN_GRAPH": "1",
+        "OMMX_KV_RING": "1",
+        "OMMX_KV_GPU_PACK": "1",
+        "OMMX_ATTN_OUTLIERS": "6"
+      },
+      "recipe_resolved": {
+        "k_format": "i2f4",
+        "outliers_per_vector": 6,
+        "use_pow2": true,
+        "group_tokens": 32,
+        "group_channels": 32,
+        "sink_tokens": 8,
+        "recent_window": 32,
+        "outlier_select": "signed",
+        "outlier_repr": "bitmap",
+        "kv_outlier_map": true,
+        "page_size": 16,
+        "ommx_env": {
+          "OMMX_ATTN_CUDA_DECODE": "0",
+          "OMMX_ATTN_GRAPH": "1",
+          "OMMX_ATTN_K_FORMAT": "i2f4",
+          "OMMX_ATTN_OUTLIERS": "6",
+          "OMMX_ATTN_OUTLIER_SELECT": "signed",
+          "OMMX_ATTN_POW2": "1",
+          "OMMX_KV_GPU_PACK": "1",
+          "OMMX_KV_GROUP_CHANNELS": "32",
+          "OMMX_KV_GROUP_TOKENS": "32",
+          "OMMX_KV_OUTLIER_MAP": "1",
+          "OMMX_KV_RECENT": "32",
+          "OMMX_KV_RING": "1",
+          "OMMX_KV_SINK": "8"
+        }
+      }
+    }
+  },
+  "vllm_version": "0.21.0",
+  "config": {
+    "cmp_ctxs": [
+      1024,
+      4096,
+      16384
+    ],
+    "abl_ctxs": [
+      1024,
+      4096,
+      16384
+    ],
+    "warmup": 16,
+    "measure": 160,
+    "reps": 5,
+    "arch": "h200",
+    "recipe": "current",
+    "outliers": 6,
+    "outlier_pct": "",
+    "fair": {
+      "dtype": "bfloat16",
+      "seed": 42,
+      "prefix_caching": false,
+      "chunked_prefill": false,
+      "block_size": "engine-default",
+      "equal_kv_pool": "pinned to the bf16 TRITON smallest-ctx arm: num_gpu_blocks_override=35353",
+      "cudagraph_capture_sizes_requested": "vLLM default ladder (not pinned by this bench)",
+      "per_arm": "enforce_eager / cudagraph / capture sizes vary by arm: read results['provenance'][<arm>]"
+    },
+    "method": "LLMEngine.step() CUDA-event per-step; TPOT p50/p99 over measure steps x reps (NO subtraction); TTFT = prefill-step CUDA-event time"
+  }
+}

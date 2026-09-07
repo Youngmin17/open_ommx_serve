@@ -1,0 +1,11 @@
+arch,group,arm,label,backend,quant,batch,ctx,ttft_p50,ttft_p99,tpot_p50,tpot_p99,n_steps,mode,ok,oom,err
+h200repro,abl,abl_attn,bf16-w+OMMXattn(noshadow),CUSTOM,,1,1024,72.35548,184.5137,11.0328,50.86194,800,graph,True,False,
+h200repro,abl,abl_attn,bf16-w+OMMXattn(noshadow),CUSTOM,,1,4096,157.9895,241.3683,11.2921,50.89585,800,graph,True,False,
+h200repro,abl,abl_attn,bf16-w+OMMXattn(noshadow),CUSTOM,,1,16384,0.52544,705.21944,18.20019,67.11461,800,graph,True,False,
+h200repro,abl,abl_attn,bf16-w+OMMXattn(noshadow),CUSTOM,,1,32768,1419.21513,1469.48533,30.22944,75.65887,800,graph,True,False,
+h200repro,abl,abl_attn,bf16-w+OMMXattn(noshadow),CUSTOM,,1,65536,1.65654,3840.4786,51.25568,101.57669,800,graph,True,False,
+h200repro,cmp,TRITON,bf16+TRITON,TRITON_ATTN,,1,1024,0.41478,36.6245,3.6487,18.10722,800,graph,True,False,
+h200repro,cmp,TRITON,bf16+TRITON,TRITON_ATTN,,1,4096,0.47734,147.0352,4.2361,19.07817,800,graph,True,False,
+h200repro,cmp,TRITON,bf16+TRITON,TRITON_ATTN,,1,16384,4.63904,1379.49608,6.25235,17.59339,800,graph,True,False,
+h200repro,cmp,TRITON,bf16+TRITON,TRITON_ATTN,,1,32768,4793.30203,4812.65339,8.93048,17.80208,800,graph,True,False,
+h200repro,cmp,TRITON,bf16+TRITON,TRITON_ATTN,,1,65536,17954.31379,17969.69974,14.31011,22.70044,800,graph,True,False,

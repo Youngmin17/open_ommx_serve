@@ -1,0 +1,87 @@
+{
+  "method": "ommx_vllm",
+  "arm": "abl_attn",
+  "attention_backend": "CUSTOM",
+  "weights": "bf16",
+  "ctxs": {
+    "1024": {
+      "tpot_ms": 8.5708,
+      "ttft_ms": 82.57075556181371,
+      "peak_gb": null
+    },
+    "4096": {
+      "tpot_ms": 7.616,
+      "ttft_ms": 191.1826590737328,
+      "peak_gb": null
+    },
+    "16384": {
+      "tpot_ms": 13.9344,
+      "ttft_ms": 742.8317257612944,
+      "peak_gb": null
+    },
+    "32768": {
+      "tpot_ms": 20.9091,
+      "ttft_ms": 1675.7932339450344,
+      "peak_gb": null
+    },
+    "65536": {
+      "tpot_ms": 37.6905,
+      "ttft_ms": 4275.431983716786,
+      "peak_gb": null
+    }
+  },
+  "breakdown": {
+    "base": {},
+    "outlier": {},
+    "unpack": {},
+    "scale": {},
+    "pack": {}
+  },
+  "breakdown_raw": {
+    "base": {},
+    "outlier": {},
+    "unpack": {},
+    "scale": {},
+    "pack": {}
+  },
+  "breakdown_meta": {
+    "method": "differential-ablation",
+    "clamped_negative": true,
+    "renormalized_to_total": true,
+    "residual_bucket": "outlier",
+    "segments": [
+      "base",
+      "outlier",
+      "unpack",
+      "scale",
+      "pack"
+    ],
+    "full_arm": "abl_attn",
+    "base_arm": "abl_attn_no_all",
+    "diff_arms": {
+      "unpack": "abl_attn_no_unpack",
+      "scale": "abl_attn_no_dequant",
+      "pack": "abl_attn_skipwrite"
+    },
+    "note": "breakdown = plotted segments (missing arm -> 0.0, negative -> 0.0, then x renorm_factor so the five sum to tpot_ms). breakdown_raw = the same differentials RAW: unclamped, unnormalized, null when the arm is missing. base/outlier in `breakdown` are derived from the CLAMPED diffs (historical recipe, kept so the plot is unchanged); in `breakdown_raw` they are derived from the RAW diffs, so the two can disagree whenever a diff was clamped.",
+    "renorm_factor": {},
+    "clamped_sum_ms": {},
+    "clamped_segments": {},
+    "missing_arms": {},
+    "arm_tpot_ms": {},
+    "source_arm": {
+      "1024": "abl_attn",
+      "4096": "abl_attn",
+      "16384": "abl_attn",
+      "32768": "abl_attn",
+      "65536": "abl_attn"
+    },
+    "no_breakdown": {
+      "1024": "abl_attn_no_all missing",
+      "4096": "abl_attn_no_all missing",
+      "16384": "abl_attn_no_all missing",
+      "32768": "abl_attn_no_all missing",
+      "65536": "abl_attn_no_all missing"
+    }
+  }
+}

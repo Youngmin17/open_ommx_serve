@@ -1,0 +1,140 @@
+{
+  "model": "meta-llama/Llama-3.1-8B-Instruct",
+  "arms": {
+    "TURBOQUANT": {
+      "b1_ctx1024": {
+        "ttft_p50": 77.06880071014166,
+        "ttft_p99": 78.51496270179749,
+        "tpot_p50": 10.973087787628174,
+        "tpot_p99": 11.054979343414306,
+        "n_steps": 800,
+        "ok": true,
+        "mode": "graph",
+        "oom": false
+      },
+      "b1_ctx4096": {
+        "ttft_p50": 290.8696372061968,
+        "ttft_p99": 292.1140583057702,
+        "tpot_p50": 12.68892765045166,
+        "tpot_p99": 12.821067562103272,
+        "n_steps": 800,
+        "ok": true,
+        "mode": "graph",
+        "oom": false
+      },
+      "b1_ctx16384": {
+        "ttft_p50": 1396.5408305488527,
+        "ttft_p99": 1403.1945477193594,
+        "tpot_p50": 20.12495994567871,
+        "tpot_p99": 20.205792446136474,
+        "n_steps": 800,
+        "ok": true,
+        "mode": "graph",
+        "oom": false
+      },
+      "b1_ctx32768": {
+        "ttft_p50": 3524.4541677832603,
+        "ttft_p99": 3530.3681306773424,
+        "tpot_p50": 30.141743659973145,
+        "tpot_p99": 30.28408477783203,
+        "n_steps": 800,
+        "ok": true,
+        "mode": "graph",
+        "oom": false
+      },
+      "b1_ctx65536": {
+        "ttft_p50": 10138.471487250179,
+        "ttft_p99": 10140.863103543223,
+        "tpot_p50": 50.215919494628906,
+        "tpot_p99": 50.44662986755371,
+        "n_steps": 800,
+        "ok": true,
+        "mode": "graph",
+        "oom": false
+      }
+    }
+  },
+  "coherence": {
+    "TURBOQUANT": [
+      98830,
+      4194,
+      4194,
+      91,
+      765,
+      765,
+      765,
+      765,
+      765,
+      765,
+      765,
+      765,
+      765,
+      765,
+      765,
+      765
+    ]
+  },
+  "route_evidence": {},
+  "provenance": {
+    "kvprobe": {
+      "backend": "TRITON_ATTN",
+      "quant": "",
+      "label": "kv-probe-triton",
+      "enforce_eager": false,
+      "cudagraph_requested": "FULL",
+      "cudagraph_capture_sizes": "vLLM default ladder (not pinned by this bench)",
+      "observed_modes": [
+        "graph"
+      ],
+      "env": {},
+      "recipe_resolved": null
+    },
+    "TURBOQUANT": {
+      "backend": "",
+      "quant": "",
+      "label": "turboquant_3bit_nc",
+      "enforce_eager": false,
+      "cudagraph_requested": "FULL",
+      "cudagraph_capture_sizes": "vLLM default ladder (not pinned by this bench)",
+      "observed_modes": [
+        "graph"
+      ],
+      "env": {
+        "VLLM_USE_FLASHINFER_SAMPLER": "0"
+      },
+      "recipe_resolved": null
+    }
+  },
+  "vllm_version": "0.21.0",
+  "config": {
+    "cmp_ctxs": [
+      1024,
+      4096,
+      16384,
+      32768,
+      65536
+    ],
+    "abl_ctxs": [
+      1024
+    ],
+    "warmup": 16,
+    "measure": 160,
+    "reps": 5,
+    "arch": "a100",
+    "recipe": "current",
+    "outliers": 6,
+    "outlier_pct": "",
+    "fair": {
+      "dtype": "bfloat16",
+      "seed": 42,
+      "prefix_caching": false,
+      "chunked_prefill": false,
+      "block_size": "engine-default",
+      "compile_mode": "engine",
+      "equal_kv_pool": "pinned to the bf16 TRITON smallest-ctx arm: num_gpu_blocks_override=13724",
+      "cudagraph_capture_sizes_requested": "vLLM default ladder (not pinned by this bench)",
+      "per_arm": "enforce_eager / cudagraph / capture sizes vary by arm: read results['provenance'][<arm>]"
+    },
+    "method": "LLMEngine.step() CUDA-event per-step; TPOT p50/p99 over measure steps x reps (NO subtraction); TTFT = prefill-step CUDA-event time"
+  }
+}

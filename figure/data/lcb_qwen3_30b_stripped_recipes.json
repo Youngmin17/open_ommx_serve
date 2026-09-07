@@ -1,0 +1,353 @@
+{
+  "benchmark": "livecodebench_v6",
+  "subset_seed": 20250729,
+  "subset_n": 120,
+  "model": "Qwen3-30B-A3B-Thinking-2507",
+  "cap_tokens": 16384,
+  "batch_size": 1,
+  "temperature": 0.6,
+  "top_p": 0.95,
+  "top_k": 20,
+  "seed": 42,
+  "harness": "unofficial",
+  "common_n": 107,
+  "arms": [
+    {
+      "arm": "none",
+      "label": "bf16",
+      "recipe": "bf16, no KV quant",
+      "bits": 16.0,
+      "n": 107,
+      "pass1": 0.8598130841121495,
+      "bf16": 0.8598130841121495,
+      "cap_hit": 0.102803738317757,
+      "n_free": 96,
+      "pass1_free": 0.9583333333333334,
+      "bf16_free": 0.9583333333333334,
+      "mcnemar": {
+        "bf16_only": 0,
+        "arm_only": 0,
+        "p": 1.0
+      },
+      "mcnemar_capfree": {
+        "bf16_only": 0,
+        "arm_only": 0,
+        "p": 1.0
+      },
+      "median_tokens": 7361,
+      "length_vs_bf16": 0.0,
+      "status": {
+        "pass": 92,
+        "no_code_block": 10,
+        "wrong_answer": 3,
+        "timeout": 1,
+        "syntax_error": 1
+      }
+    },
+    {
+      "arm": "turboquant",
+      "label": "TurboQuant",
+      "recipe": "Walsh-Hadamard rotate + K/V INT3, group 128",
+      "bits": 3.0,
+      "n": 107,
+      "pass1": 0.8037383177570093,
+      "bf16": 0.8598130841121495,
+      "cap_hit": 0.14953271028037382,
+      "n_free": 88,
+      "pass1_free": 0.9545454545454546,
+      "bf16_free": 0.9659090909090909,
+      "mcnemar": {
+        "bf16_only": 9,
+        "arm_only": 3,
+        "p": 0.14599609375
+      },
+      "mcnemar_capfree": {
+        "bf16_only": 2,
+        "arm_only": 1,
+        "p": 1.0
+      },
+      "median_tokens": 8058,
+      "length_vs_bf16": 0.11197553457322316,
+      "status": {
+        "pass": 86,
+        "no_code_block": 14,
+        "wrong_answer": 5,
+        "crash": 1,
+        "timeout": 1
+      }
+    },
+    {
+      "arm": "ommx",
+      "label": "OMMX",
+      "recipe": "INT2 base + 12/64 FP4 K-outliers, group 64, sink 8, pow2",
+      "bits": 2.188,
+      "n": 107,
+      "pass1": 0.7570093457943925,
+      "bf16": 0.8598130841121495,
+      "cap_hit": 0.21495327102803738,
+      "n_free": 82,
+      "pass1_free": 0.9634146341463414,
+      "bf16_free": 0.975609756097561,
+      "mcnemar": {
+        "bf16_only": 12,
+        "arm_only": 1,
+        "p": 0.00341796875
+      },
+      "mcnemar_capfree": {
+        "bf16_only": 1,
+        "arm_only": 0,
+        "p": 1.0
+      },
+      "median_tokens": 8128,
+      "length_vs_bf16": 0.13771530365947826,
+      "status": {
+        "pass": 81,
+        "no_code_block": 21,
+        "wrong_answer": 2,
+        "syntax_error": 1,
+        "crash": 1,
+        "timeout": 1
+      }
+    },
+    {
+      "arm": "kitty",
+      "label": "Kitty",
+      "recipe": "K/V INT2 + 3/128 bf16 channels, group 128",
+      "bits": 2.328,
+      "n": 107,
+      "pass1": 0.6448598130841121,
+      "bf16": 0.8598130841121495,
+      "cap_hit": 0.2616822429906542,
+      "n_free": 77,
+      "pass1_free": 0.8701298701298701,
+      "bf16_free": 0.987012987012987,
+      "mcnemar": {
+        "bf16_only": 24,
+        "arm_only": 1,
+        "p": 1.5497207641601562e-06
+      },
+      "mcnemar_capfree": {
+        "bf16_only": 9,
+        "arm_only": 0,
+        "p": 0.00390625
+      },
+      "median_tokens": 10773,
+      "length_vs_bf16": 0.36456039446244776,
+      "status": {
+        "pass": 69,
+        "no_code_block": 27,
+        "wrong_answer": 6,
+        "crash": 3,
+        "timeout": 1,
+        "harness_no_func": 1
+      }
+    },
+    {
+      "arm": "kivi",
+      "label": "KIVI",
+      "recipe": "K/V INT2, group 128",
+      "bits": 2.0,
+      "n": 107,
+      "pass1": 0.5420560747663551,
+      "bf16": 0.8598130841121495,
+      "cap_hit": 0.3644859813084112,
+      "n_free": 68,
+      "pass1_free": 0.8529411764705882,
+      "bf16_free": 1.0,
+      "mcnemar": {
+        "bf16_only": 34,
+        "arm_only": 0,
+        "p": 1.1641532182693481e-10
+      },
+      "mcnemar_capfree": {
+        "bf16_only": 10,
+        "arm_only": 0,
+        "p": 0.001953125
+      },
+      "median_tokens": 12413,
+      "length_vs_bf16": 0.4727834286860778,
+      "status": {
+        "pass": 58,
+        "no_code_block": 35,
+        "wrong_answer": 9,
+        "syntax_error": 2,
+        "crash": 2,
+        "harness_no_func": 1
+      }
+    }
+  ],
+  "arms_own_coverage": [
+    {
+      "arm": "none",
+      "label": "bf16",
+      "recipe": "bf16, no KV quant",
+      "bits": 16.0,
+      "n": 120,
+      "pass1": 0.8416666666666667,
+      "bf16": 0.8416666666666667,
+      "cap_hit": 0.11666666666666667,
+      "n_free": 106,
+      "pass1_free": 0.9528301886792453,
+      "bf16_free": 0.9528301886792453,
+      "mcnemar": {
+        "bf16_only": 0,
+        "arm_only": 0,
+        "p": 1.0
+      },
+      "mcnemar_capfree": {
+        "bf16_only": 0,
+        "arm_only": 0,
+        "p": 1.0
+      },
+      "median_tokens": 7361,
+      "length_vs_bf16": 0.0,
+      "status": {
+        "pass": 101,
+        "no_code_block": 13,
+        "wrong_answer": 4,
+        "timeout": 1,
+        "syntax_error": 1
+      }
+    },
+    {
+      "arm": "turboquant",
+      "label": "TurboQuant",
+      "recipe": "Walsh-Hadamard rotate + K/V INT3, group 128",
+      "bits": 3.0,
+      "n": 107,
+      "pass1": 0.8037383177570093,
+      "bf16": 0.8598130841121495,
+      "cap_hit": 0.14953271028037382,
+      "n_free": 88,
+      "pass1_free": 0.9545454545454546,
+      "bf16_free": 0.9659090909090909,
+      "mcnemar": {
+        "bf16_only": 9,
+        "arm_only": 3,
+        "p": 0.14599609375
+      },
+      "mcnemar_capfree": {
+        "bf16_only": 2,
+        "arm_only": 1,
+        "p": 1.0
+      },
+      "median_tokens": 8058,
+      "length_vs_bf16": 0.11197553457322316,
+      "status": {
+        "pass": 86,
+        "no_code_block": 14,
+        "wrong_answer": 5,
+        "timeout": 1,
+        "crash": 1
+      }
+    },
+    {
+      "arm": "ommx",
+      "label": "OMMX",
+      "recipe": "INT2 base + 12/64 FP4 K-outliers, group 64, sink 8, pow2",
+      "bits": 2.188,
+      "n": 120,
+      "pass1": 0.7583333333333333,
+      "bf16": 0.8416666666666667,
+      "cap_hit": 0.21666666666666667,
+      "n_free": 92,
+      "pass1_free": 0.967391304347826,
+      "bf16_free": 0.967391304347826,
+      "mcnemar": {
+        "bf16_only": 12,
+        "arm_only": 2,
+        "p": 0.012939453125
+      },
+      "mcnemar_capfree": {
+        "bf16_only": 1,
+        "arm_only": 1,
+        "p": 1.0
+      },
+      "median_tokens": 8249,
+      "length_vs_bf16": 0.13318616946816408,
+      "status": {
+        "pass": 91,
+        "no_code_block": 24,
+        "wrong_answer": 2,
+        "syntax_error": 1,
+        "timeout": 1,
+        "crash": 1
+      }
+    },
+    {
+      "arm": "kitty",
+      "label": "Kitty",
+      "recipe": "K/V INT2 + 3/128 bf16 channels, group 128",
+      "bits": 2.328,
+      "n": 120,
+      "pass1": 0.6416666666666667,
+      "bf16": 0.8416666666666667,
+      "cap_hit": 0.275,
+      "n_free": 85,
+      "pass1_free": 0.8823529411764706,
+      "bf16_free": 0.9764705882352941,
+      "mcnemar": {
+        "bf16_only": 26,
+        "arm_only": 2,
+        "p": 3.032386302947998e-06
+      },
+      "mcnemar_capfree": {
+        "bf16_only": 9,
+        "arm_only": 1,
+        "p": 0.021484375
+      },
+      "median_tokens": 11331,
+      "length_vs_bf16": 0.3572043890725445,
+      "status": {
+        "pass": 77,
+        "no_code_block": 32,
+        "wrong_answer": 6,
+        "crash": 3,
+        "harness_no_func": 1,
+        "timeout": 1
+      }
+    },
+    {
+      "arm": "kivi",
+      "label": "KIVI",
+      "recipe": "K/V INT2, group 128",
+      "bits": 2.0,
+      "n": 120,
+      "pass1": 0.5583333333333333,
+      "bf16": 0.8416666666666667,
+      "cap_hit": 0.35833333333333334,
+      "n_free": 77,
+      "pass1_free": 0.8701298701298701,
+      "bf16_free": 0.987012987012987,
+      "mcnemar": {
+        "bf16_only": 35,
+        "arm_only": 1,
+        "p": 1.076841726899147e-09
+      },
+      "mcnemar_capfree": {
+        "bf16_only": 10,
+        "arm_only": 1,
+        "p": 0.01171875
+      },
+      "median_tokens": 12447,
+      "length_vs_bf16": 0.45704286775711483,
+      "status": {
+        "pass": 67,
+        "no_code_block": 39,
+        "wrong_answer": 9,
+        "syntax_error": 2,
+        "crash": 2,
+        "harness_no_func": 1
+      }
+    }
+  ],
+  "_provenance": "Generated BEFORE the fp16-region fix. The shared fake-quant cache ignored residual_length and had no sink, so KIVI ran without its 128-token fp16 residual and Kitty without its 32-token sink, while OMMX kept its sink-8. The KIVI and Kitty columns therefore bound those methods from below rather than reproducing them. Superseded by a re-run under eval/lcb/kv_fakequant; kept only as the record of what was measured.",
+  "_recipe_regions_enforced": {
+    "ommx": {
+      "sink": 8
+    },
+    "kivi": {},
+    "kitty": {},
+    "turboquant": {}
+  }
+}

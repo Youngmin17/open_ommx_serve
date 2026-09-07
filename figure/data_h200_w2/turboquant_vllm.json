@@ -1,0 +1,38 @@
+{
+  "method": "turboquant_vllm",
+  "arm": "TURBOQUANT",
+  "provenance": {
+    "recipe_resolved": null,
+    "block_size": 32,
+    "page_grid": null,
+    "route_tags": null
+  },
+  "kv_cache_dtype": "turboquant_3bit_nc",
+  "ctxs": {
+    "1024": {
+      "tpot_ms": 6.5794,
+      "ttft_ms": 27.69980867765844,
+      "peak_gb": null
+    },
+    "4096": {
+      "tpot_ms": 7.8861,
+      "ttft_ms": 102.69849971914664,
+      "peak_gb": null
+    },
+    "16384": {
+      "tpot_ms": 13.6458,
+      "ttft_ms": 548.5186349367723,
+      "peak_gb": null
+    },
+    "32768": {
+      "tpot_ms": 21.3155,
+      "ttft_ms": 1486.1039395937696,
+      "peak_gb": null
+    },
+    "65536": {
+      "tpot_ms": 36.7197,
+      "ttft_ms": 4573.694759905338,
+      "peak_gb": null
+    }
+  }
+}
