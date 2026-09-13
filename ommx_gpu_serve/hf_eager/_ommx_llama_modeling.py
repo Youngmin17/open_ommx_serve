@@ -15,11 +15,11 @@
 # KIVI / Kitty are, for a fair B=1 long-context TPOT comparison.
 #
 # Split (identical to Kitty's prefill(flash) / decode(custom-kernel) contract):
-#   * PREFILL (q_len > 1): the caller's ``config._attn_implementation`` over the bf16
+#   * NEW REQUEST (empty cache, any q_len): the caller's attention implementation over bf16
 #     K/V (same as Kitty; the benches pick flash_attention_2 when flash-attn is
 #     importable, else sdpa — NOT eager, which is O(ctx^2) at long context), then
 #     pack the whole prompt into a per-layer CanonicalKVStore via append_block().
-#   * DECODE  (q_len == 1): append the new bf16 K/V row, regroup any completed
+#   * CONTINUATION: append each new bf16 K/V row, regroup any completed
 #     32-token scale-group, and call ommx_paged_decode_attention_canonical over the
 #     stored QUANTIZED prefix + the bf16 sink/recent tail.
 #
@@ -372,7 +372,10 @@ class LlamaAttention(nn.Module):
         # query_states/key_states/value_states: [B, n_heads, q_len, D]
 
         q_len = query_states.shape[2]
-        is_prefill = q_len > 1
+        # The counter is host-side: do not inspect cache_position on CUDA and add a
+        # synchronization to every decode. A one-token prompt is still a new request.
+        past_seen = past_key_value.get_seq_length() if past_key_value is not None else 0
+        is_prefill = past_seen == 0
 
         if is_prefill:
             # New sequence (prefill): (RE)BUILD this layer's store + workspace at the right
@@ -405,14 +408,27 @@ class LlamaAttention(nn.Module):
             V_pack = value_states[0].transpose(0, 1).contiguous()  # [T, Hkv, D]
             self._ommx_store.append_block(K_pack.to(torch.bfloat16), V_pack.to(torch.bfloat16))
         else:
-            # DECODE (q_len == 1). Append the new bf16 K/V row, regroup any completed
-            # 32-token group, then run the OMMX canonical decode kernel.
-            assert self._ommx_store is not None, "OMMX decode before prefill"
-            k_row = key_states[0, :, 0, :]      # [Hkv, D]
-            v_row = value_states[0, :, 0, :]    # [Hkv, D]
-            self._ommx_store.append(k_row.to(torch.bfloat16), v_row.to(torch.bfloat16))
-            self._ommx_store.maybe_regroup()     # HOST seam: pack newly completed group(s)
-            attn_output = self._ommx_decode(query_states)   # [B=1, q_len=1, Hq, D]
+            if self._ommx_store is None or self._ommx_store.seq_len != past_seen:
+                raise ValueError("OMMX cache counter does not match this layer's KV history")
+            if q_len == 1:
+                # Keep the usual single-token decode path allocation-free.
+                k_row = key_states[0, :, 0, :]
+                v_row = value_states[0, :, 0, :]
+                self._ommx_store.append(k_row.to(torch.bfloat16), v_row.to(torch.bfloat16))
+                self._ommx_store.maybe_regroup()
+                attn_output = self._ommx_decode(query_states)
+            else:
+                # A cached multi-token continuation is not a fresh prefill. Decode
+                # causally against the existing packed prefix, one new query at a time.
+                attn_output = query_states.new_empty(
+                    input_shape[0], q_len, self.num_attention_heads, self.head_dim)
+                for i in range(q_len):
+                    self._ommx_store.append(key_states[0, :, i, :].to(torch.bfloat16),
+                                            value_states[0, :, i, :].to(torch.bfloat16))
+                    self._ommx_store.maybe_regroup()
+                    # _ommx_decode reuses its workspace; copy before the next query.
+                    attn_output[:, i:i + 1].copy_(
+                        self._ommx_decode(query_states[:, :, i:i + 1]))
             attn_weights = None
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
@@ -576,11 +592,26 @@ class LlamaModel(LlamaPreTrainedModel):
         # has a get_seq_length() to read; the actual K/V never lives in it (the OMMX
         # store is the single source of truth). The model RETURNS this so the decode
         # loop's `past_key_values=` keeps cache_position advancing across steps.
+        if past_key_values is not None and not isinstance(past_key_values, OmmxSeqCounterCache):
+            # GenerationMixin may create an empty DynamicCache before the first call.
+            # Its tensors are never our backing store, so only an empty one is accepted.
+            if int(past_key_values.get_seq_length()) != 0:
+                raise ValueError("OMMX cannot continue a nonempty external HF cache")
+            past_key_values = None
         if use_cache and past_key_values is None:
             past_key_values = OmmxSeqCounterCache()
+        past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+        if past_seen_tokens:
+            if not use_cache:
+                raise ValueError("OMMX cached continuation requires use_cache=True")
+            if past_key_values is not getattr(self, "_ommx_active_cache", None):
+                raise ValueError("OMMX cache is not the active request; interleaved caches are unsupported")
+        else:
+            # KV lives on the model, not in the lightweight counter cache. A counter
+            # from a previous request cannot safely resume after another request ran.
+            self._ommx_active_cache = past_key_values
 
         if cache_position is None:
-            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
             cache_position = torch.arange(
                 past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
             )
@@ -629,9 +660,7 @@ class LlamaModel(LlamaPreTrainedModel):
 
         # Advance the cache_position bookkeeping by the tokens we just consumed, WITHOUT
         # storing real K/V (the OMMX per-layer stores hold them). The next forward then
-        # derives cache_position from get_seq_length() exactly like a stock HF run. For
-        # OmmxSeqCounterCache this just bumps an int; for any other passed-in cache we fall
-        # back to its own update() (a stock DynamicCache, e.g. the bf16 arm, advances itself).
+        # derives cache_position from get_seq_length() exactly like a stock HF run.
         if use_cache and isinstance(past_key_values, OmmxSeqCounterCache):
             past_key_values._ommx_seq_len += int(inputs_embeds.shape[1])
 

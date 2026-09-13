@@ -919,13 +919,9 @@ def _env_on(name: str) -> bool:
 #:     ``TORCH_CHECK(M >= 16, "prefill_wmma needs M>=16 (m16n8k16 16-row tile); route
 #:     M<16 to decode_base (law #1)")``. A threshold below 16 routes a short prefill into
 #:     a kernel that refuses it. LOUD.
-#:   * upper bound 17 — ``decode_base`` has NO upper TORCH_CHECK on M, but its batched
-#:     launcher tops out at ``decode_gemv_batched_kernel<SF, 16>`` and that kernel's
-#:     epilogue writes ``for (int m = 0; m < M_MAX; ++m) ... if (lane == 0 && m < M)``.
-#:     At M > 16 rows 16..M-1 are NEVER WRITTEN, and ``out`` came from ``torch::zeros``,
-#:     so those tokens silently receive an all-zero activation. SILENT. A threshold of 17
-#:     still routes M==16 to decode_base (all 16 rows written) and M>=17 to prefill, so 17
-#:     is the largest value that cannot reach the silent case.
+#:   * upper bound 17 — ``decode_base`` rejects M outside [1,16], the largest
+#:     specialization of its batched GEMV. A threshold of 17 still routes M==16
+#:     to decode_base and M>=17 to prefill, so it is the largest valid threshold.
 #:
 #: The env knob therefore validates against BOTH ends. The default, 16, is unaffected.
 PREFILL_MIN_M_BOUNDS: Tuple[int, int] = (16, 17)
@@ -934,8 +930,8 @@ PREFILL_MIN_M_BOUNDS: Tuple[int, int] = (16, 17)
 def prefill_min_m_env() -> int:
     """The decode/prefill routing threshold, validated against the kernel's own bounds.
 
-    Refusing out of range converts a silent wrong answer (see PREFILL_MIN_M_BOUNDS,
-    upper bound) into a named error at the first forward. It is a refusal and not a
+    Refusing out of range identifies an invalid route before native dispatch
+    (see PREFILL_MIN_M_BOUNDS). It is a refusal and not a
     clamp on purpose: an operator who set the knob meant something by it, and quietly
     serving a different threshold is the failure mode law #11 names.
     """
@@ -1053,11 +1049,17 @@ def linear_dispatch(x2d: torch.Tensor, code: torch.Tensor, scale: torch.Tensor,
     # the crossover between them was never measured, so the threshold is an env-tunable
     # GUESS sitting between the two verified points. Validated against BOTH kernel bounds
     # (PREFILL_MIN_M_BOUNDS): too low aborts inside prefill_wmma, too high hands
-    # decode_base an M its batched kernel silently truncates to 16 rows.
+    # decode_base an M beyond its supported 16 rows, which native dispatch rejects.
     prefill_min_m = prefill_min_m_env()
+    if M >= prefill_min_m and split not in (1, 2, 4, 8):
+        raise OMMXWError(f"OMMX_W_SPLIT={split} is unsupported for prefill; use one of "
+                         f"{{1,2,4,8}} (1 selects automatic splitting)")
     e8m0 = _env_on("OMMX_W_E8M0")
     has_outliers = npv > 0
     abl_no_corr = has_outliers and _env_on("OMMX_W_ABL_NO_CORR")
+    if M > 1 and has_outliers and not abl_no_corr and ((K + gs - 1) // gs) * npv > 5120:
+        raise OMMXWError("sparse_correct: n_blk*npv exceeds smem stage bound 5120 for "
+                         "both parallel and legacy kernels; reduce npv or K")
     if abl_no_corr:
         # ABLATION ONLY -- parity-breaking by design: the base GEMV runs, the outlier
         # correction is skipped, so TPOT(full) - TPOT(this) attributes the correction.

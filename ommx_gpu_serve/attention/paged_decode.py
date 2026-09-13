@@ -592,58 +592,49 @@ def _build_kernels(triton, tl):
                                  tl.where(vcode == 2, L2, L3)))
 
     @triton.jit
-    def _int2_to_bf16_lop3(vcode):
-        """INT2 code (0..3) -> (float)code as bf16 via ONE lop3.b32 splice.
+    def _int2_byte_to_bf16_lop3(vpacked):
+        """One packed byte -> four BF16 codes, using both lanes of two x2 ops.
 
-        Mirrors the CUDA ``ommx_int2_splice_bf16x2`` (numeric_core.cuh:692): the
-        2-bit code is OR-ed into a bf16 whose exponent field is preset to 0x43
-        (=2^(0x86-127)=2^7=128 with mantissa 0 -> the bf16 value 128.0). With the
-        low 2 mantissa bits = code, the bf16 bit pattern 0x4300|code decodes to
-        (128.0 + code*2^(7-7)) = 128.0 + code  (the bf16 ulp at exp 0x43 is
-        2^(7-7)=1.0, so each mantissa lsb adds exactly 1.0). Subtracting the
-        128.0 bias yields (float)code EXACTLY for code in {0,1,2,3}.
+        Code j occupies bits [2*j+1:2*j]. Pair codes (0,1) and (2,3) in the
+        low/high BF16 halves before injecting 0x4300 (=128.0). The BF16 ULP
+        there is 1, so fma(x, 1, -128) yields each integer 0..3 exactly.
+        BF16x2 FMA supports SM80; BF16x2 sub requires SM90 (PTX ISA 9.7.4).
 
-        bf16 layout (16b): [sign:1][exp:8][mant:7]; 0x4300 = 0_10000110_0000000
-          exp=0x86=134 -> 2^(134-127)=2^7=128; mant=0 -> value 128.0.
-          0x4300|code sets mant bits[1:0]=code -> value 128 + code (ulp=1.0).
-        PTX: pack the low-2-bit code into the LOW bf16 half of a b32 (hi half
-        kept 0 -> decodes to a harmless 128.0), splice via
-        ``lop3.b32 d, 0x4300, 0, code, 0xFA`` (immLut 0xFA = a|c) so the low half
-        holds (128+code) as bf16, subtract a packed bf16x2 bias {128.0,128.0}
-        via ``sub.rn.bf16x2`` (well-defined sm_80+; .rn rounding), then extract
-        the LOW bf16 half via ``mov.b32 {lo,hi}, d`` and return ``lo``. Both
-        halves carry the same 128.0 bias so the high lane resolves to 0.0 and is
-        discarded. Identical numerics to the x2 CUDA twin (just one useful lane
-        per invocation). PARITY: exact integer->bf16 for 0..3 (no rounding);
-        the subtract is exact (128+code and 128 are both representable, diff is
-        an integer 0..3); CUDA law #10 — no .to(bf16).to(f32) const-fold.
+        ``pack=1`` keeps all four codes from the SAME input byte; the tuple
+        outputs retain its tensor shape and map to V columns 4*b+j. Triton's
+        ``pack=2`` would instead group different tensor elements. No scale,
+        zero-point, or downstream PV rounding is changed here.
         """
-        # tl.inline_asm_elementwise: emit the lop3 splice + bf16x2 bias subtract,
-        # then extract the low bf16. Input is the masked 2-bit code (int32, only
-        # bits[1:0] meaningful). Output is bf16. ``pack=1`` => one element/lane.
-        # 0x43004300 = packed bf16x2 {128.0, 128.0} (== OMMX_INT2_BF16_MAGIC32).
-        # PTX block (comments are PTX `//` inside the string; bias 0x43004300 =
-        # packed bf16x2 {128,128}; lop3 0xFA = a|c; sub.rn.bf16x2 exact for 0..3).
-        spliced = tl.inline_asm_elementwise(
+        return tl.inline_asm_elementwise(
             asm=(
                 "{\n"
-                " .reg .b32 t, bias;\n"
-                " .reg .b16 lo, hi;\n"
+                " .reg .b32 p01, p23, t, bias, one, neg_bias;\n"
                 " mov.b32 bias, 0x43004300;\n"
-                " and.b32 t, $1, 0x3;\n"
-                " lop3.b32 t, bias, 0, t, 0xFA;\n"
-                " sub.rn.bf16x2 t, t, bias;\n"
-                " mov.b32 {lo, hi}, t;\n"
-                " mov.b16 $0, lo;\n"
+                " mov.b32 one, 0x3F803F80;\n"
+                " mov.b32 neg_bias, 0xC300C300;\n"
+                " and.b32 p01, $4, 0x3;\n"
+                " and.b32 t, $4, 0xC;\n"
+                " shl.b32 t, t, 14;\n"
+                " or.b32 p01, p01, t;\n"
+                " shr.u32 p23, $4, 4;\n"
+                " and.b32 p23, p23, 0x3;\n"
+                " and.b32 t, $4, 0xC0;\n"
+                " shl.b32 t, t, 10;\n"
+                " or.b32 p23, p23, t;\n"
+                " lop3.b32 p01, bias, 0, p01, 0xFA;\n"
+                " lop3.b32 p23, bias, 0, p23, 0xFA;\n"
+                " fma.rn.bf16x2 p01, p01, one, neg_bias;\n"
+                " fma.rn.bf16x2 p23, p23, one, neg_bias;\n"
+                " mov.b32 {$0, $1}, p01;\n"
+                " mov.b32 {$2, $3}, p23;\n"
                 "}"
             ),
-            constraints="=h,r",
-            args=[vcode],
-            dtype=tl.bfloat16,
+            constraints="=h,=h,=h,=h,r",
+            args=[vpacked],
+            dtype=(tl.bfloat16, tl.bfloat16, tl.bfloat16, tl.bfloat16),
             is_pure=True,
             pack=1,
         )
-        return spliced
 
     @triton.jit
     def _relidx7_splice_block(
@@ -2192,16 +2183,10 @@ def _build_kernels(triton, tl):
                             [GROUP_TOKENS, V_BYTE_COUNT])
                     else:
                         if V_VLOP3:
-                            # LEVER 1(b) lop3-in-Triton: replace the (>>sh)&3 -> bf16
-                            # cast with ONE lop3.b32 splice per byte-lane
-                            # (numeric_core ommx_int2_splice_bf16x2 twin). Produces
-                            # (float)code as bf16 BIT-EXACTLY for 0..3 (no rounding);
-                            # the downstream v*vs+vz / split-PV math is IDENTICAL to
-                            # the cast path, so VLOP3 stays compatible with split-PV.
-                            v0 = _int2_to_bf16_lop3((v_packed & 0x3))
-                            v1 = _int2_to_bf16_lop3((v_packed >> 2) & 0x3)
-                            v2 = _int2_to_bf16_lop3((v_packed >> 4) & 0x3)
-                            v3 = _int2_to_bf16_lop3((v_packed >> 6) & 0x3)
+                            # Two BF16x2 splices recover the four codes of ONE byte.
+                            # Output j still belongs to channel 4*b+j; scale/zp
+                            # and split-PV arithmetic below remain unchanged.
+                            v0, v1, v2, v3 = _int2_byte_to_bf16_lop3(v_packed)
                         else:
                             v0 = (v_packed & 0x3).to(tl.bfloat16)
                             v1 = ((v_packed >> 2) & 0x3).to(tl.bfloat16)
@@ -2712,7 +2697,7 @@ def _build_kernels(triton, tl):
     g["_grouped_qk_accumulate_fp8"] = _grouped_qk_accumulate_fp8
     g["_grouped_pv_accumulate"] = _grouped_pv_accumulate
     g["_vlut_select"] = _vlut_select
-    g["_int2_to_bf16_lop3"] = _int2_to_bf16_lop3
+    g["_int2_byte_to_bf16_lop3"] = _int2_byte_to_bf16_lop3
     g["_relidx7_splice_block"] = _relidx7_splice_block
     g["_combinadic_unrank_oi"] = _combinadic_unrank_oi
     g["_popcount32"] = _popcount32
@@ -3093,7 +3078,9 @@ def ommx_paged_decode_attention_canonical(
         fbr = (max(1, (total - 1).bit_length()) + 7) // 8           # rank field bytes
         fbr_p2 = triton.next_power_of_2(max(1, fbr))
     else:
-        binom_lut = torch.zeros(1, dtype=torch.int32, device=q.device)
+        # This pointer is eliminated by COMBINADIC_READ=False. Reuse resident
+        # storage instead of allocating/zeroing a dummy on every layer and step.
+        binom_lut = req_to_group
     # FLAT BITMASK field width: ceil(VL/8) bytes per frame — sized by the GROUP, NOT
     # by k (that flatness is the encoding's whole point). FBB_P2 is the next-pow2
     # tl.arange load width the kernel tiles the frame with.
@@ -3112,7 +3099,7 @@ def ommx_paged_decode_attention_canonical(
             # combinadic_read / bitmap_read with no relidx7 plane: dummy idx pointer
             # (unused — the alternate index plane is the real source).
             relidx_packed = True
-            koidx_t = torch.zeros(1, dtype=torch.uint8, device=q.device)
+            koidx_t = k_base
             s_koidx_g = s_koidx_h = s_koidx_d = 0
         koval_t = k_oval
         s_koval_g, s_koval_h, s_koval_d = (
@@ -3123,7 +3110,7 @@ def ommx_paged_decode_attention_canonical(
                 int(k_crank.stride(0)), int(k_crank.stride(1)),
                 int(k_crank.stride(2)))
         else:
-            kcrank_t = torch.zeros(1, dtype=torch.uint8, device=q.device)
+            kcrank_t = k_base
             s_kcr_g = s_kcr_h = s_kcr_d = 0
         if bitmap_read:
             kobmp_t = k_obmp
@@ -3131,14 +3118,12 @@ def ommx_paged_decode_attention_canonical(
                 int(k_obmp.stride(0)), int(k_obmp.stride(1)),
                 int(k_obmp.stride(2)))
         else:
-            kobmp_t = torch.zeros(1, dtype=torch.uint8, device=q.device)
+            kobmp_t = k_base
             s_kbm_g = s_kbm_h = s_kbm_d = 0
     else:
         relidx_packed = False
-        koidx_t = torch.zeros(1, dtype=torch.int16, device=q.device)
-        koval_t = torch.zeros(1, dtype=torch.uint8, device=q.device)
-        kcrank_t = torch.zeros(1, dtype=torch.uint8, device=q.device)
-        kobmp_t = torch.zeros(1, dtype=torch.uint8, device=q.device)
+        # K_OUTLIER_K=0 removes all sidecar reads, regardless of their values.
+        koidx_t = koval_t = kcrank_t = kobmp_t = k_base
         s_koidx_g = s_koidx_h = s_koidx_d = 0
         s_koval_g = s_koval_h = s_koval_d = 0
         s_kcr_g = s_kcr_h = s_kcr_d = 0
@@ -3345,8 +3330,7 @@ def ommx_paged_decode_attention_canonical(
         s_kmc_g, s_kmc_h, s_kmc_d = (int(kmc_t.stride(0)), int(kmc_t.stride(1)),
                                      int(kmc_t.stride(2)))
     else:
-        kms_t = torch.zeros(1, dtype=k_scale.dtype if k_scale.dtype.is_floating_point
-                            else torch.bfloat16, device=q.device)
+        kms_t = k_zp  # unused when KV_OUTLIER_MAP=False
         kmc_t = kms_t
         s_kms_g = s_kms_h = s_kms_d = 0
         s_kmc_g = s_kmc_h = s_kmc_d = 0

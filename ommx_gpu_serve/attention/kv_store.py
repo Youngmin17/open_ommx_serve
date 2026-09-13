@@ -254,6 +254,8 @@ class CanonicalKVStore:
         _resolve_recipe_env()
         _ring_raw = _os2.environ.get("OMMX_KV_RING")
         self.kv_ring = bool(_ring_raw) and _ring_raw.strip().lower() not in {"0", "false", "off", "no"}
+        self._fused_io = (self.device.type == "cuda" and _os2.environ.get(
+            "OMMX_KV_FUSED_IO", "1").strip().lower() not in {"0", "false", "off", "no"})
         self.kv_cap = self.max_seq_len
         if self.kv_ring:
             # ring geometry: sink pinned, then a sliding window over the recent live set.
@@ -370,6 +372,14 @@ class CanonicalKVStore:
         ``pos`` with the ABS position (``seq-1``); the remap keeps the scatter target a
         valid ring row. Identity when ring is OFF (the index_copy_ shape is unchanged).
         """
+        # index_copy_ also accepts host indices and validates malformed index
+        # shapes/dtypes. Keep those public-call semantics outside the fast path.
+        if (self._fused_io and pos.ndim == 1 and pos.numel() == 1
+                and pos.dtype == torch.int64 and pos.device == self.k_hist.device):
+            from .kv_store_ops import write_token
+            write_token(self.k_hist, self.v_hist, pos, k.view(self.H, self.D),
+                        v.view(self.H, self.D), self._ring_sink, self._ring_rec)
+            return
         slot = self._ring_slot_dev(pos)
         self.k_hist.index_copy_(0, slot, k.view(1, self.H, self.D).to(torch.bfloat16))
         self.v_hist.index_copy_(0, slot, v.view(1, self.H, self.D).to(torch.bfloat16))
@@ -396,6 +406,20 @@ class CanonicalKVStore:
         tensor arithmetic before the gather (the padding 0s map to ring slot 0, masked by
         ``b_tail_len`` in the kernel). Identity when ring is OFF.
         """
+        # The fused copy addresses contiguous fixed-shape buffers. Preserve the
+        # original index_select/copy_ semantics for caller-supplied strided views,
+        # broadcastable outputs, or host indices; these checks never read device data.
+        tail_shape = (1, tail_idx.numel(), self.H, self.D)
+        if (self._fused_io and tail_idx.ndim == 1 and tail_idx.is_contiguous()
+                and tail_idx.dtype in (torch.int32, torch.int64)
+                and tail_idx.device == self.k_hist.device
+                and k_tail.shape == tail_shape and v_tail.shape == tail_shape
+                and k_tail.is_contiguous() and v_tail.is_contiguous()
+                and k_tail.device == self.k_hist.device and v_tail.device == self.v_hist.device):
+            from .kv_store_ops import gather_tail
+            gather_tail(self.k_hist, self.v_hist, tail_idx, k_tail, v_tail,
+                        self._ring_sink, self._ring_rec)
+            return
         slot = self._ring_slot_dev(tail_idx)
         kt = self.k_hist.index_select(0, slot)                # [T_tail_max, H, D]
         vt = self.v_hist.index_select(0, slot)
