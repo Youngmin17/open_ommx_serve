@@ -155,6 +155,13 @@ def free_memory(monkeypatch: pytest.MonkeyPatch):
     return _set
 
 
+@pytest.fixture(autouse=True)
+def _batched_route_on(_hermetic_ommx_env, monkeypatch: pytest.MonkeyPatch):
+    """The stub's default ``sched_max_num_seqs=4`` is a multi-request engine, which
+    preflight refuses without a batched route. Tests that need the route off unset it."""
+    monkeypatch.setenv("OMMX_ATTN_BATCHED", "1")
+
+
 # ── violation classification ────────────────────────────────────────────────────
 
 def _tags(report: dict) -> set:
@@ -175,6 +182,12 @@ def _tags(report: dict) -> set:
             out.add("pool")
         elif head.startswith("vLLM"):
             out.add("vllm_version")
+        elif head.startswith("multi-request scheduling is"):
+            out.add("batched_route")
+        elif head.startswith("OMMX_ATTN_GRAPH=1 with multi-request scheduling"):
+            out.add("graph_route")
+        elif "is CONFIGURED (vllm_config." in head:
+            out.add("spec_transfer")
         elif head.startswith("scheduler max_num_seqs="):
             # check 4 (the slot cap). MUST be tested BEFORE the generic ``num_seqs``
             # branch below: this head also contains the substring "num_seqs", so
@@ -606,7 +619,7 @@ def test_every_unsafe_override_env_in_preflight_is_covered_here() -> None:
 
 @_XFAIL_MISSING
 def test_unreadable_scheduler_concurrency_still_projects_the_pool(
-        fake_vllm, free_memory) -> None:
+        fake_vllm, free_memory, monkeypatch) -> None:
     """An unreadable ``max_num_seqs`` must count as REACHABLE, not as "no pool".
 
     ``reachable`` gates the entire pool-OOM check. Flipping the unknown branch to
@@ -615,24 +628,29 @@ def test_unreadable_scheduler_concurrency_still_projects_the_pool(
     """
     fake_vllm("0.21.0")
     free_memory(1 * GIB)
+    # the batched force would make the pool reachable on its own and hide the branch
+    monkeypatch.delenv("OMMX_ATTN_BATCHED")
     report = pf.ommx_preflight_check(_stub_vllm_config(sched_max_num_seqs=None),
                                      num_seqs=4, cfg=_serving_cfg(), strict=False)
     assert report["pool"]["scheduler_max_num_seqs"] == "unknown"
     assert report["pool"]["b_gt_1_reachable"] is True, (
         f"unknown was treated as 'no batched step': {report['pool']}")
-    assert _tags(report) == {"pool"}, f"got {_tags(report)}"
+    # unknown concurrency with no batched route is refused by its own check too
+    assert _tags(report) == {"pool", "batched_route"}, f"got {_tags(report)}"
 
 
 @_XFAIL_MISSING
 def test_provably_unreachable_pool_is_informational_not_a_violation(
-        fake_vllm, free_memory) -> None:
+        fake_vllm, free_memory, monkeypatch) -> None:
     """The complement: ``max_num_seqs=1`` with the batched force off allocates nothing.
 
     Refusing here would refuse every single-sequence run. The projection is still
-    reported, under a key that cannot be read as a budget verdict.
+    reported, under a key that cannot be read as a budget verdict. The force is turned
+    off with the word an operator writes, ``no``, which ``backend._env_on`` reads as OFF.
     """
     fake_vllm("0.21.0")
     free_memory(1 * GIB)                        # would NOT fit if it were built
+    monkeypatch.setenv("OMMX_ATTN_BATCHED", "no")
     report = pf.ommx_preflight_check(_stub_vllm_config(sched_max_num_seqs=1),
                                      num_seqs=4, cfg=_serving_cfg(), strict=False)
     assert report["pool"]["b_gt_1_reachable"] is False, f"{report['pool']}"
@@ -646,7 +664,7 @@ def test_provably_unreachable_pool_is_informational_not_a_violation(
 
 
 @_XFAIL_MISSING
-@pytest.mark.parametrize("value", ["1", "no"])
+@pytest.mark.parametrize("value", ["1", "yes"])
 def test_ommx_attn_batched_forces_the_pool_check_back_on(value, fake_vllm,
                                                          free_memory,
                                                          monkeypatch) -> None:
@@ -657,11 +675,11 @@ def test_ommx_attn_batched_forces_the_pool_check_back_on(value, fake_vllm,
     informational back to a refusal. Ignoring this env re-opens the silent-OOM hole at
     ``max_num_seqs=1``.
 
-    ``"no"`` is parametrized on purpose: ``backend._env_on`` is
-    ``... not in {"0", "false", "off", ""}``, so ``OMMX_ATTN_BATCHED=no`` force-ENABLES
-    the route. preflight mirrors that with ``_backend_env_on``; reading it with ordinary
-    flag truthiness instead would declare "no B>1 step is possible" for a run whose
-    backend batches every step.
+    ``"yes"`` is parametrized on purpose: preflight reads this env with
+    ``_backend_env_on``, the verbatim copy of ``backend._env_on``, so any spelling
+    outside the off set ``{"", "0", "false", "off", "no"}`` must force the route on here
+    exactly as it does in the backend. ``"no"`` is OFF in both; the unreachable-pool
+    test above pins that spelling.
     """
     fake_vllm("0.21.0")
     free_memory(1 * GIB)

@@ -1,148 +1,26 @@
 # Copyright (c) 2024-2026, OMMX Contributors
 # SPDX-License-Identifier: Apache-2.0
-"""PACKED-ONLY capacity mode — the OMMX KV page-budget knob, and what it does NOT prove.
+"""Opt-in B1 KV arena integration and independent packed-plane byte accounting.
 
-THE PROBLEM (SHADOW mode, see the ``backend.py`` module docstring): the OMMX backend
-INHERITS vLLM's bf16 ``get_kv_cache_shape`` (a full bf16 paged cache sized for
-``max_model_len`` tokens) AND builds the compressed ``CanonicalKVStore`` sidecar planes
-as EXTRA memory on top. So there is NO capacity win as wired — the sidecar is strictly
-additive. The honest OMMX superiority over FA3 is CAPACITY: for the CANONICAL PUBLISHED
-RECIPE (``OMMX_ATTN_K_FORMAT=i2f4 OMMX_ATTN_OUTLIERS=6 OMMX_ATTN_POW2=1
-OMMX_KV_GROUP_TOKENS=32 OMMX_KV_GROUP_CHANNELS=32``; dedicated FP4 outlier map ON =
-the default) the ACTUAL allocated plane footprint is
+For OMMX engines, ``OMMX_KV_PACKED_ONLY=1`` replaces the full BF16 KV allocation with a
+positive-byte arena backing the actual packed planes, residual ring and tables.
+Only the guarded single-request GRAPH path is supported; unsupported schedulers,
+cache formats and mixed backends fail before allocation. Default OFF preserves the
+SHADOW control path. Allocation/alias evidence is not a measured capacity claim.
 
-    K = 6.000 bit/elem, V = 2.750 bit/elem  ->  8.750 bit per (K,V) element pair
-    vs bf16 32.000 bit/pair                 ->  3.66x KV compression
-
--> 3.66x more concurrent sequences / longer context in the same HBM. Every term of that
-number is enumerated, per plane, by :func:`kv_bits_breakdown` — it is not a magic float.
-
-WHY 3.66x AND NOT "~4.6x" / "<=3-bit". Neither figure describes this recipe; do not
-reintroduce them. An accounting that reproduces them makes three independent errors:
-
-  * it omits the two DEDICATED FP4 outlier-map planes (``k_fp4_mapscale`` /
-    ``k_fp4_mapcenter``, bf16, one value per group x head x channel). They ARE allocated by
-    default: ``kv_pool.MultiSeqKVPool.__init__`` gates them on ``kv_outlier_map`` whose
-    default is True, ``config.py`` resolves the same default onto ``OMMXServingConfig``
-    (which ``metadata.py`` passes down as ``kv_outlier_map=c.kv_outlier_map``), and
-    ``pack.ommx_pack_kv_canonical_block`` resolves it again for direct callers.
-    +1.00 bit on K at gt=32.
-  * it prices the scale at a fixed 2 bytes (bf16). With ``OMMX_ATTN_POW2=1`` — which
-    the canonical recipe sets — ``kv_int8_scale`` defaults to ``bool(use_pow2)`` and the
-    scale is stored as an int8 pow2 EXPONENT (the ``OMMX_KV_INT8_SCALE`` read in
-    ``kv_pool.MultiSeqKVPool.__init__`` / ``pack.ommx_pack_kv_canonical_block``).
-    -0.25 bit on K and -0.25 bit on V at gt=gc=32. The ZERO-POINT stays bf16
-    (an arbitrary zp is not 2^e, so int8-exp would be lossy) and so do the two map
-    planes — all three are ``scale_dtype`` (bf16), never the int8 scale dtype.
-  * (unrelated to the three errors below, but load-bearing for any bit figure quoted
-    from this module) the OUTLIER-POSITION plane is a CHOICE of three
-    membership-equivalent encodings, and the number moves with it. All three decode to
-    bit-identical values; only the storage differs. At the canonical recipe (gt=32, k=6,
-    map ON, pow2):
-
-        relidx7            k_oidx  1.500 b/elem -> K 6.000 / V 2.750 / avg 4.375 / 3.657x
-        bitmap (DEFAULT)   k_obmp  1.000 b/elem -> K 5.500 / V 2.750 / avg 4.125 / 3.879x
-        combinadic         k_crank 0.750 b/elem -> K 5.250 / V 2.750 / avg 4.000 / 4.000x
-
-    The ``bitmap`` row is the format the ICCAD paper attributes to the GPU
-    implementation ("positions are stored as a flat bitmask (N bits per group), enabling
-    simple decoding at the cost of higher metadata overhead"). NOTE THE DIRECTION: at
-    this recipe the flat bitmask is CHEAPER than relidx7 — 32 bit/group vs 48 —
-    because k/gt = 6/32 = 18.8% is above the
-    1/7 = 14.3% crossover where 1 bit/position beats 7 bits/outlier. The paper's "higher
-    metadata overhead" holds against a SPARSER budget, not against this one.
-
-  * "~4.6x" is not reproduced by the repo's own formula at ANY outlier count: that
-    formula yields 4.41x at k=3 and 3.88x at the published k=6. The 4.6x figure mixes
-    a pow2-int8 V (2.75 bit) with a bf16-scale K (4.25 bit at k=3) — two different
-    recipes in one ratio.
-
-  net: repo formula K 5.25 / V 3.00 (3.88x)  ->  real planes K 6.00 / V 2.75 (3.66x).
-
-THE "<=3-bit" CLAIM IS A DIFFERENT NUMBER SYSTEM — NOT THIS RECIPE. K <= 3 bit/elem is
-reachable, but ONLY with ``OMMX_KV_GROUP_TOKENS=64`` AND ``OMMX_KV_GROUP_CHANNELS=64``
-AND ``OMMX_KV_OUTLIER_MAP=0`` (gt=64 with gc=32 gives 6.250 bit/pair = 3.125 avg, NOT <=3)
-(base-shared outliers: the FP4 code rides the base scale/zp, no dedicated map). See
-``pack.ommx_pack_kv_canonical_block`` ("THE LOW-BIT KV LEVER" in its docstring), which states
-that combination explicitly, tabulates the same per-plane terms, and calls the result "its OWN
-fakequant oracle ... a different number system" from the dedicated-map recipe.
-Measured by :func:`kv_bits_breakdown` at gt=gc=64, map OFF, pow2 ON:
-
-    k=6 -> K 3.500 / V 2.375  (5.875 bit/pair, 5.45x)   <- still ABOVE 3 bit on K
-    k=3 -> K 3.000 / V 2.375  (5.375 bit/pair, 5.95x)   <- the "<=3-bit" point
-
-NONE of the published OMMX accuracy results were produced under that recipe (they used
-the dedicated-map k=6 gt=32 recipe above). Quoting the <=3-bit ratio next to those
-accuracy numbers mixes two number systems; do not do it.
-
-THE LEVER (vLLM 0.21, verified in v1/core/kv_cache_utils.py:945 + v1/worker/gpu/
-attn_utils.py:155-160):
-
-    num_gpu_blocks = available_kv_memory // page_size_bytes // num_layers
-    page_size_bytes (FullAttentionSpec) = 2 * block_size * num_kv_heads
-                                            * head_size * dtype_size
-
-``num_blocks`` (== the KV token capacity) is INVERSELY proportional to
-``page_size_bytes``, and ``page_size_bytes`` is linear in ``head_size``. The
-allocator builds the paged tensor from ``get_kv_cache_shape(num_blocks, block_size,
-H, head_size)`` — i.e. it reads ``head_size`` STRAIGHT FROM THE SPEC, so shrinking
-the spec's ``head_size`` shrinks ``page_size_bytes`` AND the allocated bf16 tensor
-*consistently* (the contiguous-view path stays valid; ``page_size_padded`` is left
-None — that path uses ``torch.as_strided`` and is documented-broken for the standard
-``(2, num_blocks, ...)`` attention shape, attn_utils.py:181-184).
-
-So PACKED-ONLY = monkeypatch ``Attention.get_kv_cache_spec`` so the returned
-``FullAttentionSpec`` carries a ``head_size`` shrunk by the OMMX compression ratio
-``r = ommx_bits_per_elem / 32``. vLLM then admits ``1/r`` more KV blocks -> the budget
-shows up directly in vLLM's own log lines:
-
-    "GPU KV cache size: <N> tokens"
-    "Maximum concurrency for <ctx> tokens per request: <Y>x"
-
-The OMMX compressed sidecar (``CanonicalKVStore`` / ``MultiSeqKVPool``) is the REAL
-backing store for the compressed prefix and serves uniform-decode through the canonical
-op; the shrunk bf16 paged cache holds the KIVI sink+recent residual + the prefill pass.
-
-BYTE BUDGET ONLY — WHAT THAT LOG LINE DOES AND DOES NOT PROVE. The shrunk ``head_size``
-is a RESERVATION AND NOTHING ELSE. Four separate reasons it is not a measured capacity:
-
-  1. the shrunk pages are never written and never read — ``backend.py`` skips the paged
-     write in ``do_kv_cache_update`` (a headdim-D scatter into shrunk pages would
-     corrupt) and full-prefill/uniform-decode are served off the in-batch q/k/v and the
-     sidecar respectively. So nothing validates that the reserved bytes suffice.
-  2. the REAL backing store is ``MultiSeqKVPool``, allocated SEPARATELY per layer from
-     ``num_seqs x max_context``. It DOES NOT OBEY THIS BUDGET and is invisible to vLLM's
-     allocator, so admitting more blocks does not mean the pool fits.
-  3. ``head_size`` is quantized to a multiple of 8, so the budget is not even equal to
-     the ratio. At D=128 the exact byte-equivalent is 128 * 8.750/32 = 35.0, rounded to
-     32 -> vLLM reports 128/32 = 4.00x while the planes only compress 3.66x. The budget
-     is 8.6% OPTIMISTIC (see :func:`shrunk_head_size`).
-  4. the pool ALSO allocates the bf16 residual history ``k_hist``/``v_hist``. With
-     ``OMMX_KV_RING=1`` (the canonical recipe) that is bounded at
-     ``sink + recent + 2*gt`` = 104 rows/request, i.e. +32*104/S bit per (K,V) pair:
-     +0.81 bit at S=4096 -> 3.35x effective, not 3.66x. With ``OMMX_KV_RING`` UNSET the
-     pool keeps the FULL ``[num_seqs, max_seq_len, H, D]`` bf16 shadow = +32.0 bit/pair
-     -> the compression claim is VOID (strictly worse than plain bf16). Pass
-     ``seq_len=`` to :func:`kv_bits_breakdown` to get that term as a number.
-
-Therefore vLLM's "Maximum concurrency ... <Y>x" line is NOT a validated OMMX capacity
-result — it reports what the allocator was TOLD to budget. A capacity claim needs a
-max-batch admission probe that runs to completion with the pool resident.
-
-HONEST SCOPE: this realizes the capacity-BUDGET win only, as above. ``backend.py``
-never writes and never reads the shrunk pages — a FULL-PROMPT prefill (q_len ==
-seq_len per request, ``detect_full_prefill``) runs varlen FlashAttention directly on
-the in-batch q/k/v, and uniform decode is sidecar-served; any other step raises loudly
-(no bf16 fallback exists over the shrunk cache). Handled scope = the eager bench
-(``bench_capacity.py --mode packed``: enforce_eager, enable_chunked_prefill=False,
-enable_prefix_caching=False); chunked/mixed prefill under PACKED-ONLY is the remaining
-follow-up. Default OFF (``OMMX_KV_PACKED_ONLY=1`` to enable) so SHADOW stays the safe
-baseline.
+``kv_bits_breakdown`` describes the selected codec, not scheduler admission. At
+k=6, gt=gc=32, pow2 and the dedicated FP4 map ON, K/V bit costs are:
+relidx7 6.000/2.750, bitmap (default) 5.500/2.750, combinadic 5.250/2.750.
+Residuals, finite-context slack, tables and alignment add bytes. The arena planner
+inventories the real store instead of deriving its allocation from these ratios.
+``shrunk_head_size`` remains a legacy accounting helper; it is not used to allocate
+or describe a serving cache. GPU bitmap and NPU combinatorial budgets are distinct.
 """
 from __future__ import annotations
 
 import math
 import os
+import sys
 from typing import Any, Dict, Optional
 
 from ...recipes import resolve_env as _resolve_recipe_env
@@ -600,29 +478,11 @@ def packed_compression_ratio(head_dim: int = 128, **overrides: Any) -> float:
 
 
 def shrunk_head_size(head_size: int) -> int:
-    """The reduced spec ``head_size`` that makes vLLM budget ``page_size_bytes`` for the
-    OMMX packed footprint instead of bf16.
+    """Legacy reservation-only estimate, retained for reproducible accounting.
 
-    ``page_size_bytes`` is linear in ``head_size``; we want it scaled by
-    ``ommx_bits_per_elem / 32`` (both K and V together). Rounded to the NEAREST multiple
-    of 8 (FA shape sanity), floor 8, never larger than the real head_size. Overridable
-    by ``OMMX_KV_PACKED_HEADSIZE``.
-
-    THIS IS A BYTE BUDGET ONLY — IT BACKS NOTHING. The returned head_size shrinks what
-    vLLM's allocator reserves and therefore how many blocks it admits, but those pages
-    are never written and never read, and the REAL store for the compressed prefix is
-    the separately allocated ``MultiSeqKVPool``, which does NOT obey this budget and is
-    invisible to vLLM's accounting. Consequently vLLM's "Maximum concurrency ... Nx"
-    log line is NOT a validated OMMX capacity result (module docstring, reasons 1-4).
-
-    The nearest-multiple-of-8 rounding can land BELOW the exact byte-equivalent, i.e.
-    the budget can be OPTIMISTIC relative to the plane footprint. For the canonical
-    recipe at head_size=128: exact = 128 * 8.750/32 = 35.0 -> returned 32, so vLLM
-    budgets 128/32 = 4.00x while the planes only compress 3.66x (8.6% optimistic).
-    That is unchanged from the pre-H5/H6 formula (which gave 33.0 -> 32 as well): the
-    corrected, LARGER bit count raises the reservation only where the rounding does not
-    absorb it (e.g. head_size=256: 64 -> 72). Rounding is deliberately left as-is so the
-    H100-measured 4.00x budget stays reproducible.
+    This rounds the packed-plane ratio to a multiple of eight and can under-budget
+    the real allocation. No serving path uses it; use ``plan_kv_arena`` for exact
+    bytes including residuals, tables, slack and alignment.
     """
     forced = _env_int("OMMX_KV_PACKED_HEADSIZE", 0)
     if forced > 0:
@@ -641,128 +501,119 @@ def shrunk_head_size(head_size: int) -> int:
     return hs
 
 
-# --- the monkeypatch: shrink FullAttentionSpec.head_size in PACKED-ONLY mode -------
+# --- engine-owned byte arena spec (explicit opt-in) -----------------------------
 
 _PATCHED = False
+_EVIDENCE_DONE = [False]
 
 
-def install_packed_only_spec() -> Optional[float]:
-    """Patch ``Attention.get_kv_cache_spec`` so PACKED-ONLY shrinks the bf16 cache
-    page budget by the OMMX compression ratio. Idempotent. No-op (returns None) when
-    PACKED-ONLY is disabled or the patch is already installed.
+def validate_packed_only_config(vllm_config, layer=None) -> None:
+    """Fail closed before allocation: the arena is a single-request SoA store.
 
-    LAW #5 (no silent fallback): the ONLY no-op conditions are the two above, both of
-    which are checked BEFORE anything can fail. Past that point the operator has
-    explicitly set ``OMMX_KV_PACKED_ONLY``, which makes the sidecar the only backing
-    store, so a missing vLLM symbol RAISES here. Returning None instead would leave
-    ``backend._PACKED_ONLY`` True (it is resolved from the env, independently of this
-    patch) against an UNSHRUNK bf16 paged cache that ``do_kv_cache_update`` never
-    writes and ``forward()`` refuses to read — the contradictory engine
-    ``plugin.py``'s import guard exists to prevent. That guard only covers failure to
-    import THIS MODULE; a symbol failure inside it must be caught here.
-
-    Always returns None: the realized multiplier is not known until the first layer's
-    spec is rewritten, so it is emitted as one-time evidence by
-    :func:`_packed_only_evidence` (log line + ``OMMX_FIRE_FILE``) instead of returned.
-
-    THE RAISE IS NOT UNCONDITIONAL — re-verified on a host with no vLLM installed. The
-    ``not packed_only_enabled()`` guard runs BEFORE the ``from vllm...`` import, and
-    ``packed_only_enabled()`` reads ``OMMX_KV_PACKED_ONLY`` with default ``"0"``, so
-    SHADOW mode (the default, which keeps vLLM's full bf16 paged cache and a valid bf16
-    fallback for every step) returns None without ever touching a vLLM symbol. Measured
-    on this machine, ``vllm`` not importable: env unset -> ``install_packed_only_spec()``
-    is ``None``; env ``"0"``/``"off"``/``""`` -> ``None``; env ``"1"`` -> ``RuntimeError
-    (ModuleNotFoundError: No module named 'vllm')``. A vLLM tree missing the v1 symbols
-    therefore still runs SHADOW; only an operator who asked for PACKED-ONLY is stopped.
-
-    ``plugin.py`` does not double-raise or mask this. Its ``try`` wraps ONLY
-    ``from .packed_only import install_packed_only_spec`` (a MODULE import failure, which
-    it re-raises just for ``_packed_only_requested()`` and otherwise reports as a SHADOW
-    note); the call to this function sits in that ``try``'s ``else:`` branch, so the
-    RuntimeError above propagates out of ``register()`` unmodified. The two env
-    predicates agree exactly: ``plugin._packed_only_requested`` and
-    ``packed_only_enabled`` both strip+lowercase and both treat
-    ``{"", "0", "false", "off", "no"}`` (and unset) as OFF.
-
-    UNVERIFIED (no GPU this session): the SUCCESS path — a real vLLM import, the patched
-    ``get_kv_cache_spec`` running during KV-cache sizing, and the resulting page-budget
-    shrink — was not exercised here. Only the two no-op conditions and the PACKED-ONLY
-    raise were executed, on CPU, with no vLLM present.
+    Engine block copying/zeroing is not meaningful for this layout. Hybrid/Mamba,
+    transfer, sharing and prefix-cache paths must not reach allocation.
     """
+    def require(ok, reason):
+        if not ok:
+            raise RuntimeError(f"OMMX_KV_PACKED_ONLY requires {reason}")
+
+    require(_env_flag_config("OMMX_ATTN_GRAPH", False), "OMMX_ATTN_GRAPH=1")
+    require(_env_flag_config("OMMX_KV_RING", False), "OMMX_KV_RING=1")
+    for flag in ("OMMX_ATTN_BATCHED", "OMMX_ATTN_BATCHED_GRAPH", "OMMX_ATTN_V_BF16"):
+        require(not _env_flag_config(flag, False), f"{flag}=0")
+    require(not _os_present("OMMX_KV_PACKED_HEADSIZE"),
+            "no legacy OMMX_KV_PACKED_HEADSIZE override (arena uses exact bytes)")
+    scheduler = vllm_config.scheduler_config
+    cache = vllm_config.cache_config
+    model = vllm_config.model_config
+    parallel = vllm_config.parallel_config
+    require(model.max_model_len >= 32, "max_model_len>=32 (profiling cache must stay undersized)")
+    require(vllm_config.compilation_config.cudagraph_capture_sizes == [1],
+            "cudagraph_capture_sizes=[1] (single-request decode capture only)")
+    require(scheduler.max_num_seqs == 1, "max_num_seqs=1")
+    require(not scheduler.enable_chunked_prefill, "enable_chunked_prefill=False")
+    require(not cache.enable_prefix_caching, "enable_prefix_caching=False")
+    require(cache.block_size == 16, "block_size=16")
+    require(cache.cache_dtype in {"auto", "float16", "bfloat16"}, "unquantized KV cache")
+    require(vllm_config.speculative_config is None, "no speculative decoding")
+    require(vllm_config.kv_transfer_config is None, "no KV transfer/connector")
+    require(getattr(vllm_config, "ec_transfer_config", None) is None, "no encoder transfer")
+    for name in ("tensor_parallel_size", "pipeline_parallel_size",
+                 "decode_context_parallel_size", "prefill_context_parallel_size"):
+        require(getattr(parallel, name) == 1, f"{name}=1")
+    require(not getattr(model, "is_hybrid", False), "no hybrid/Mamba layers or block zeroing")
+    require(not getattr(model, "is_encoder_decoder", False), "decoder-only full attention")
+    require(not getattr(model, "use_mla", False), "no MLA attention")
+    if layer is not None:
+        require(getattr(layer, "kv_sharing_target_layer_name", None) is None,
+                "no cross-layer KV sharing")
+
+
+def install_packed_only_spec() -> None:
+    """Install the exact arena spec once; default SHADOW never imports vLLM here."""
     global _PATCHED
     if _PATCHED or not packed_only_enabled():
         return None
     try:
         from vllm.model_executor.layers.attention.attention import Attention
         from vllm.v1.kv_cache_interface import FullAttentionSpec
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         raise RuntimeError(
-            "OMMX_KV_PACKED_ONLY is set but the vLLM v1 attention symbols the "
-            "page-budget patch needs could not be imported "
-            f"({type(exc).__name__}: {exc}). Needed: "
+            "OMMX_KV_PACKED_ONLY is set but the vLLM v1 attention symbols could not "
+            f"be imported ({type(exc).__name__}: {exc}). Needed: "
             "vllm.model_executor.layers.attention.attention.Attention and "
-            "vllm.v1.kv_cache_interface.FullAttentionSpec. Without the patch vLLM "
-            "reserves FULL bf16 pages that the OMMX sidecar never writes and the "
-            "backend refuses to read, so the engine would be self-contradictory. "
-            "FIX: install a vLLM >= 0.21 that exposes the v1 attention layer, or "
-            "unset OMMX_KV_PACKED_ONLY to use SHADOW mode."
+            "vllm.v1.kv_cache_interface.FullAttentionSpec. FIX: install a compatible "
+            "vLLM 0.21 or unset OMMX_KV_PACKED_ONLY to use SHADOW mode."
         ) from exc
+    original = Attention.get_kv_cache_spec
 
-    _orig = Attention.get_kv_cache_spec
+    def packed_spec(self, vllm_config):
+        spec = original(self, vllm_config)
+        peers = (self, *vllm_config.compilation_config.static_forward_context.values())
+        # The patch is process-wide, but only engines containing OMMX opt in.
+        # Its backend class is already loaded if any layer uses it; compare by
+        # identity without importing the backend for unrelated engines.
+        backend = sys.modules.get(f"{__package__}.backend")
+        ommx_backend = getattr(backend, "OMMXCanonicalBackend", None)
+        if ommx_backend is None or not any(
+                getattr(layer, "attn_backend", None) is ommx_backend for layer in peers):
+            return spec
+        from .arena import make_kv_arena_spec
+        from .backend import register_kv_arena_layout
 
-    def _packed_only_spec(self, vllm_config):  # noqa: ANN001
-        spec = _orig(self, vllm_config)
-        # Only shrink the standard full-attention bf16 KV cache (the OMMX target).
-        # Sliding-window / TQ / MLA / fp8 specs are left untouched (not the OMMX path).
+        validate_packed_only_config(vllm_config, self)
+        # Check peers too: the runner skips shared layers before invoking this
+        # getter, and Mamba/non-Attention layers have their own unpatched getter.
+        for layer in peers:
+            if layer is not self and not callable(getattr(layer, "get_kv_cache_spec", None)):
+                continue
+            if (not isinstance(layer, Attention)
+                    or getattr(layer, "attn_backend", None) is not ommx_backend
+                    or getattr(layer, "kv_sharing_target_layer_name", None) is not None):
+                raise RuntimeError("OMMX_KV_PACKED_ONLY requires only unshared OMMX full-attention layers")
         if not isinstance(spec, FullAttentionSpec):
-            return spec
-        try:
-            import torch
-            if spec.dtype not in (torch.bfloat16, torch.float16):
-                return spec  # quantized-cache layers: leave alone
-            # NOTE: an unbuildable recipe (bad env, head_size not a multiple of the V
-            # group) raises out of shrunk_head_size and lands in the except below
-            # -> the spec is left at full bf16, i.e. OVER-reserved, never under. The
-            # loud failure for that same geometry still happens at pool construction
-            # (MultiSeqKVPool.__init__ raises), so no silently-wrong path exists.
-            hs = shrunk_head_size(int(spec.head_size))
-            if hs >= int(spec.head_size):
-                return spec
-            from dataclasses import replace
-            new = replace(spec, head_size=hs, head_size_v=hs)
-            # one-time evidence (law #5): the page budget really shrank.
-            _packed_only_evidence(int(spec.head_size), hs)
-            return new
-        except Exception as exc:  # noqa: BLE001
-            # LAW #5: this is the ONE fail-SAFE direction (the spec stays FULL bf16, i.e.
-            # OVER-reserved, never under) so it does not raise here — but it must not be
-            # silent either, or the operator sees PACKED-ONLY with no PACKED_ONLY_SPEC
-            # evidence and no stated reason. Record it once, then leave the spec alone.
-            _packed_only_spec_skipped_evidence(exc)
-            return spec
+            raise RuntimeError("OMMX_KV_PACKED_ONLY requires FullAttentionSpec for every layer")
+        result = make_kv_arena_spec(spec, max_context=vllm_config.model_config.max_model_len,
+                                   n_q_heads=self.num_heads)
+        register_kv_arena_layout(result.arena_layout)
+        self._ommx_arena_layout = result.arena_layout
+        _packed_only_evidence(result.arena_layout)
+        return result
 
-    Attention.get_kv_cache_spec = _packed_only_spec  # type: ignore[assignment]
+    Attention.get_kv_cache_spec = packed_spec
     _PATCHED = True
     return None
 
 
-_EVIDENCE_DONE = [False]
-_SKIP_EVIDENCE_DONE = [False]
-
-
-def _packed_only_evidence(orig_hs: int, new_hs: int) -> None:
+def _packed_only_evidence(layout) -> None:
     if _EVIDENCE_DONE[0]:
         return
     _EVIDENCE_DONE[0] = True
-    ratio = orig_hs / max(1, new_hs)
-    # "page_bytes /Nx" is the BUDGET ratio (quantized to a multiple of 8); "ommx_bits"
-    # is the true plane footprint. They differ by the rounding — both are logged so the
-    # log line cannot be mistaken for a measured compression result.
-    bits = ommx_bits_per_elem(orig_hs)
-    line = (f"PACKED_ONLY_SPEC head_size {orig_hs} -> {new_hs} "
-            f"(page_bytes /{ratio:.2f}x budget) "
-            f"ommx_bits/elem={bits:.3f} planes={_BF16_KV_BITS / bits:.2f}x "
-            f"(budget only; MultiSeqKVPool is allocated outside it)")
+    line = (f"PACKED_ONLY_SPEC arena head_size={layout.head_dim} "
+            f"kv_heads={layout.n_kv_heads} max_context={layout.max_context} "
+            f"page_bytes={layout.page_size_bytes} store_bytes={layout.total_store_bytes} "
+            f"required_blocks={layout.required_blocks} "
+            f"allocation_bytes={layout.allocation_bytes} (engine-owned; binding checked separately)")
     try:
         from vllm.logger import init_logger
         init_logger("ommx_gpu_serve").info("[ommx] %s", line)
@@ -776,38 +627,8 @@ def _packed_only_evidence(orig_hs: int, new_hs: int) -> None:
         pass
 
 
-
-def _packed_only_spec_skipped_evidence(exc: BaseException) -> None:
-    """One-time record that a FullAttentionSpec was left UNSHRUNK and why.
-
-    The page budget then stays at full bf16 (over-reserved, never under), and the
-    geometry that broke ``shrunk_head_size`` still raises loudly at pool construction
-    (``MultiSeqKVPool.__init__``). This line is what makes the gap between "PACKED-ONLY
-    is on" and "no PACKED_ONLY_SPEC fired" attributable instead of silent.
-    """
-    if _SKIP_EVIDENCE_DONE[0]:
-        return
-    _SKIP_EVIDENCE_DONE[0] = True
-    line = ("PACKED_ONLY_SPEC_SKIPPED head_size left UNSHRUNK (full bf16 pages, "
-            f"over-reserved) because {type(exc).__name__}: {exc}")
-    try:
-        from vllm.logger import init_logger
-        init_logger("ommx_gpu_serve").warning("[ommx] %s", line)
-    except Exception:
-        pass
-    fire = os.environ.get("OMMX_FIRE_FILE", "/tmp/ommx_route_fired.log")
-    try:
-        with open(fire, "a") as fh:
-            fh.write(line + f" pid={os.getpid()}\n")
-    except Exception:
-        pass
-
-
 __all__ = [
-    "packed_only_enabled",
-    "kv_bits_breakdown",
-    "ommx_bits_per_elem",
-    "packed_compression_ratio",
-    "shrunk_head_size",
+    "packed_only_enabled", "kv_bits_breakdown", "ommx_bits_per_elem",
+    "packed_compression_ratio", "shrunk_head_size", "validate_packed_only_config",
     "install_packed_only_spec",
 ]
