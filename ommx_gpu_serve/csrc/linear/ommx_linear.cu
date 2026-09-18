@@ -851,7 +851,7 @@ __global__ void build_outlier_delta_dense_kernel(
 // ////[GPU]//// parity vs fakequant fp32 + SASS `mma.m16n8k16` MUST be confirmed on A100.
 //
 // stage_A_tile: cooperatively cp.async one 16x16 A tile (2x 16B per row = 8 bf16)
-// into a ring slot; scalar tail when the K-tile or M-row is partial. Whole-CTA
+// into a ring slot; scalar fallback for partial tiles/rows or unaligned A. Whole-CTA
 // participates (coop over threadIdx.x); no per-lane early-return (law #9).
 template<class StoreFmt>
 __device__ __forceinline__ void stage_A_tile(
@@ -862,7 +862,8 @@ __device__ __forceinline__ void stage_A_tile(
     #pragma unroll 8
     for (int r = coop_id; r < MMA_M; r += coop_n) {
         const int m = m0 + r;
-        if (m < M && ktile_full) {
+        if (m < M && ktile_full &&
+            (reinterpret_cast<uintptr_t>(A + static_cast<size_t>(m) * K + k0) & 15u) == 0) {
             const __nv_bfloat16* gsrc = A + static_cast<size_t>(m) * K + k0;
             nc::cp_async_cg_16B(&sAslot[r * MMA_K + 0], gsrc + 0);   // 8 bf16 = 16B
             nc::cp_async_cg_16B(&sAslot[r * MMA_K + 8], gsrc + 8);   // 8 bf16 = 16B
@@ -995,6 +996,32 @@ __device__ __forceinline__ void decode_B_tile(
     __syncwarp();
 }
 
+// Base-only affine INT2, full 16-wide K tile in a 64/128-element group.
+// Decode directly in the MMA B-fragment layout; no dequantized shared-B round-trip.
+// The host checks packed-word alignment and keeps all other cases on decode_B_tile.
+__device__ __forceinline__ void decode_B_registers_affine(
+    uint32_t (&b)[2], int n_tile, int k0, int lane,
+    const uint8_t* __restrict__ code, const float* __restrict__ scale,
+    const float* __restrict__ zp, int N, int K, int G, int vector_length) {
+    const int n = n_tile + lane / 4;
+    if (n >= N) { b[0] = b[1] = 0; return; }  // no barriers in this helper
+    const int bk = (lane % 4) * 2;
+    const uint32_t packed = *reinterpret_cast<const uint32_t*>(
+        code + static_cast<size_t>(n) * (K / 4) + k0 / 4);
+    const int g = k0 / vector_length;
+    const float s = scale[n * G + g], z = zp[n * G + g];
+    const __nv_bfloat162 scale_x2 = __floats2bfloat162_rn(s, s);
+    const __nv_bfloat162 zp_x2 = __floats2bfloat162_rn(z, z);
+    #pragma unroll
+    for (int t = 0; t < 2; ++t) {
+        const uint32_t pair = (packed >> (2 * (bk + 8 * t))) & 0xfu;
+        const uint32_t pk = (pair & 3u) | ((pair & 12u) << 14);
+        const __nv_bfloat162 raw = nc::ommx_int2_splice_bf16x2(pk);
+        const __nv_bfloat162 out2 = __hfma2(raw, scale_x2, zp_x2);
+        b[t] = *reinterpret_cast<const uint32_t*>(&out2);
+    }
+}
+
 // EXACT sm_80 tensor-core op: mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32.
 __device__ __forceinline__ void mma_m16n8k16_bf16(
     const uint32_t (&a)[4], const uint32_t (&b)[2], float (&d)[4]) {
@@ -1009,7 +1036,8 @@ __device__ __forceinline__ void mma_m16n8k16_bf16(
 #endif
 }
 
-template<class StoreFmt, int WARPS_PER_CTA = 4, int MT_BLOCKS = 8, int SPLITK = 1>
+template<class StoreFmt, int WARPS_PER_CTA = 4, int MT_BLOCKS = 8, int SPLITK = 1,
+         bool REGISTER_B = false>
 __global__ void __launch_bounds__(WARPS_PER_CTA * 32)
 prefill_wmma_kernel(
     const __nv_bfloat16* __restrict__ A,      // [M, K] row-major
@@ -1032,6 +1060,7 @@ prefill_wmma_kernel(
 
     __shared__ __align__(16) __nv_bfloat16 sA[2][MT_BLOCKS][MMA_M * MMA_K];
     __shared__ __nv_bfloat16 sB[2][WARPS_PER_CTA][MMA_N * MMA_K];
+    uint32_t b_cur[2];  // only live in the REGISTER_B specialization
     const int n_ktiles = (K + MMA_K - 1) / MMA_K;
     const int kt_per = (SPLITK == 1) ? n_ktiles : (n_ktiles / SPLITK);
     const int kt_lo  = (SPLITK == 1) ? 0 : (blockIdx.z * kt_per);
@@ -1059,9 +1088,14 @@ prefill_wmma_kernel(
             stage_A_tile<StoreFmt>(A, sA[0][mb], m_base + mb * MMA_M, kt_lo * MMA_K,
                                    M, K, threadIdx.x, coop_n);
         nc::cp_async_commit();
-        decode_B_tile<StoreFmt>(sB[0][warp_id], n_tile, kt_lo * MMA_K, lane, code,
-                                scale, zp, N, K, G, vector_length, symmetric,
-                                LV_SLOPE, LV_BIAS, oindex, odelta, npv, B_blk, idx_fmt);
+        if constexpr (REGISTER_B) {
+            decode_B_registers_affine(b_cur, n_tile, kt_lo * MMA_K, lane,
+                                     code, scale, zp, N, K, G, vector_length);
+        } else {
+            decode_B_tile<StoreFmt>(sB[0][warp_id], n_tile, kt_lo * MMA_K, lane, code,
+                                    scale, zp, N, K, G, vector_length, symmetric,
+                                    LV_SLOPE, LV_BIAS, oindex, odelta, npv, B_blk, idx_fmt);
+        }
     }
 
     for (int kt = kt_lo; kt < kt_hi; ++kt) {
@@ -1080,17 +1114,27 @@ prefill_wmma_kernel(
         }
         __syncthreads();
         // double-buffer B: decode B[kt+1] while we MMA B[kt].
-        if (kt + 1 < kt_hi)
-            decode_B_tile<StoreFmt>(sB[(kt + 1 - kt_lo) & 1][warp_id], n_tile,
-                                    k0 + MMA_K, lane, code, scale, zp, N, K, G,
-                                    vector_length, symmetric, LV_SLOPE, LV_BIAS,
-                                    oindex, odelta, npv, B_blk, idx_fmt);
+        uint32_t b_next[2];
+        if (kt + 1 < kt_hi) {
+            if constexpr (REGISTER_B) {
+                decode_B_registers_affine(b_next, n_tile, k0 + MMA_K, lane,
+                                         code, scale, zp, N, K, G, vector_length);
+            } else {
+                decode_B_tile<StoreFmt>(sB[(kt + 1 - kt_lo) & 1][warp_id], n_tile,
+                                        k0 + MMA_K, lane, code, scale, zp, N, K, G,
+                                        vector_length, symmetric, LV_SLOPE, LV_BIAS,
+                                        oindex, odelta, npv, B_blk, idx_fmt);
+            }
+        }
 
         // ── B fragment (col-major B operand of m16n8k16). bcol=lane/4 (8 N-cols),
         // bk=(lane%4)*2; t=0 -> k in [bk,bk+1], t=1 -> k in [bk+8,bk+9].
-        const __nv_bfloat16* sBw = sB[slot][warp_id];
         uint32_t b[2];
-        { const int bcol = lane / 4, bk = (lane % 4) * 2;
+        if constexpr (REGISTER_B) {
+            b[0] = b_cur[0]; b[1] = b_cur[1];
+        } else {
+          const __nv_bfloat16* sBw = sB[slot][warp_id];
+          const int bcol = lane / 4, bk = (lane % 4) * 2;
           #pragma unroll
           for (int t = 0; t < 2; ++t) { const int kk = bk + (t ? 8 : 0);
             const __nv_bfloat16 lo = sBw[bcol * MMA_K + kk + 0];
@@ -1113,6 +1157,9 @@ prefill_wmma_kernel(
                      |  static_cast<uint32_t>(*reinterpret_cast<const uint16_t*>(&lo));
             }
             mma_m16n8k16_bf16(a, b, d[mb]);
+        }
+        if constexpr (REGISTER_B) {
+            if (kt + 1 < kt_hi) { b_cur[0] = b_next[0]; b_cur[1] = b_next[1]; }
         }
         __syncthreads();
     }
@@ -1948,6 +1995,7 @@ namespace nc = ommx::numeric;
 // evidence. ////[GPU]//// Do NOT read fire_stats() as replay-time proof.
 static unsigned long long g_fire_decode   = 0;
 static unsigned long long g_fire_prefill  = 0;
+static unsigned long long g_fire_prefill_register_b = 0;
 static unsigned long long g_fire_outlier  = 0;
 
 static inline void check_contig_cuda(const torch::Tensor& t, const char* name) {
@@ -2183,12 +2231,14 @@ void sparse_correct(
         const auto* Atp = reinterpret_cast<const __nv_bfloat16*>(At_opt->data_ptr<at::BFloat16>());
         auto* Cp = reinterpret_cast<__nv_bfloat16*>(out_or_C.data_ptr<at::BFloat16>());
         constexpr int MAX_STAGE_DENSE = 5120;    // static smem stage bound (40 KB < 48 KB default); raised 4096->5120 to hold Phi-4 down_proj n_blk*npv=4480 (K=17920,B=128,npv=32) without silent truncation
+        // Both kernels use the same fixed-size stage. The legacy compaction path
+        // also truncates beyond this bound; switching kernels is not a safe fallback.
+        const int64_t n_blk = (K + B - 1) / B;
+        TORCH_CHECK(n_blk * npv <= MAX_STAGE_DENSE,
+                    "sparse_correct: n_blk*npv=", n_blk * npv,
+                    " exceeds smem stage bound ", MAX_STAGE_DENSE,
+                    " for both parallel and legacy kernels; reduce npv or K");
         if (corr_parallel) {
-            const int64_t n_blk = (K + B - 1) / B;
-            TORCH_CHECK(n_blk * npv <= MAX_STAGE_DENSE,
-                        "sparse_correct(parallel): n_blk*npv=", n_blk * npv,
-                        " exceeds smem stage bound ", MAX_STAGE_DENSE,
-                        " (set OMMX_W_CORR_PARALLEL=0 for the legacy kernel)");
             // ~1 warp per row while M<=32 (32*M threads), clamped to [256,1024];
             // beyond 32 rows (e.g. the dWt identity probe M=K) warps loop m += nwarps.
             int block = 32 * static_cast<int>(M);
@@ -2226,6 +2276,9 @@ torch::Tensor prefill_wmma(
     TORCH_CHECK(code.dtype() == torch::kUInt8, "code must be uint8");
     TORCH_CHECK(scale.dtype() == torch::kFloat32, "scale must be fp32");
     TORCH_CHECK(M >= 16, "prefill_wmma needs M>=16 (m16n8k16 16-row tile); route M<16 to decode_base: decode M<16 is ALU-only");
+    TORCH_CHECK(splitk == 1 || splitk == 2 || splitk == 4 || splitk == 8,
+                "prefill_wmma splitk must be one of {1,2,4,8}; got ", splitk,
+                " (1 selects automatic splitting)");
     auto C = torch::empty({M, N}, A.options());
     const float* zp = zp_opt.has_value() ? zp_opt->data_ptr<float>() : nullptr;
     const uint8_t* oip = oindex_opt.has_value() ? oindex_opt->data_ptr<uint8_t>() : nullptr;
@@ -2236,11 +2289,20 @@ torch::Tensor prefill_wmma(
     auto* Cp = reinterpret_cast<__nv_bfloat16*>(C.data_ptr<at::BFloat16>());
     auto stream = at::cuda::getCurrentCUDAStream();
     constexpr int WARPS_PER_CTA = 4, MMA_M = 16, MMA_N = 8, MMA_K = 16, BN = WARPS_PER_CTA * MMA_N;
+    // Experimental, default OFF. The shared-B variant remains the fallback for
+    // every case not covered by the direct-register helper's narrow contract.
+    const char* register_b_env = std::getenv("OMMX_W_REGISTER_B");
+    const bool register_b = register_b_env != nullptr && register_b_env[0] == '1'
+        && register_b_env[1] == '\0' && !symmetric && zp != nullptr
+        && oip == nullptr && odp == nullptr
+        && (vector_length == 64 || vector_length == 128)
+        && K % vector_length == 0 && K % MMA_K == 0
+        && (reinterpret_cast<uintptr_t>(code.data_ptr<uint8_t>()) & 3u) == 0;
     const int mblk = (int)((M + MMA_M - 1) / MMA_M);
     const int MT = (mblk <= 2) ? 2 : (mblk <= 4 ? 4 : 8);          // m-block reuse band
     const int RPC = MT * MMA_M;
     const int n_ktiles = (int)((K + MMA_K - 1) / MMA_K);
-    // split-K = compile-time SPLITK. honor caller splitk>1 (must divide n_ktiles),
+    // split-K = compile-time SPLITK in {1,2,4,8}. Honor caller splitk>1 (must divide n_ktiles),
     // else SM-saturation auto-fill when the base grid underfills (Marlin-style).
     const int base_ctas = (int)((N + BN - 1) / BN) * (int)((M + RPC - 1) / RPC);
     int sk = (splitk > 1) ? (int)splitk : 1;
@@ -2251,20 +2313,24 @@ torch::Tensor prefill_wmma(
     if (sk > 1 && (n_ktiles % sk) != 0) sk = 1;                    // SPLITK must divide K-tiles
     torch::Tensor Cf; float* Cfp = nullptr;
     if (sk > 1) { Cf = torch::zeros({M, N}, A.options().dtype(torch::kFloat32)); Cfp = Cf.data_ptr<float>(); }
-    #define OMMX_LAUNCH(MTv, SKv) do { constexpr int RPCv = (MTv) * MMA_M; \
+    #define OMMX_LAUNCH(MTv, SKv, RBv) do { constexpr int RPCv = (MTv) * MMA_M; \
         dim3 grid((unsigned)((N + BN - 1) / BN), (unsigned)((M + RPCv - 1) / RPCv), (unsigned)(SKv)); \
         dim3 block(WARPS_PER_CTA * 32); \
         auto go = [&](auto tag) { using SF = decltype(tag); \
-            prefill_wmma_kernel<SF, WARPS_PER_CTA, (MTv), (SKv)><<<grid, block, 0, stream>>>( \
+            prefill_wmma_kernel<SF, WARPS_PER_CTA, (MTv), (SKv), (RBv)><<<grid, block, 0, stream>>>( \
                 Ap, code.data_ptr<uint8_t>(), scale.data_ptr<float>(), zp, \
                 ((SKv) == 1 ? nullptr : Cfp), ((SKv) == 1 ? Cp : nullptr), \
                 (int)N, (int)M, (int)K, (int)vector_length, symmetric, (SKv), \
                 oip, odp, npvi, bblki); }; \
         go(nc::StoreI2F4{}); } while (0)
-    #define OMMX_DISPATCH_SK(MTv) do { \
-        if (sk == 8) OMMX_LAUNCH(MTv, 8); else if (sk == 4) OMMX_LAUNCH(MTv, 4); \
-        else if (sk == 2) OMMX_LAUNCH(MTv, 2); else OMMX_LAUNCH(MTv, 1); } while (0)
-    if (MT == 2) OMMX_DISPATCH_SK(2); else if (MT == 4) OMMX_DISPATCH_SK(4); else OMMX_DISPATCH_SK(8);
+    #define OMMX_DISPATCH_SK(MTv, RBv) do { \
+        if (sk == 8) OMMX_LAUNCH(MTv, 8, RBv); else if (sk == 4) OMMX_LAUNCH(MTv, 4, RBv); \
+        else if (sk == 2) OMMX_LAUNCH(MTv, 2, RBv); else OMMX_LAUNCH(MTv, 1, RBv); } while (0)
+    #define OMMX_DISPATCH_MT(RBv) do { \
+        if (MT == 2) OMMX_DISPATCH_SK(2, RBv); else if (MT == 4) OMMX_DISPATCH_SK(4, RBv); \
+        else OMMX_DISPATCH_SK(8, RBv); } while (0)
+    if (register_b) { OMMX_DISPATCH_MT(true); } else { OMMX_DISPATCH_MT(false); }
+    #undef OMMX_DISPATCH_MT
     #undef OMMX_DISPATCH_SK
     #undef OMMX_LAUNCH
     C10_CUDA_CHECK(cudaGetLastError());   // launch error check (graph-safe, not a host sync)
@@ -2272,6 +2338,7 @@ torch::Tensor prefill_wmma(
         cast_f32_to_bf16_kernel<<<(total + CT - 1) / CT, CT, 0, stream>>>(Cfp, Cp, total);
         C10_CUDA_CHECK(cudaGetLastError()); }
     g_fire_prefill++;
+    if (register_b) g_fire_prefill_register_b++;
     return C;
 }
 
@@ -2279,6 +2346,7 @@ std::map<std::string, int64_t> fire_stats() {   // std::map -> pybind Python dic
     std::map<std::string, int64_t> d;
     d["decode_calls"]  = (int64_t)g_fire_decode;
     d["prefill_calls"] = (int64_t)g_fire_prefill;
+    d["prefill_register_b_calls"] = (int64_t)g_fire_prefill_register_b;
     d["outlier_calls"] = (int64_t)g_fire_outlier;
     d["cute_bf16_calls"] = (int64_t)g_fire_cute_bf16;
     d["cute_fp8_calls"]  = (int64_t)g_fire_cute_fp8;

@@ -64,8 +64,10 @@ Envs read here:
   OMMX_UNSAFE_ALLOW_CHUNKED_PREFILL  skip check 2 (WILL drop prefill chunks)
   OMMX_UNSAFE_ALLOW_POOL_OVERSUBSCRIBE  skip check 3 (WILL OOM)
   OMMX_UNSAFE_ALLOW_SLOT_CAP_OVERSUBSCRIBE  skip check 4 (WILL raise mid-serve)
-Read but never written: OMMX_ATTN_BATCHED (the batched-route force-on, so check 3
-knows whether a B>1 step is reachable) and OMMX_ATTN_MAX_NUM_SEQS (only to say WHERE
+Read but never written: OMMX_ATTN_BATCHED / OMMX_ATTN_BATCHED_GRAPH / OMMX_ATTN_GRAPH
+(the route envs: check 3 needs to know whether a B>1 step is reachable, and a
+multi-request engine needs a batched route and no GRAPH route) and
+OMMX_ATTN_MAX_NUM_SEQS (only to say WHERE
 the resolved ``num_seqs`` came from in the error text; the backend resolves it as
 ``max(1, min(OMMX_ATTN_MAX_NUM_SEQS or 256, scheduler_config.max_num_seqs))`` -- a MIN,
 not a precedence chain: the env can only LOWER the cap below the engine's, never raise
@@ -183,14 +185,13 @@ def _backend_env_on(name: str) -> bool:
     """Resolve a BACKEND ROUTE env exactly the way ``backend._env_on`` resolves it.
 
     AUTHORITY: ``integration/vllm/backend.py``::``_env_on`` — verbatim
-    ``os.environ.get(name, "0").strip().lower() not in {"0", "false", "off", ""}``.
-    Note what is NOT in that set: ``"no"``.  ``OMMX_ATTN_BATCHED=no`` therefore
-    FORCE-ENABLES the batched route in the backend, while ``_env_flag`` here reads the
-    same string as OFF.  That divergence would let this module's reachability proof
-    declare "no B>1 step is possible" for a run whose backend routes every single step
-    through the batched pool — the exact false-negative a startup guard must not have.
+    ``os.environ.get(name, "0").strip().lower() not in {"", "0", "false", "off", "no"}``.
+    Repeated rather than imported because backend.py imports vLLM and torch at module
+    scope. Change both together: a copy that disagrees on one spelling (this one used to
+    read ``"no"`` as ON) makes every route check below describe a route the backend does
+    not take.
     """
-    return os.environ.get(name, "0").strip().lower() not in {"0", "false", "off", ""}
+    return os.environ.get(name, "0").strip().lower() not in {"", "0", "false", "off", "no"}
 
 
 def _int_or_none(raw: Any):
@@ -693,6 +694,64 @@ def ommx_preflight_check(
     else:
         report["vllm_block_size"] = "unknown"
 
+    # ── 4c. request concurrency vs the OMMX decode route ──────────────────────
+    # NOT overridable: backend.py build() raises at the first unsupported multi-request
+    # step anyway, so a waiver would only move the failure from startup into the run.
+    ns_val, ns_found = _chain(vllm_config, "scheduler_config", "max_num_seqs")
+    ns_found = ns_found and isinstance(ns_val, int) and not isinstance(ns_val, bool)
+    report["multi_request_scheduling"] = (int(ns_val) > 1) if ns_found else "unknown"
+    ns_state = (f"ENABLED (scheduler_config.max_num_seqs={int(ns_val)})" if ns_found
+                else "UNKNOWN (scheduler_config.max_num_seqs is missing or not an int)")
+    multi = (not ns_found) or int(ns_val) > 1
+    if multi and _backend_env_on("OMMX_ATTN_GRAPH"):
+        violations.append(
+            f"OMMX_ATTN_GRAPH=1 with multi-request scheduling {ns_state} — the GRAPH "
+            "route serves one request.\n"
+            "  WHY: the graph route owns a single-sequence KV store and never enters the "
+            "batched pool (backend.py build(): in_batched requires not _GRAPH), so the "
+            "first step carrying two requests raises 'OMMX_ATTN_GRAPH supports one "
+            "request only' mid-run. OMMX_ATTN_BATCHED* does not help: GRAPH wins.\n"
+            "  FIX: launch with --max-num-seqs 1 (CLI) or max_num_seqs=1 "
+            "(LLM/EngineArgs), or serve batches with OMMX_ATTN_GRAPH=0 and "
+            "OMMX_ATTN_BATCHED_GRAPH=1 (captured) or OMMX_ATTN_BATCHED=1 (eager).")
+    elif multi and not (_backend_env_on("OMMX_ATTN_BATCHED")
+                        or _backend_env_on("OMMX_ATTN_BATCHED_GRAPH")):
+        violations.append(
+            f"multi-request scheduling is {ns_state} without a batched OMMX route.\n"
+            "  WHY: without OMMX_ATTN_BATCHED / OMMX_ATTN_BATCHED_GRAPH the backend "
+            "enters the batched pool only at the first step with B>1. vLLM 0.21 "
+            "prefills one request per step, so that step is a decode whose earlier "
+            "prefills live in the single-sequence store, and build() raises 'cannot "
+            "migrate a live single-sequence KV history into the batched pool' mid-run.\n"
+            "  FIX: set OMMX_ATTN_BATCHED_GRAPH=1 (captured) or OMMX_ATTN_BATCHED=1 "
+            "(eager) before starting the engine, or launch with --max-num-seqs 1 (CLI) "
+            "/ max_num_seqs=1 (LLM/EngineArgs).")
+
+    # ── 4d. speculative decoding / KV transfer / encoder-cache transfer ────────
+    # NOT overridable, every mode. A field this vLLM does not define is not configured.
+    # The sidecar is written only by do_kv_cache_update on this worker; none of these
+    # paths writes, rolls back or ships it, so SHADOW decode would read a sidecar that
+    # does not hold the KV vLLM's own cache holds.
+    for name, what, why in (
+            ("speculative_config", "speculative decoding",
+             "a verify step carries several tokens per request, which the write path "
+             "treats as a fresh prefill (reset + append_block), and the sidecar has no "
+             "rollback for rejected draft tokens."),
+            ("kv_transfer_config", "KV transfer",
+             "a KV connector loads blocks straight into vLLM's paged cache, so the "
+             "loaded tokens never pass do_kv_cache_update and are missing from the "
+             "sidecar; blocks it saves carry no sidecar either."),
+            ("ec_transfer_config", "encoder-cache transfer",
+             "the disaggregated encoder path is not validated against the sidecar "
+             "(OMMX_KV_PACKED_ONLY refuses it for the same reason).")):
+        if getattr(vllm_config, name, None) is not None:
+            violations.append(
+                f"{what} is CONFIGURED (vllm_config.{name} is set) — unsupported by the "
+                "OMMX KV sidecar.\n"
+                f"  WHY: {why}\n"
+                f"  FIX: launch without --{name.replace('_config', '').replace('_', '-')}"
+                f"-config (CLI) or with {name}=None (LLM/EngineArgs).")
+
     # ── 5. projected pool footprint vs free memory, and scheduler concurrency vs
     #       the pool slot cap. (These are the module docstring's WHY-items 3 and 4;
     #       the numbering here counts the two pure-sanity checks above as 1 and 2.)
@@ -902,23 +961,30 @@ def _pool_budget_check(vllm_config: Any, *, num_seqs: int, cfg: Any,
     # batched step. Two independent ways such a step can occur:
     #   * the engine's scheduler admits more than one sequence at a time
     #     (scheduler_config.max_num_seqs > 1), or
-    #   * OMMX_ATTN_BATCHED force-routes even a B==1 decode through the batched pool
-    #     (backend.py _BATCHED) — read with the BACKEND's truthiness (_backend_env_on),
-    #     because backend.py treats the spelling "no" as ON and this module used to
-    #     treat it as OFF, which would have turned a forced-batched run into a
-    #     "provably unreachable" one.
+    #   * OMMX_ATTN_BATCHED or OMMX_ATTN_BATCHED_GRAPH pre-latches the batched session
+    #     (backend.py _BATCHED_SESSION), so even a B==1 decode is served from the pool.
+    #     Both are read with the BACKEND's truthiness (_backend_env_on).
+    # OMMX_ATTN_GRAPH overrides both: build() batches only when _GRAPH is off.
     # UNKNOWN counts as REACHABLE: a scheduler cap we cannot read is not a proof that
     # no batched step happens, and "unknown" is never "safe" in this file.
     sched_ns, sched_found = _chain(vllm_config, "scheduler_config", "max_num_seqs")
     sched_found = (sched_found and isinstance(sched_ns, int)
                    and not isinstance(sched_ns, bool))
     pool["scheduler_max_num_seqs"] = int(sched_ns) if sched_found else "unknown"
-    batched_forced = _backend_env_on("OMMX_ATTN_BATCHED")
+    graph_route = _backend_env_on("OMMX_ATTN_GRAPH")
+    batched_forced = (_backend_env_on("OMMX_ATTN_BATCHED")
+                      or _backend_env_on("OMMX_ATTN_BATCHED_GRAPH"))
     pool["ommx_attn_batched_forced"] = batched_forced
-    if batched_forced:
+    if graph_route:
+        # backend build(): in_batched requires not _GRAPH, so the pool is never built;
+        # a multi-request GRAPH engine is refused by check 4c instead.
+        reachable = False
+        why_reach = ("OMMX_ATTN_GRAPH is on, and the GRAPH route never enters the batched "
+                     "pool (multi-request scheduling with GRAPH is refused separately)")
+    elif batched_forced:
         reachable = True
-        why_reach = ("OMMX_ATTN_BATCHED is on, which force-routes even a B==1 decode "
-                     "through the batched pool")
+        why_reach = ("OMMX_ATTN_BATCHED or OMMX_ATTN_BATCHED_GRAPH is on, which "
+                     "force-routes even a B==1 decode through the batched pool")
     elif not sched_found:
         reachable = True
         why_reach = ("scheduler_config.max_num_seqs is missing/unreadable, so a B>1 "
@@ -929,7 +995,8 @@ def _pool_budget_check(vllm_config: Any, *, num_seqs: int, cfg: Any,
     else:
         reachable = False
         why_reach = (f"scheduler_config.max_num_seqs={int(sched_ns)} <= 1 and "
-                     "OMMX_ATTN_BATCHED is off, so no B>1 decode step can be scheduled")
+                     "OMMX_ATTN_BATCHED / OMMX_ATTN_BATCHED_GRAPH are off, so no B>1 "
+                     "decode step can be scheduled")
     pool["b_gt_1_reachable"] = reachable
     pool["b_gt_1_reachable_because"] = why_reach
 

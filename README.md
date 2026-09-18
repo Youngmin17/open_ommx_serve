@@ -100,7 +100,9 @@ Every arm runs the upstream code that served its tokens, not a re-implementation
   because the kernel takes a single KV split below 2K tokens. Block size 16 (32 is supported and
   verified; +26% at 4K).
 - **vs bf16**: OMMX decode is still slower than bf16 (64K: 22.6 ms vs 14.3 Triton / 5.8
-  FlashAttention). The win over bf16 is KV capacity, not speed.
+  FlashAttention). The format's byte saving is not measured here as engine KV capacity: the
+  default SHADOW mode keeps vLLM's bf16 paged cache beside the OMMX store, and the opt-in
+  `OMMX_KV_PACKED_ONLY=1` arena serves one request at a time.
 
 ## Decode-linear latency
 

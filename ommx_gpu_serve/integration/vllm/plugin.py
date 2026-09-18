@@ -311,22 +311,9 @@ def register(method_name: str = "ommx") -> Optional[str]:
         # String class path: the backend module (and vLLM's FlashAttention base)
         # imports lazily only when CUSTOM is actually selected.
         register_backend(AttentionBackendEnum.CUSTOM, _OMMX_BACKEND_PATH)
-        # PACKED-ONLY capacity mode (OMMX_KV_PACKED_ONLY=1, default OFF): patch
-        # Attention.get_kv_cache_spec to shrink the bf16 paged-cache page budget by the
-        # OMMX plane footprint (measured 3.66x for the canonical i2f4+i2 recipe — see
-        # packed_only.kv_bits_breakdown; the older "<=3-bit / ~4.6x" figures belong to
-        # the group_tokens=64 + OMMX_KV_OUTLIER_MAP=0 recipe, a different number system
-        # from the one the published accuracy results used). The shrunk pages are a
-        # BYTE BUDGET ONLY — the real backing store is the separately allocated
-        # MultiSeqKVPool. Installed here (plugin load, once per worker) so it is in
-        # place before get_kv_cache_spec runs during KV-cache sizing.
-        #
-        # LAW #5 (no silent fallback): the backend decides PACKED-ONLY from the ENV
-        # (backend._PACKED_ONLY = packed_only_enabled()), independently of whether this
-        # patch installed. So swallowing an install failure produced a CONTRADICTORY
-        # engine: an UNSHRUNK bf16 paged cache that do_kv_cache_update deliberately
-        # never writes, and a forward() that refuses to read it. Fail at plugin load,
-        # where the message can still name the cause, instead of at the first prefill.
+        # Opt-in B1 arena: install the exact byte spec before engine KV sizing.
+        # Backend and allocator must agree; an installation failure is fatal when
+        # requested because the byte layout has no BF16 paged-cache fallback.
         try:
             from .packed_only import install_packed_only_spec
         except Exception as exc:  # noqa: BLE001
@@ -334,9 +321,9 @@ def register(method_name: str = "ommx") -> Optional[str]:
                 raise RuntimeError(
                     "OMMX_KV_PACKED_ONLY is set but ommx_gpu_serve.integration.vllm."
                     f"packed_only could not be imported ({type(exc).__name__}: {exc}). "
-                    "PACKED-ONLY makes the sidecar the ONLY backing store, so running "
-                    "without the page-budget patch would serve from an unwritten bf16 "
-                    "cache. Unset OMMX_KV_PACKED_ONLY to use SHADOW mode."
+                    "PACKED-ONLY requires the engine-owned byte arena; its spec patch "
+                    "must be installed before KV allocation. Unset "
+                    "OMMX_KV_PACKED_ONLY to use SHADOW mode."
                 ) from exc
             # SHADOW mode (the default) does not need the patch: vLLM keeps its full
             # bf16 paged cache and every step has a valid fallback. Still say so once.

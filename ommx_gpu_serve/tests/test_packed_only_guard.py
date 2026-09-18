@@ -90,7 +90,6 @@ def _reset_packed_only_latches():
     def _clear():
         po._PATCHED = False
         po._EVIDENCE_DONE[0] = False
-        po._SKIP_EVIDENCE_DONE[0] = False
     _clear()
     yield
     _clear()
@@ -184,7 +183,7 @@ def empty_vllm(monkeypatch):
     return mod
 
 
-@dataclasses.dataclass
+@dataclasses.dataclass(frozen=True)
 class _StubFullAttentionSpec:
     """Stands in for ``vllm.v1.kv_cache_interface.FullAttentionSpec``.
 
@@ -194,6 +193,12 @@ class _StubFullAttentionSpec:
     dtype: object
     head_size: int
     head_size_v: int
+    block_size: int = 16
+    num_kv_heads: int = 2
+    kv_quant_mode: int = 0
+    page_size_padded: int | None = None
+    sliding_window: int | None = None
+    attention_chunk_size: int | None = None
 
 
 @dataclasses.dataclass
@@ -240,8 +245,40 @@ def working_vllm(monkeypatch):
                 raise spec
             return spec
 
+    from ommx_gpu_serve.integration.vllm import arena
+    monkeypatch.setattr(arena, "_SPEC_CLASS", None)
+    monkeypatch.setitem(vars(arena), "OMMXArenaSpec", None)
+    backend = types.ModuleType("ommx_gpu_serve.integration.vllm.backend")
+    class OMMXCanonicalBackend:
+        pass
+    backend.OMMXCanonicalBackend = OMMXCanonicalBackend
+    backend.registered = []
+    backend.register_kv_arena_layout = backend.registered.append
+    monkeypatch.setitem(sys.modules, backend.__name__, backend)
+    Attention.attn_backend = OMMXCanonicalBackend
+    Attention.num_heads = 4
+    Attention.kv_sharing_target_layer_name = None
+    Attention.registered = backend.registered
+    S = types.SimpleNamespace
+    Attention.config = S(
+        scheduler_config=S(max_num_seqs=1, enable_chunked_prefill=False),
+        cache_config=S(block_size=16, cache_dtype="auto", enable_prefix_caching=False),
+        model_config=S(max_model_len=4096, is_hybrid=False, is_encoder_decoder=False, use_mla=False),
+        parallel_config=S(tensor_parallel_size=1, pipeline_parallel_size=1,
+                          decode_context_parallel_size=1, prefill_context_parallel_size=1),
+        speculative_config=None, kv_transfer_config=None,
+        compilation_config=S(static_forward_context={}, cudagraph_capture_sizes=[1]))
+    monkeypatch.setenv("OMMX_ATTN_GRAPH", "1")
+    monkeypatch.setenv("OMMX_KV_RING", "1")
+
     sys.modules[_ATTENTION_MOD].Attention = Attention
     sys.modules[_SPEC_MOD].FullAttentionSpec = _StubFullAttentionSpec
+    managers = types.ModuleType("vllm.v1.core.single_type_kv_cache_manager")
+    class FullAttentionManager:
+        pass
+    managers.FullAttentionManager = FullAttentionManager
+    managers.spec_manager_map = {_StubFullAttentionSpec: FullAttentionManager}
+    monkeypatch.setitem(sys.modules, managers.__name__, managers)
 
     # vllm.logger.init_logger is best-effort inside the evidence helpers; give it a
     # real (recording) implementation so the log branch is executed rather than
@@ -423,84 +460,73 @@ def test_install_is_idempotent_and_does_not_re_patch(working_vllm,
     assert working_vllm.get_kv_cache_spec is after_first
 
 
-def test_patched_spec_shrinks_the_bf16_page_budget(working_vllm, canonical_recipe,
-                                                   fire_file, monkeypatch) -> None:
-    """The patch does the thing it exists for, at the CANONICAL PUBLISHED RECIPE.
-
-    head_size 128 -> 32: the canonical recipe is 8.750 bit per (K,V) element pair, so
-    the exact byte-equivalent is 128 * 8.750/32 = 35.0, rounded to the nearest
-    multiple of 8 -> 32. vLLM therefore budgets 128/32 = 4.00x while the planes only
-    compress 3.66x — the budget is 8.6% OPTIMISTIC, and BOTH numbers are asserted to
-    be present in the evidence line so the log can never be mistaken for a measured
-    compression result.
-
-    THIS IS A BYTE BUDGET, NOT A MEASURED CAPACITY. The shrunk pages are never written
-    and never read (module docstring, reasons 1-4); nothing here claims otherwise.
-    """
+def test_patched_spec_backs_exact_arena(working_vllm, canonical_recipe,
+                                       fire_file, monkeypatch) -> None:
     import torch
     monkeypatch.setenv("OMMX_KV_PACKED_ONLY", "1")
     po.install_packed_only_spec()
-
     working_vllm.next_spec = _StubFullAttentionSpec(
         dtype=torch.bfloat16, head_size=128, head_size_v=128)
-    out = working_vllm().get_kv_cache_spec(object())
-    assert (out.head_size, out.head_size_v) == (32, 32)
-    assert working_vllm.next_spec.head_size == 128, "the original spec was mutated"
-
+    layer = working_vllm()
+    out = layer.get_kv_cache_spec(working_vllm.config)
+    assert (out.head_size, out.head_size_v, out.num_kv_heads) == (128, 128, 2)
+    assert out.dtype == torch.uint8 and out.page_size_padded is None
+    assert layer._ommx_arena_layout == working_vllm.registered[-1] == out.arena_layout
+    assert out.page_size_bytes * out.arena_layout.required_blocks >= out.arena_layout.total_store_bytes
+    assert working_vllm.next_spec.dtype == torch.bfloat16
     line = fire_file()
-    assert "PACKED_ONLY_SPEC head_size 128 -> 32" in line, line
-    assert "ommx_bits/elem=8.750" in line, line
-    assert "planes=3.66x" in line, line
+    assert "PACKED_ONLY_SPEC arena head_size=128" in line
+    assert "engine-owned; binding checked separately" in line
+    assert "page_bytes=" in line and "store_bytes=" in line
     assert any(kind == "info" and "PACKED_ONLY_SPEC" in text
-               for kind, text in working_vllm.log_records), working_vllm.log_records
+               for kind, text in working_vllm.log_records)
 
 
-def test_patched_spec_leaves_foreign_specs_alone(working_vllm, canonical_recipe,
-                                                 fire_file, monkeypatch) -> None:
-    """Sliding-window / MLA / fp8 specs are NOT the OMMX path and pass through.
-
-    Shrinking a spec the OMMX sidecar does not back would under-reserve a cache that
-    IS read — the one direction of this patch that is not fail-safe.
-    """
+def test_patched_spec_rejects_foreign_specs(working_vllm, canonical_recipe,
+                                           fire_file, monkeypatch) -> None:
+    import torch
     monkeypatch.setenv("OMMX_KV_PACKED_ONLY", "1")
     po.install_packed_only_spec()
-    import torch
-    for spec in (
-            # bf16 + head_size_v present: EVERYTHING except the type says "shrink me",
-            # so only the isinstance(spec, FullAttentionSpec) check can save it.
-            _StubOtherSpec(dtype=torch.bfloat16, head_size=128, head_size_v=128),
-            # the other exclusion axis: right type, wrong dtype (quantized cache).
-            _StubFullAttentionSpec(dtype="fp8", head_size=128, head_size_v=128)):
+    for spec in (_StubOtherSpec(dtype=torch.bfloat16, head_size=128, head_size_v=128),
+                 _StubFullAttentionSpec(dtype="fp8", head_size=128, head_size_v=128)):
         working_vllm.next_spec = spec
-        got = working_vllm().get_kv_cache_spec(object())
-        assert got is spec, (
-            f"{type(spec).__name__} was rewritten (head_size {spec.head_size} -> "
-            f"{getattr(got, 'head_size', None)}). Shrinking a spec the OMMX sidecar "
-            "does not back UNDER-reserves a cache vLLM really reads — the one "
-            "direction of this patch that is not fail-safe.")
-        assert spec.head_size == 128, "the original spec was mutated in place"
-    assert fire_file() == "", "an untouched spec must not emit shrink evidence"
+        with pytest.raises((RuntimeError, ValueError)):
+            working_vllm().get_kv_cache_spec(working_vllm.config)
+        assert spec.head_size == 128
+    assert fire_file() == ""
 
 
-def test_patched_spec_records_a_skip_instead_of_shrinking_blind(
+def test_patched_spec_rejects_bad_recipe_without_bf16_skip(
         working_vllm, fire_file, monkeypatch) -> None:
-    """An unbuildable recipe leaves the spec at FULL bf16 and says so, once.
-
-    This is the ONE fail-safe direction (over-reserved, never under), so it must not
-    raise — but it must not be silent either, or the operator sees PACKED-ONLY with no
-    ``PACKED_ONLY_SPEC`` line and no stated reason. The same geometry still raises
-    loudly at pool construction, so no silently-wrong path exists.
-    """
     import torch
     monkeypatch.setenv("OMMX_KV_PACKED_ONLY", "1")
-    monkeypatch.setenv("OMMX_KV_GROUP_TOKENS", "31")     # not in {16,32,64,128}
+    monkeypatch.setenv("OMMX_KV_GROUP_TOKENS", "31")
     po.install_packed_only_spec()
-    spec = _StubFullAttentionSpec(dtype=torch.bfloat16, head_size=128, head_size_v=128)
-    working_vllm.next_spec = spec
-    assert working_vllm().get_kv_cache_spec(object()) is spec
-    line = fire_file()
-    assert "PACKED_ONLY_SPEC_SKIPPED" in line and "UNSHRUNK" in line, line
-    assert "OMMX_KV_GROUP_TOKENS" in line, line
+    working_vllm.next_spec = _StubFullAttentionSpec(dtype=torch.bfloat16, head_size=128, head_size_v=128)
+    with pytest.raises(ValueError):
+        working_vllm().get_kv_cache_spec(working_vllm.config)
+    assert fire_file() == ""
+
+
+@pytest.mark.parametrize("foreign", ["self", "peer", "mamba", "shared"])
+def test_patched_spec_rejects_mixed_or_shared_backing(working_vllm, monkeypatch, foreign):
+    import torch
+    monkeypatch.setenv("OMMX_KV_PACKED_ONLY", "1")
+    po.install_packed_only_spec()
+    working_vllm.next_spec = _StubFullAttentionSpec(dtype=torch.bfloat16, head_size=128, head_size_v=128)
+    layer = working_vllm()
+    peer = working_vllm()
+    if foreign == "self":
+        layer.attn_backend = object
+    elif foreign == "peer":
+        peer.attn_backend = object
+    elif foreign == "mamba":
+        peer = types.SimpleNamespace(get_kv_cache_spec=lambda cfg: object())
+    else:
+        peer.kv_sharing_target_layer_name = "other"
+    working_vllm.config.compilation_config.static_forward_context["peer"] = peer
+    with pytest.raises(RuntimeError, match="only unshared OMMX"):
+        layer.get_kv_cache_spec(working_vllm.config)
 
 
 def test_a_failing_original_spec_call_is_not_swallowed(working_vllm, canonical_recipe,

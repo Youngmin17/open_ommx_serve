@@ -1,102 +1,17 @@
 # Copyright (c) 2024-2026, OMMX Contributors
 # SPDX-License-Identifier: Apache-2.0
-"""vLLM v1 attention backend for the canonical OMMX paged decode (SHADOW mode).
+"""Canonical OMMX decode integration for vLLM 0.21.
 
-⚠ CLUSTER-VALIDATION: imports vLLM v1 internals at module load (subclasses
-``FlashAttentionBackend`` / ``Impl`` / ``MetadataBuilder``). Loaded lazily by the
-registry only when ``--attention-backend CUSTOM`` is selected; NOT importable
-without vLLM. Validated against vLLM 0.21 (the ``ommx`` cluster env).
+The default SHADOW path retains vLLM's BF16 paged cache and a canonical sidecar.
+OMMX_KV_PACKED_ONLY=1 instead uses an engine-owned byte arena for every persistent
+canonical-store tensor, including the BF16 sink/recent ring. It supports only B1
+GRAPH, full attention, TP/PP/CP=1, without prefix caching, chunking, speculation,
+KV transfer or sharing. Unsupported configurations fail at startup.
 
-SHADOW mode, EAGER single-batch (step1 first slice):
-  * vLLM keeps its bf16 paged KV cache (inherited ``get_kv_cache_shape``) and
-    serves PREFILL / mixed / non-uniform steps with stock FlashAttention.
-  * OMMX keeps a per-layer ``CanonicalKVStore`` sidecar (the canonical i2f4 K /
-    i2 V planes + bf16 sink/recent window). ``do_kv_cache_update`` appends the new
-    bf16 K/V into the sidecar (and regroups completed 32-token groups); ``forward``
-    routes UNIFORM SINGLE-TOKEN DECODE through ``ommx_gpu_serve::paged_decode`` and
-    falls back to bf16 FlashAttention otherwise.
-
-SLIDING-WINDOW LAYERS ARE NEVER OMMX-ROUTED, AND SAY SO. The plugin registers CUSTOM
-for whatever model is loaded, but every OMMX route here is gated on
-``sliding_window == (-1, -1)``: an alternating SWA/full model (Mistral, Gemma-2,
-Ministral) gets OMMX on its full-attention layers and stock bf16 FlashAttention, out of
-vLLM's own paged cache, on its sliding-window ones. Correct, but PARTIAL — and without
-evidence it would be invisible, because the sentinel of such a run would look exactly
-like a fully routed Llama run. Both halves of the carve-out record evidence (``SW_BYPASS_BF16`` on the
-write, ``SW_BYPASS_BF16_READ`` on the read, plus
-``ommx_route_health()["sliding_window_bypass"]``), so "OMMX served this model" and
-"OMMX served part of this model" are distinguishable after the fact.
-
-CUDA-graph: declared ``UNIFORM_SINGLE_TOKEN_DECODE``; the eager slice runs with
-``enforce_eager=True`` (the sidecar append uses a python seq index — NOT yet a
-slot-mapping scatter, so it is not capture-safe). FULL-graph capture + the paged
-multi-batch store is the follow-up (the build-seam scatter in ``metadata.py``).
-
-PACKED-ONLY capacity mode (the KV compression — the headline OMMX benefit over FA3)
-is implemented in ``packed_only.py`` and gated by ``OMMX_KV_PACKED_ONLY=1`` (default
-OFF; SHADOW stays the correctness-first baseline). It patches
-``Attention.get_kv_cache_spec`` so the bf16 paged-cache page budget shrinks by the
-OMMX-vs-bf16 byte ratio -> vLLM budgets proportionally more KV blocks.
-
-  MEASURED KV FOOTPRINT — do not quote "≤3-bit" or "~4.6x" for the published recipe;
-  neither survives this measurement. Obtained by SUMMING THE REAL ALLOCATED
-  ``MultiSeqKVPool`` TENSORS (not by evaluating a formula), Llama-3.1-8B geometry:
-    canonical PUBLISHED recipe — i2f4, 6 outliers/vector, relative-index 7,
-      group_tokens=32, group_channels=32, OMMX_KV_OUTLIER_MAP=1, pow2 (int8 scale):
-        K+V = 8.750 bit per K/V element PAIR = 4.375 bit/elem -> 32/8.75 = 3.66x
-    same recipe with OMMX_KV_OUTLIER_MAP=0:
-        K+V = 7.750 -> 3.875 bit/elem -> 4.13x
-    group_tokens=64 + group_channels=64 + OMMX_KV_OUTLIER_MAP=0:
-        K+V = 5.875 -> 2.938 bit/elem -> 5.45x   (the ONLY "≤3-bit" configuration)
-  So the recipe the ACCURACY results were produced with is 4.375 bit/elem = 3.66x.
-  Reaching ≤3 bit needs group_tokens=64 + group_channels=64 + OMMX_KV_OUTLIER_MAP=0
-  (at group_channels=32 the same knobs give 6.250 bit/pair = 3.125 avg, NOT ≤3),
-  i.e. a DIFFERENT number system from the one the accuracy numbers used — the
-  compression figure and the accuracy figure must never be quoted from different
-  recipes in one sentence.
-  (What vLLM applies to the page budget: PACKED-ONLY calls
-  ``packed_only.ommx_bits_per_elem(head_size)`` with NO keyword overrides, so the recipe
-  comes from the ENV — the same env the pool itself reads. Under the published recipe
-  (``OMMX_ATTN_OUTLIERS=6 OMMX_ATTN_POW2=1 OMMX_KV_GROUP_TOKENS=32
-  OMMX_KV_GROUP_CHANNELS=32``) that returns K 6.000 / V 2.750 = 8.750 bit = 3.657x,
-  IDENTICAL to the measured plane footprint above — verified by calling the function and
-  by summing the real ``MultiSeqKVPool`` tensors independently.
-  Two ways to get a different number out of it, both of which mean the env was not the
-  published recipe: with NOTHING set it falls back to k=3 + bf16 scale (8.250 bit,
-  3.88x), and at k=6 but ``use_pow2`` unset it gives 9.250 bit (3.46x) because the scale
-  reverts from an int8 pow2 exponent to bf16. Always state which recipe a ratio belongs
-  to; ``packed_only.kv_bits_breakdown()`` prints the resolved recipe alongside the
-  number for exactly this reason.)
-
-The INT2 sidecar is the real backing store + decode op; the SHRUNK bf16 paged cache
-is a BYTE-BUDGET RESERVATION ONLY — never written (``do_kv_cache_update`` skips the
-paged write) and never read (a full-prompt prefill runs varlen FlashAttention
-directly on the in-batch q/k/v; the KIVI sink/recent residual lives in the store's
-own buffers). Because it is a reservation that never stores a token, vLLM's own
-"GPU KV cache size: <N> tokens" / "Maximum concurrency <Y>x" log lines merely RESTATE
-that reservation — they are NOT a validated OMMX capacity result, and quoting them as
-one attributes to OMMX a number vLLM computed from a head_size we asked it to shrink.
-The only capacity claim backed by measurement is the pool-tensor byte count above.
-Steps neither packed route can serve raise loudly — over the shrunk pages there is no
-valid bf16 fallback.
-
-FAILURE POLICY (law #5, NO SILENT FALLBACK): an OMMX route failure is FATAL by
-default. Every OMMX route (the sidecar write in ``do_kv_cache_update``, and the
-single-batch / batched / batched-graph decode reads) records the evidence and
-RE-RAISES. Do not answer a failure by latching ``layer._ommx_dead`` and returning
-False (handing the step to bf16 FlashAttention): measured on vLLM 0.21, whose defaults
-are ``enable_prefix_caching=True`` (vllm/config/cache.py:91) and
-``enable_chunked_prefill=True`` (vllm/config/scheduler.py:84) — BOTH unsupported by
-the non-paged sidecar — a Llama-3.1-8B run with ``--attention-backend CUSTOM`` that
-degrades that way writes ``KV_UPDATE_DEAD`` to the sentinel and then produces output
-BYTE-IDENTICAL to the bf16 reference (228/228 chars), while the same config with
-prefix caching OFF produces a genuinely different (OMMX) continuation. A fluent, fast,
-wrong-backend run is the worst possible failure mode for a benchmark, which is why
-silent degradation is not an option here. ``OMMX_ALLOW_BF16_FALLBACK=1``
-opts back into degrading, and then does so LOUDLY (one-time stderr+logger banner,
-``_DEGRADED`` latch, ``ommx_route_health()["degraded"] == True`` for a bench to
-assert on). ``OMMX_STRICT=1`` (``cfg.strict``) stays the STRONGER knob: it raises even
-when the opt-in is set.
+Packed prefill reads the complete in-batch K/V through varlen FlashAttention;
+decode uses the Triton canonical kernel. No BF16 paged-cache read/write is valid
+in arena mode. This fixed single-request arena is not a paged multi-request cache;
+vLLM's admission/concurrency estimate is not a measured OMMX capacity guarantee.
 """
 from __future__ import annotations
 
@@ -143,15 +58,8 @@ def _env_on(name: str) -> bool:
     Both are safety-critical knobs, so the divergence is closed here rather than
     documented as a quirk.
 
-    ONE MIRROR IS STILL STALE, DELIBERATELY LEFT FOR ITS OWNER:
-    ``preflight._backend_env_on`` copies the OLD set verbatim (its docstring names this
-    function as the authority) and ``tests/test_preflight_guards.py`` pins that copy by
-    parametrizing ``OMMX_ATTN_BATCHED="no"``. Until those two are updated together,
-    preflight reads ``"no"`` as ON where this reads it OFF — i.e. preflight assumes a
-    B>1 step is reachable when the backend would not batch, so it can only REFUSE a run
-    the backend would have served. That direction is fail-closed (a refusal costs a
-    re-run; the reverse would publish a FlashAttention number as OMMX), which is why it
-    is safe to land this half first.
+    ``preflight._backend_env_on`` repeats this rule verbatim (preflight must import
+    without vLLM or torch); change the two together.
     """
     return os.environ.get(name, "0").strip().lower() not in {
         "", "0", "false", "off", "no"}
@@ -291,14 +199,19 @@ _V_BF16 = _env_on("OMMX_ATTN_V_BF16")
 # the only trace of a knowingly-wrong run was the env of the process that launched it,
 # and the sentinel still showed a clean DECODE_ROUTE_FIRED.
 _ABL_SKIP_WRITE = _env_on("OMMX_ABL_SKIP_WRITE")
-# PACKED-ONLY capacity mode (OMMX_KV_PACKED_ONLY=1, packed_only.py). The spec patch
-# shrinks the bf16 paged-cache page budget, so the pages CANNOT hold real headdim-D
-# K/V rows — they are a byte-budget reservation. In this mode the backend (a) never
-# writes the paged cache, (b) serves a FULL-PROMPT prefill with varlen FlashAttention
-# over the in-batch q/k/v, (c) serves uniform decode from the OMMX sidecar, and
-# (d) raises on any other step (a bf16 fallback would read the shrunk pages ->
-# garbage/OOB, and law #5 forbids doing that silently). OFF -> byte-identical SHADOW.
+# Explicit opt-in: engine-owned byte storage; SHADOW remains the control path.
 _PACKED_ONLY = packed_only_enabled()
+_ARENA_LAYOUTS = {}
+
+
+def register_kv_arena_layout(layout) -> None:
+    key = (layout.block_size, layout.n_kv_heads, layout.head_dim)
+    old = _ARENA_LAYOUTS.get(key)
+    if old is not None and old != layout:
+        raise RuntimeError("OMMX arena geometry/recipe changed within one worker")
+    _ARENA_LAYOUTS[key] = layout
+
+
 # vLLM cudagraph CAPTURE latch (set only inside build_for_cudagraph_capture). During
 # capture, vLLM drives a SYNTHETIC dummy decode (no real requests / no OMMX pool), so
 # the OMMX route can't fire and PACKED has no bf16 fallback (shrunk cache). Attention is
@@ -593,7 +506,7 @@ def _ommx_route_failed(tag: str, exc: BaseException, *, cfg=None, layer=None,
     # getattr default then reads as "not strict", and the DEFAULT policy below raises
     # anyway — the only way to reach the fall-through is strict False AND the opt-in set.
     strict = bool(getattr(cfg, "strict", False))
-    if strict or not _ALLOW_BF16_FALLBACK:
+    if _PACKED_ONLY or strict or not _ALLOW_BF16_FALLBACK:
         raise exc
     if _DEGRADED["reason"] is None:
         _DEGRADED["reason"] = f"{tag}: {type(exc).__name__}: {exc}"
@@ -835,6 +748,9 @@ _MAX_MODEL_LEN = None
 # RE-RAISED for every later builder — a guard that runs once and is then skipped is the
 # silent fallback law #5 forbids.
 _PREFLIGHT = {"done": False, "error": None, "report": None}
+# Content fingerprint of the one engine this process serves (_claim_engine). Every
+# latch and singleton in this module is per PROCESS, so a second engine is refused.
+_ENGINE_FINGERPRINT = [None]
 
 # One step manager per worker (graph path), lazily created with model geometry.
 _MANAGER = None
@@ -861,7 +777,7 @@ _LAST_COMMON_MD = None
 #     UNIFORM single-token DECODE step in a batched session (a prefill read still goes to
 #     bf16 FlashAttention via super()).
 #   "B" (int): number of requests this step.
-#   "full_prefill" (bool, PACKED-ONLY): every request's query span covers its WHOLE
+#   "full_prefill" (bool): every request's query span covers its WHOLE
 #     sequence (q_len == seq_len; chunked prefill + prefix caching disabled), so the
 #     in-batch K/V is the complete causal context and the prefill read can run varlen
 #     FlashAttention directly on it — never the shrunk paged cache.
@@ -890,9 +806,8 @@ _STEP = {"batched_write": False, "batched_read": False, "B": 0,
 # The pool then holds one token against a 1357-token sequence and the build seam regroups
 # to vLLM's count anyway, packing uninitialised rows (the batched-graph reproducer
 # in tests/test_seam_write_highwater.py records the 32768/32768 non-finite case).
-# `_BATCHED_GRAPH` pre-latches because that mode has already committed to the shared pool:
-# there is no B==1 fast path left to regress, which is the objection that kept the general
-# pre-latch out. `_BATCHED` alone still latches on demand.
+# Explicit batched modes pre-latch because they have committed to the shared pool.
+# Without them, a late B>1 continuation now fails closed: no history migration exists.
 _BATCHED_SESSION = [bool(_BATCHED or _BATCHED_GRAPH)]
 
 
@@ -900,6 +815,10 @@ def _manager(cfg, device):
     global _MANAGER
     if _MANAGER is None:
         _MANAGER = OMMXStepManager(cfg, device)
+        # The first write creates the manager after build(). A one-token prompt
+        # immediately uses its read buffers, so initialize them for this same step.
+        if _LAST_COMMON_MD is not None and int(_STEP.get("B", 0)) == 1:
+            _MANAGER.on_build(_LAST_COMMON_MD, new_request=_STEP["full_prefill"])
     return _MANAGER
 
 
@@ -954,6 +873,57 @@ def _hf_geometry(vllm_config) -> dict:
         "num_layers": pick("num_hidden_layers", "n_layer", "num_layers"),
         "tensor_parallel_size": tp,
     }
+
+
+def _engine_fingerprint(vllm_config) -> dict:
+    """The engine settings this module's state and the preflight verdict derive from.
+
+    Content, not ``id()``: vLLM builds a metadata builder per attention group (and per
+    ubatch) from the same config, and a copy of that config is still the same engine.
+    """
+    def get(node, name):
+        v = getattr(getattr(vllm_config, node, None), name, None)
+        return v if v is None or isinstance(v, (bool, int, float, str)) else str(v)
+
+    fp = {
+        "model": get("model_config", "model"),
+        "revision": get("model_config", "revision"),
+        "dtype": get("model_config", "dtype"),
+        "max_model_len": get("model_config", "max_model_len"),
+        "max_num_seqs": get("scheduler_config", "max_num_seqs"),
+        "chunked_prefill_enabled": get("scheduler_config", "chunked_prefill_enabled"),
+        "enable_chunked_prefill": get("scheduler_config", "enable_chunked_prefill"),
+        "block_size": get("cache_config", "block_size"),
+        "cache_dtype": get("cache_config", "cache_dtype"),
+        "enable_prefix_caching": get("cache_config", "enable_prefix_caching"),
+        "pipeline_parallel_size": get("parallel_config", "pipeline_parallel_size"),
+    }
+    for name in ("speculative_config", "kv_transfer_config", "ec_transfer_config"):
+        fp[name] = getattr(vllm_config, name, None) is not None
+    fp.update(_hf_geometry(vllm_config))
+    return fp
+
+
+def _claim_engine(vllm_config) -> None:
+    """Latch the first engine's fingerprint; refuse any other engine in this process.
+
+    The preflight runs once and the sizing globals, step managers and arena layouts are
+    per process, so a second, different engine would skip every refusal and inherit the
+    first engine's state. Called before the builder writes any of it.
+    """
+    fp = _engine_fingerprint(vllm_config)
+    first = _ENGINE_FINGERPRINT[0]
+    if first is None:
+        _ENGINE_FINGERPRINT[0] = fp
+        return
+    if fp != first:
+        diff = ", ".join(f"{k}: {first.get(k)!r} -> {fp.get(k)!r}"
+                         for k in sorted(set(first) | set(fp)) if first.get(k) != fp.get(k))
+        raise RuntimeError(
+            "OMMX backend: one OMMX engine per process; start another process for this "
+            f"engine. This process already serves an engine that differs in {diff}. "
+            "The preflight verdict, KV sizing and step managers are per-process state "
+            "and would be reused without being checked.")
 
 
 def _preflight_once(vllm_config) -> None:
@@ -1026,6 +996,10 @@ class OMMXCanonicalMetadataBuilder(FlashAttentionMetadataBuilder):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        if _PACKED_ONLY:
+            # Byte-cache dtype is an allocation contract, not the Q/K/V compute
+            # dtype used by FA3's prefill scheduler metadata.
+            self.kv_cache_dtype = self.model_config.dtype
         # Capture the real serving max_model_len here (the builder is constructed
         # BEFORE any forward / capture) so the sidecar store is sized to it, not the
         # 4096 default — see _MAX_MODEL_LEN above. Robust to attribute-name /
@@ -1047,7 +1021,6 @@ class OMMXCanonicalMetadataBuilder(FlashAttentionMetadataBuilder):
             try:
                 mml = int(vc.model_config.max_model_len)
                 if mml > 0:
-                    _MAX_MODEL_LEN = mml
                     chosen = vc
                     break
             except Exception:
@@ -1057,14 +1030,21 @@ class OMMXCanonicalMetadataBuilder(FlashAttentionMetadataBuilder):
         # max_model_len, and BEFORE _preflight_once below, so the preflight projects the
         # pool at the cap that will really be allocated instead of at a hard-coded 256.
         # Unreadable (older/oddly-shaped config) leaves it None -> env/default as before.
+        engine_max_num_seqs = None
         for vc in cfgs:
             try:
                 mns = int(vc.scheduler_config.max_num_seqs)
             except Exception:
                 continue
             if mns > 0:
-                _ENGINE_MAX_NUM_SEQS = mns
+                engine_max_num_seqs = mns
                 break
+        # One engine per process: refuse a different engine before any global is written.
+        _claim_engine(chosen if chosen is not None else fallback)
+        if chosen is not None:
+            _MAX_MODEL_LEN = mml
+        if engine_max_num_seqs is not None:
+            _ENGINE_MAX_NUM_SEQS = engine_max_num_seqs
         # ── PREFLIGHT (once per worker, BEFORE any forward / cudagraph capture) ────
         # Earliest point holding the whole vllm_config, so it is where the unsupported-
         # configuration guards live: prefix caching (shared first physical block ->
@@ -1077,16 +1057,12 @@ class OMMXCanonicalMetadataBuilder(FlashAttentionMetadataBuilder):
 
     @classmethod
     def get_cudagraph_support(cls, vllm_config, kv_cache_spec) -> AttentionCGSupport:
-        # sm_90 (H100/H200) FULL-cudagraph capture of the OMMX uniform single-token decode
-        # SKIPS the per-step host metadata seam (build -> on_build): the captured op then
-        # reads the FROZEN capture-time write_pos / b_seq_len / tail_idx buffers, so the
-        # decode attends ~1 stale position -> incoherent output (a fast "garbage" decode).
-        # sm_80 (A100) keeps running this attention PIECEWISE (the seam fires every step)
-        # and is correct. So on sm_90 declare NEVER -> vLLM keeps the OMMX attention OUT of
-        # the FULL graph (piecewise/eager) so the host seam runs per step and the graph
-        # decode reads FRESH buffers. A100/sm_80 keeps the UNIFORM_SINGLE_TOKEN_DECODE
-        # declaration (validated coherent under FULL cudagraph). OMMX_ATTN_CG_FORCE overrides
-        # (never|uniform) for A/B testing.
+        # Keep Hopper's conservative default until FULL capture is qualified for
+        # the deployment's scheduler and cache mode. The previous stale-buffer
+        # failure is not proof that vLLM 0.21 skips the host metadata builder:
+        # build() runs before replay, and fixed-address buffers must be refreshed
+        # there. OMMX_ATTN_CG_FORCE=never|uniform supports explicit A/B validation.
+        # The uniform override is not a blanket dynamic-batching guarantee.
         _force = os.environ.get("OMMX_ATTN_CG_FORCE", "").strip().lower()
         _never = getattr(AttentionCGSupport, "NEVER", cls._cudagraph_support)
         if _force == "never":
@@ -1129,11 +1105,27 @@ class OMMXCanonicalMetadataBuilder(FlashAttentionMetadataBuilder):
                 "STEP_ROUTE_UNCLASSIFIED",
                 "CommonAttentionMetadata exposed no readable seq_lens; B is unknown "
                 "(NOT 1). Check the vLLM version against the validated 0.21.")
+            if _GRAPH:
+                # Unknown is not the valid B=0 profiling case. FULL replay would
+                # bypass the Python write/read refusals without refreshed metadata.
+                _ommx_route_evidence("GRAPH_ROUTE_UNCLASSIFIED_DEAD", "request count is unknown")
+                raise RuntimeError("OMMX refuses graph replay with unclassified batch metadata")
         # PACKED-ONLY prefill gate (HOST seam): forward has no host q_len/seq_len,
         # so classify "every request prefills its WHOLE sequence" here.
-        _STEP["full_prefill"] = (detect_full_prefill(common_attn_metadata)
-                                 if _PACKED_ONLY else False)
+        # The same q_len == seq_len predicate identifies a new cache lifetime in
+        # SHADOW mode too, including a new request containing only one token.
+        _STEP["full_prefill"] = detect_full_prefill(common_attn_metadata)
+        if _GRAPH and B > 1:
+            raise RuntimeError(
+                "OMMX_ATTN_GRAPH supports one request only; a multi-request step "
+                "cannot reuse its single-sequence KV store. Restart with "
+                "OMMX_ATTN_GRAPH=0 and OMMX_ATTN_BATCHED_GRAPH=1 for batched serving.")
         if not _GRAPH and B > 1:
+            if not _BATCHED_SESSION[0] and not _STEP["full_prefill"]:
+                raise RuntimeError(
+                    "OMMX cannot migrate a live single-sequence KV history into the "
+                    "batched pool. Set OMMX_ATTN_BATCHED=1 before starting the engine "
+                    "for staggered requests, or submit a full batched prefill.")
             # Multi-request batch seen -> this worker is continuous-batching for its life.
             _BATCHED_SESSION[0] = True
         in_batched = bool(_BATCHED_SESSION[0]) and not _GRAPH
@@ -1141,9 +1133,15 @@ class OMMXCanonicalMetadataBuilder(FlashAttentionMetadataBuilder):
         # rows). READ: only a uniform single-token decode uses the batched decode op.
         _STEP["batched_write"] = bool(in_batched)
         _STEP["batched_read"] = bool(in_batched and uniform and B >= 1)
-        if _GRAPH and _MANAGER is not None:
+        if _GRAPH and _MANAGER is not None and B == 1:
             # HOST seam (outside capture): regroup + refresh fixed-address buffers.
-            _MANAGER.on_build(common_attn_metadata)
+            _MANAGER.on_build(common_attn_metadata, new_request=_STEP["full_prefill"])
+            if _MANAGER.dead:
+                # FULL replay bypasses the Python decode/fallback checks. A dead
+                # host seam must stop here, even when BF16 fallback was requested.
+                reason = getattr(_MANAGER, "dead_reason", None) or "single-sequence store dead"
+                _ommx_route_evidence("GRAPH_SEAM_DEAD", reason)
+                raise RuntimeError(f"OMMX refuses graph replay with stale KV metadata: {reason}")
         if in_batched and _BMANAGER is not None:
             # HOST seam (eager, outside capture): per-request seq_lens / query_start_loc
             # -> uniform-decode detection + per-slot regroup. Run whenever the session is
@@ -1169,6 +1167,20 @@ class OMMXCanonicalMetadataBuilder(FlashAttentionMetadataBuilder):
                 _BMANAGER.capturing = False
             if _GRAPH and _MANAGER is not None:
                 _MANAGER.capturing = False
+
+
+def _arena_profiling_stub(layer, kv_cache) -> bool:
+    if not _PACKED_ONLY:
+        return False
+    layout = getattr(layer, "_ommx_arena_layout", None)
+    size = kv_cache.numel() if isinstance(kv_cache, torch.Tensor) else 0
+    if layout is not None and size >= layout.allocation_bytes:
+        return False
+    if _REAL_SERVE_STARTED[0] or _STEP.get("full_prefill", False):
+        raise RuntimeError("OMMX engine KV arena is too small for a real request")
+    if size and layout is None:
+        raise RuntimeError("OMMX byte cache has no planned arena layout")
+    return True
 
 
 class OMMXCanonicalImpl(FlashAttentionImpl):
@@ -1201,6 +1213,11 @@ class OMMXCanonicalImpl(FlashAttentionImpl):
 
     def _ommx_store(self, layer, device, max_ctx) -> CanonicalKVStore:
         st = getattr(layer, "_ommx_store", None)
+        if _PACKED_ONLY and st is not None:
+            if int(st.max_seq_len) != int(max_ctx):
+                raise RuntimeError("OMMX arena cannot grow after engine allocation")
+            if st.k_base.untyped_storage().data_ptr() != layer.kv_cache.untyped_storage().data_ptr():
+                raise RuntimeError("OMMX engine KV backing changed after graph binding")
         if st is None:
             cfg = self._ommx_cfg()
             st = CanonicalKVStore(
@@ -1209,12 +1226,51 @@ class OMMXCanonicalImpl(FlashAttentionImpl):
                 v_format=("bf16" if _V_BF16 else "i2"),
                 outliers_per_vector=cfg.outliers_per_vector,
                 outlier_select=cfg.outlier_select, outlier_repr=cfg.outlier_repr,
-                use_pow2=cfg.use_pow2, window=cfg.window(),
-                group_channels=cfg.group_channels, device=device)
+                use_pow2=cfg.use_pow2, kv_outlier_map=cfg.kv_outlier_map,
+                window=cfg.window(), group_channels=cfg.group_channels,
+                device="meta" if _PACKED_ONLY else device)
+            if _PACKED_ONLY:
+                from .arena import arena_tensor_views, plan_kv_arena
+                layout = getattr(layer, "_ommx_arena_layout", None)
+                if layout is None or layout != plan_kv_arena(cfg, layout.block_size):
+                    raise RuntimeError("OMMX arena binding does not match the engine KV spec")
+                if int(max_ctx) != layout.max_context:
+                    raise RuntimeError("OMMX arena cannot grow after engine allocation")
+                arena = layer.kv_cache
+                expected_device = torch.device(device)
+                if expected_device.type == "cuda" and expected_device.index is None:
+                    expected_device = torch.device("cuda", torch.cuda.current_device())
+                if (not isinstance(arena, torch.Tensor) or arena.ndim != 2
+                        or arena.dtype != torch.uint8 or arena.device != expected_device
+                        or arena.shape[1] != layout.page_size_bytes):
+                    raise RuntimeError("OMMX requires the engine-owned 2-D uint8 KV arena page shape")
+                views = arena_tensor_views(arena, layout)
+                actual_names = {name for name, value in vars(st).items()
+                                if isinstance(value, torch.Tensor)}
+                if actual_names != views.keys():
+                    raise RuntimeError("OMMX arena tensor inventory changed after planning")
+                for name, value in views.items():
+                    setattr(st, name, value)
+                # The engine zero-initializes its byte allocation. Identity tables
+                # are the only nonzero constructor values and are initialized once.
+                for table in (st._req_to_token_full, st._req_to_group_full):
+                    table.copy_(torch.arange(table.numel(), dtype=table.dtype,
+                                             device=device).reshape(table.shape))
+                st.device = arena.device
+                st._fused_io = (st.device.type == "cuda" and os.environ.get(
+                    "OMMX_KV_FUSED_IO", "1").strip().lower() not in {"0", "false", "off", "no"})
+                _ommx_route_evidence("KV_ARENA_BOUND",
+                    f"layer={getattr(layer, 'layer_name', id(layer))} "
+                    f"store_bytes={layout.total_store_bytes} engine_bytes={arena.numel()} "
+                    f"page_bytes={layout.page_size_bytes}")
             layer._ommx_store = st
         return st
 
     def _ommx_reset(self, layer, device, max_ctx) -> CanonicalKVStore:
+        if _PACKED_ONLY:
+            st = self._ommx_store(layer, device, max_ctx)
+            st.reset_inplace()
+            return st
         # New sequence (a prefill arrived). CUDA-graph-SAFE: if a store already
         # exists AND is large enough, reset it IN PLACE (reuse the captured tensor
         # addresses — reallocating would make the captured decode graph touch a
@@ -1515,17 +1571,18 @@ class OMMXCanonicalImpl(FlashAttentionImpl):
             _sw_bypass_evidence("SW_BYPASS_BF16", self,
                                 "write: bf16 paged cache only, NO OMMX sidecar")
             return
-        # PACKED-ONLY: the paged cache is SHRUNK (spec head_size reduced to reserve
-        # the OMMX byte budget), so a headdim-D reshape_and_cache_flash into it
-        # scatters past the page (corruption, not just waste). The sidecar below is
-        # the ONLY backing store in packed mode; skip the paged write entirely.
+        # The byte arena is not a BF16 paged layout. Only canonical writes may
+        # touch it; the stock paged writer would corrupt the packed planes.
         if not _PACKED_ONLY:
             super().do_kv_cache_update(layer, key, value, kv_cache, slot_mapping)
+        if _arena_profiling_stub(layer, kv_cache):
+            return
         try:
-            # key/value: [num_tokens, n_kv_heads, head_size]. num_tokens > 1 marks a
-            # (new) prefill in the single-batch slice -> reset + append the block;
-            # num_tokens == 1 is a decode step -> append one row.
+            # key/value: [num_tokens, n_kv_heads, head_size]. The metadata seam,
+            # not this row count, identifies a new request's cache lifetime.
             n = int(key.shape[0])
+            if n == 0:
+                return
             cfg = self._ommx_cfg()
             max_ctx = cfg.max_context
             # UNCLASSIFIED STEP (law #5). build() could not read this step's per-request
@@ -1552,13 +1609,13 @@ class OMMXCanonicalImpl(FlashAttentionImpl):
             # ABLATION (timing-only, PARITY-BREAKING): skip the per-step new-token KV
             # pack+regroup/write on a DECODE step so the kernel reads STALE KV (wrong
             # output). (full_step) - (SKIP_WRITE_step) = the per-step KV pack/write cost.
-            # Prefill (n>1) is KEPT (else the cache is empty). Default OFF.
+            # New-request prefill, including n==1, is KEPT. Default OFF.
             # ANNOUNCED, not silent: the first skip writes the ABL_SKIP_WRITE_ACTIVE tag
             # to the sentinel and a one-time banner to stderr + the vLLM log, so a run
             # whose output is wrong on purpose cannot be mistaken for a clean one after
             # the fact. The announcement is placed HERE (at the first real skip) rather
             # than at import, so it fires only when the knob actually changed a step.
-            if _ABL_SKIP_WRITE and n == 1:
+            if _ABL_SKIP_WRITE and n == 1 and not _STEP["full_prefill"]:
                 _announce_parity_breaking_ablations()
                 return
             # B-AWARE WRITE: in a batched session, EVERY write (prefill block + decode
@@ -1584,33 +1641,35 @@ class OMMXCanonicalImpl(FlashAttentionImpl):
                 return
             if _GRAPH:
                 mgr = _manager(cfg, key.device)
-                if n > 1:
+                if n > 1 and (_STEP["full_prefill"] or int(_STEP.get("B", 0)) == 0):
                     # PREFILL (eager / piecewise — not captured): reset + bulk pack,
                     # register the layer store with the step manager.
-                    # ── CHUNKED-PREFILL SEAM ──────────────────────────────────────
-                    # Decode-only today (enable_chunked_prefill=False), so every n>1 is
-                    # a whole new sequence's prefill -> always reset. To enable chunked
-                    # prefill, gate this reset on FIRST-CHUNK only (request identity /
-                    # query_start_loc==0) and have continuation chunks call append_block
-                    # WITHOUT reset (the store already accumulates via append_block into
-                    # seq_len; maybe_regroup packs whatever groups complete). Kernel /
-                    # store need NO change — only this reset-vs-append decision does.
+                    # Continuation chunks remain unsupported and are refused below.
                     st = self._ommx_reset(layer, key.device, max(max_ctx, n))
                     st.append_block(key, value)
                     mgr.register(id(layer), st)
-                else:
+                elif n == 1:
                     # DECODE (captured): capture-safe device-indexed write at the
                     # build-seam-set write_pos. No regroup here (host build() owns it).
                     st = self._ommx_store(layer, key.device, max_ctx)
+                    if _STEP["full_prefill"]:
+                        st.reset_inplace()
+                        st.seq_len = 1
                     mgr.register(id(layer), st)
+                    # Even a one-token prompt must capture this device-indexed write,
+                    # not append_block's constant row zero; later replays are decode.
                     st.write_token(mgr.write_pos, key[0], value[0])
-            elif n > 1:
+                else:
+                    raise RuntimeError("OMMX single-sequence graph route does not support chunked prefill")
+            elif _STEP["full_prefill"] or (n > 1 and int(_STEP.get("B", 0)) == 0):
                 st = self._ommx_reset(layer, key.device, max(max_ctx, n))
                 st.append_block(key, value)
-            else:
+            elif n == 1:
                 st = self._ommx_store(layer, key.device, max_ctx)
                 st.append(key[0], value[0])
                 st.maybe_regroup()
+            else:
+                raise RuntimeError("OMMX single-sequence eager route does not support chunked prefill")
         except Exception as e:  # noqa: BLE001
             # THE MEASURED SILENT-bf16 PATH. This write-path pre-latch is the only one
             # that latches _ommx_dead WITHOUT a forward-side sentinel (forward's gate
@@ -1634,6 +1693,15 @@ class OMMXCanonicalImpl(FlashAttentionImpl):
 
     def forward(self, layer, query, key, value, kv_cache, attn_metadata,
                 output, output_scale=None, output_block_scale=None):
+        if _arena_profiling_stub(layer, kv_cache):
+            # vLLM's graph-memory probe owns only one temporary cache block.
+            # Never bind a full-context store to it or retain it after cleanup.
+            output.zero_()
+            return output
+        if _PACKED_ONLY and (output_scale is not None or output_block_scale is not None):
+            raise RuntimeError("OMMX arena does not support quantized attention output")
+        if _PACKED_ONLY and getattr(self, "sliding_window", (-1, -1)) != (-1, -1):
+            raise RuntimeError("OMMX arena does not support sliding-window attention")
         # SLIDING-WINDOW layers: bf16 FlashAttention out of vLLM's paged cache, tagged.
         # BEHAVIOR-IDENTICAL to the fall-through it replaces — all three gates below
         # already require sliding_window == (-1, -1) (the packed prefill seam, the decode
@@ -1758,36 +1826,9 @@ class OMMXCanonicalImpl(FlashAttentionImpl):
                 # suffix here would mark every graph-mode run ok=False for steps that
                 # served no request at all. It reports coverage, like SW_BYPASS_BF16.
                 _decode_unrouted_evidence(B, graph=_GRAPH)
-        if (_PACKED_ONLY and attn_metadata is not None
-                and getattr(self, "sliding_window", (-1, -1)) == (-1, -1)
-                and str(getattr(self, "attn_type", "decoder")) in
-                ("decoder", "AttentionType.DECODER")):
-            # PACKED-ONLY: the shrunk paged cache holds no real K/V, so the bf16
-            # FlashAttention fallback would read garbage — fail LOUD with the step
-            # shape instead of silently mis-serving (law #5). Profiling runs pass
-            # (attn_metadata None returns early in super()); sliding-window layers
-            # keep an unshrunk cache (the spec patch only touches FullAttentionSpec)
-            # and may still fall through.
-            # cudagraph CAPTURE/warmup dummy (no real OMMX pool): attention is a vLLM
-            # splitting_op (runs eager at serve, NOT replayed from this capture), so a
-            # zero-fill placeholder lets capture proceed without reading the shrunk cache.
-            # Signals: the build_for_cudagraph_capture latch AND the canonical
-            # is_current_stream_capturing() (covers profile_cudagraph_memory, which does
-            # NOT go through build_for_cudagraph_capture). Safe here: this runs inside the
-            # opaque unified_attention op (not dynamo-traced -> no graph-break). Real serve
-            # steps (both signals False) still raise below (law #5).
-            _capturing = _CAPTURING[0] or (not _REAL_SERVE_STARTED[0])
-            if not _capturing:
-                try:
-                    _capturing = bool(torch.cuda.is_current_stream_capturing())
-                except Exception:  # noqa: BLE001
-                    _capturing = False
-            if _capturing:
-                _ommx_route_evidence("PACKED_CAPTURE_STUB",
-                                     f"B={_STEP.get('B')} mql="
-                                     f"{getattr(attn_metadata, 'max_query_len', None)}")
-                output.zero_()
-                return output
+        if _PACKED_ONLY and attn_metadata is not None:
+            # The only init placeholder is the undersized profiling arena above.
+            # A real-size capture must contain canonical decode, never a zero stub.
             raise RuntimeError(
                 "[ommx] PACKED-ONLY has no bf16 fallback for this step: "
                 f"max_query_len={getattr(attn_metadata, 'max_query_len', None)} "
@@ -1804,12 +1845,14 @@ class OMMXCanonicalImpl(FlashAttentionImpl):
 
     def _prefill_packed_varlen(self, query, key, value, attn_metadata,
                                output) -> None:
-        """PACKED-ONLY full-prompt prefill DIRECTLY on the batch q/k/v.
+        """PACKED-ONLY full-prompt prefill on current Q/K/V, not persistent BF16 KV.
 
         With chunked prefill + prefix caching disabled, a full_prefill step carries
-        each request's ENTIRE prompt, so causal varlen FlashAttention over the
-        in-batch K/V (``cu_seqlens_k == cu_seqlens_q``) is exact — no paged-cache
-        read. The sidecar write already happened (``unified_kv_cache_update`` runs
+        each request's ENTIRE prompt. FA2 keeps the stock paged specialization
+        using transient views/copies of that prompt: contiguous-varlen FA2 changes
+        reduction order enough to change long-context greedy outputs. FA3 retains
+        the validated contiguous-varlen path. Neither reads an engine BF16 shadow.
+        The canonical write already happened (``unified_kv_cache_update`` runs
         ``do_kv_cache_update`` before this forward). Errors PROPAGATE: in packed
         mode there is no valid fallback, so a crash here must stay loud (law #5).
         """
@@ -1822,6 +1865,32 @@ class OMMXCanonicalImpl(FlashAttentionImpl):
         cu = attn_metadata.query_start_loc
         m = int(attn_metadata.max_query_len)
         fn = _flash_varlen_fn()
+        if getattr(self, "vllm_flash_attn_version", None) == 2:
+            # The guarded arena is B1/full-prefill/block16 only. Aligned prompts
+            # alias the current (possibly strided fused-QKV) input. A partial page
+            # needs a transient copy of the whole rounded-up K/V, not just slack;
+            # nothing is retained on the layer/store or used by decode replay.
+            blocks = (n + 15) // 16
+            if n % 16:
+                pages = torch.zeros((2, blocks, 16, self.num_kv_heads, D),
+                                    dtype=k.dtype, device=k.device)
+                pages[0].view(-1, self.num_kv_heads, D)[:n].copy_(k)
+                pages[1].view(-1, self.num_kv_heads, D)[:n].copy_(v)
+                k_pages, v_pages = pages.unbind(0)
+            else:
+                k_pages = k.view(blocks, 16, self.num_kv_heads, D)
+                v_pages = v.view(blocks, 16, self.num_kv_heads, D)
+            table = torch.arange(blocks, device=k.device, dtype=torch.int32)[None, :]
+            fn(q=q, k=k_pages, v=v_pages, out=out, cu_seqlens_q=cu,
+               max_seqlen_q=m, seqused_k=attn_metadata.seq_lens, max_seqlen_k=m,
+               softmax_scale=float(self.scale), causal=bool(attn_metadata.causal),
+               alibi_slopes=getattr(self, "alibi_slopes", None), window_size=[-1, -1],
+               block_table=table, softcap=float(self.logits_soft_cap or 0.0),
+               scheduler_metadata=attn_metadata.scheduler_metadata, fa_version=2,
+               num_splits=attn_metadata.max_num_splits, s_aux=getattr(self, "sinks", None))
+            _PACKED_PREFILL_FIRES[0] += 1
+            _ommx_route_evidence("PACKED_PREFILL_FIRED", f"tokens={n} B=1 ephemeral_fa2_pages")
+            return
         base = dict(q=q, k=k, v=v, cu_seqlens_q=cu, cu_seqlens_k=cu,
                     max_seqlen_q=m, max_seqlen_k=m,
                     softmax_scale=float(getattr(self, "scale", 1.0 / (D ** 0.5))),
@@ -2011,7 +2080,7 @@ class OMMXCanonicalImpl(FlashAttentionImpl):
 
 
 class OMMXCanonicalBackend(FlashAttentionBackend):
-    """vLLM v1 attention backend (SHADOW mode): bf16 cache + OMMX canonical sidecar."""
+    """vLLM backend with SHADOW control and opt-in engine-owned canonical arena."""
 
     @staticmethod
     def get_name() -> str:
@@ -2025,26 +2094,29 @@ class OMMXCanonicalBackend(FlashAttentionBackend):
     def get_builder_cls() -> type[OMMXCanonicalMetadataBuilder]:
         return OMMXCanonicalMetadataBuilder
 
-    # get_kv_cache_shape / get_supported_kernel_block_sizes inherit the bf16
-    # FlashAttention layout. SHADOW keeps the full bf16 head_size; PACKED-ONLY
-    # (OMMX_KV_PACKED_ONLY=1, packed_only.py) shrinks the SPEC head_size so the
-    # inherited get_kv_cache_shape allocates a SMALLER paged cache and vLLM budgets
-    # proportionally more KV blocks — no shape-method override needed (head_size
-    # flows from the spec into get_kv_cache_shape).
-    #   THE RATIO. The canonical PUBLISHED recipe measures 4.375 bit/elem (K+V = 8.750
-    #   bit per K/V element pair) = 32/8.75 = 3.66x versus bf16, obtained by summing the
-    #   REAL allocated MultiSeqKVPool tensors for Llama-3.1-8B rather than by evaluating
-    #   a formula. Do not quote "~4.6x" here: that figure mixes two recipes in one ratio
-    #   (packed_only.py). It is also NOT "≤3-bit": 2.938 bit/elem (5.45x) needs group_tokens=64
-    #   + group_channels=64 + OMMX_KV_OUTLIER_MAP=0 — a DIFFERENT number system from
-    #   the one the accuracy results used, so the two figures must not be quoted
-    #   together. Full table in the module docstring.
-    #   AND THE SHRUNK CACHE IS A RESERVATION: no token is ever stored in it, so vLLM's
-    #   "GPU KV cache size: <N> tokens" / "Maximum concurrency <Y>x" log lines simply
-    #   restate the byte budget this shrink reserved. They are NOT a validated OMMX
-    #   capacity result. The store that really holds the KV is the non-paged sidecar
-    #   pool, sized O(num_seqs * max_model_len) (see _resolved_max_num_seqs and the
-    #   projection in preflight.py).
+    @staticmethod
+    def get_kv_cache_shape(num_blocks, block_size, num_kv_heads, head_size,
+                           cache_dtype_str="auto"):
+        if not _PACKED_ONLY:
+            return FlashAttentionBackend.get_kv_cache_shape(
+                num_blocks, block_size, num_kv_heads, head_size, cache_dtype_str)
+        layout = _ARENA_LAYOUTS.get((block_size, num_kv_heads, head_size))
+        if layout is None:
+            raise RuntimeError("OMMX byte-cache shape requested without an arena spec")
+        return (num_blocks, layout.page_size_bytes)
+
+    @staticmethod
+    def get_kv_cache_stride_order(include_num_layers_dimension=False):
+        if not _PACKED_ONLY:
+            return FlashAttentionBackend.get_kv_cache_stride_order(include_num_layers_dimension)
+        if include_num_layers_dimension:
+            raise NotImplementedError("OMMX arena does not support cross-layer KV transfer")
+        return (0, 1)
+
+    @staticmethod
+    def get_supported_kernel_block_sizes():
+        # No virtual block splitting: the byte layout is planned per engine block.
+        return [16] if _PACKED_ONLY else FlashAttentionBackend.get_supported_kernel_block_sizes()
 
 
 __all__ = [

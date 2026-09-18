@@ -9,7 +9,8 @@ the serving cluster. Single-batch (step1); batched is a follow-up.
 CAPTURE-SAFETY MODEL (UNIFORM_SINGLE_TOKEN_DECODE):
 - `build()` runs on the HOST every step, OUTSIDE the captured region. It does ALL the
   dynamic work and writes results into FIXED-ADDRESS device buffers (+ python ints):
-    * `advance_to(seq)` on each registered per-layer store -> CPU regroup of any newly
+    * reset logical cursors on new-request prefill, before its KV is written;
+    * otherwise `advance_to(seq)` at group boundaries -> CPU regroup of any newly
       completed 32-token group (the current token is in the recent TAIL, not a packed
       group, so the regroup never needs it);
     * refresh shared `write_pos` (= seq-1, the about-to-be-written token slot),
@@ -80,10 +81,11 @@ class OMMXStepManager:
     def register(self, layer_id: int, store) -> None:
         # overwrite-safe: a new sequence's prefill re-registers each layer's fresh
         # store under the same id, evicting the stale one (no accumulation).
-        self.stores[int(layer_id)] = store
-        # a fresh store must get its first advance_to even when the new sequence's first
-        # boundary equals the previous sequence's last one
-        self._last_boundary = -1
+        layer_id = int(layer_id)
+        if self.stores.get(layer_id) is not store:
+            self.stores[layer_id] = store
+            # Re-registering the same store on decode must not defeat boundary gating.
+            self._last_boundary = -1
 
     def reset(self) -> None:
         """Drop registered stores + clear dead latch (manual full reset)."""
@@ -94,12 +96,14 @@ class OMMXStepManager:
 
     # ── host seam ───────────────────────────────────────────────────────────────
 
-    def on_build(self, common_attn_metadata: Any) -> None:
+    def on_build(self, common_attn_metadata: Any, *, new_request=None) -> None:
         if self.dead:
             return
         try:
             seq = self._current_seq(common_attn_metadata)
-            self._refresh(seq)
+            if new_request is None:
+                new_request = detect_full_prefill(common_attn_metadata)
+            self._refresh(seq, new_request=bool(new_request))
         except Exception as exc:
             if self.cfg.strict:
                 raise
@@ -132,7 +136,7 @@ class OMMXStepManager:
             return int(self._seq_pin[0])
         raise RuntimeError("CommonAttentionMetadata: no seq_lens field found")
 
-    def _refresh(self, seq: int) -> None:
+    def _refresh(self, seq: int, *, new_request: bool = False) -> None:
         seq = int(seq)
         self.cur_seq = seq
         sink = self.window.sink_tokens
@@ -141,7 +145,15 @@ class OMMXStepManager:
         # group_tokens steps). At non-boundary decode steps advance_to is a no-op, so
         # gating skips the per-step 32-layer python loop — the p50 host-seam (law #1:
         # decode is launch/host-bound, so kill per-step host work).
-        if boundary != self._last_boundary:
+        if new_request:
+            # This build precedes the prompt write. Advancing the old store to the
+            # new prompt's length would pack stale/unwritten ring rows. Reset only
+            # logical cursors, preserving every captured tensor address; the writer
+            # will pack the actual prompt. This also handles one-token new requests.
+            for st in self.stores.values():
+                st.reset_inplace()
+            self._last_boundary = boundary
+        elif boundary != self._last_boundary:
             for st in self.stores.values():
                 st.advance_to(seq)
             self._last_boundary = boundary
